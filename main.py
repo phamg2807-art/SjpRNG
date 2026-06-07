@@ -27,7 +27,16 @@ if not DB_URL:
     exit(1)
 
 def get_conn():
-    return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor, sslmode='require')
+    import time
+    last_err = None
+    for attempt in range(3):
+        try:
+            return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor, sslmode='require', connect_timeout=10)
+        except psycopg2.OperationalError as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    raise last_err
 
 def init_db():
     with get_conn() as conn:
@@ -224,7 +233,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
