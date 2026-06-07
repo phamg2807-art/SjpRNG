@@ -1,11 +1,31 @@
-
+import os
 import discord
 from discord.ext import commands
+from flask import Flask
+from threading import Thread
 
-# Bot configuration
-# Ensure you use the Token from the "Bot" tab in your Developer Portal
-# NOT the Client Secret provided in your message.
-TOKEN = 'YOUR_BOT_TOKEN_HERE' 
+# --- Flask Web Server (To keep Render alive) ---
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run_flask():
+    app.run(host='0.0.0.0', port=8080)
+
+# Start the web server in a separate thread
+t = Thread(target=run_flask)
+t.start()
+
+# --- Discord Bot Setup ---
+# Fetch the token from Render's Environment Variables
+TOKEN = os.getenv('DISCORD_TOKEN')
+
+# Safety check for missing token
+if not TOKEN:
+    print("ERROR: DISCORD_TOKEN is missing! Check your Render Environment Variables.")
+    exit(1)
 
 # Set up intents
 intents = discord.Intents.default()
@@ -27,7 +47,9 @@ async def changecolor(ctx, role_name: str, color_hex: str):
     """
     # Convert hex string (e.g., 'FF0000') to discord.Color
     try:
-        color = discord.Color(int(color_hex.replace('0x', ''), 16))
+        # Strip '0x' or '#' if user includes it
+        clean_hex = color_hex.replace('0x', '').replace('#', '')
+        color = discord.Color(int(clean_hex, 16))
     except ValueError:
         await ctx.send("Invalid color format. Please use hex (e.g., 0xFF0000).")
         return
