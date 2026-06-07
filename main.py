@@ -1,89 +1,94 @@
 import os
 import discord
-from discord.ext import commands, tasks
+import random
+from discord.ext import commands
 from flask import Flask
 from threading import Thread
 
-# --- Flask Web Server (To keep Render alive) ---
+# --- Flask Server (Keep alive) ---
 app = Flask('')
-
 @app.route('/')
-def home():
-    return "Bot is alive!"
+def home(): return "Bot is alive!"
+def run_flask(): app.run(host='0.0.0.0', port=8080)
+Thread(target=run_flask).start()
 
-def run_flask():
-    app.run(host='0.0.0.0', port=8080)
-
-t = Thread(target=run_flask)
-t.start()
-
-# --- Discord Bot Setup ---
+# --- Setup ---
 TOKEN = os.getenv('DISCORD_TOKEN')
-
-if not TOKEN:
-    print("ERROR: DISCORD_TOKEN is missing!")
-    exit(1)
+ADMIN_ROLE_ID = 920309927375933490
+ANNOUNCEMENT_CHANNEL_ID = 900015775069401128
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# --- Rainbow Role Configuration ---
-# List of hex colors for the rainbow
-rainbow_colors = [0xFF0000, 0xFF7F00, 0xFFFF00, 0x00FF00, 0x0000FF, 0x4B0082, 0x8F00FF]
-color_index = 0
-TARGET_ROLE_ID = 920309927375933490
+# In-memory storage (Resets on restart)
+prizes = []
 
-@tasks.loop(minutes=10)
-async def rainbow_role_loop():
-    global color_index
-    # Iterate through all guilds the bot is in
-    for guild in bot.guilds:
-        role = guild.get_role(TARGET_ROLE_ID)
-        
-        if role:
-            try:
-                await role.edit(color=discord.Color(rainbow_colors[color_index]))
-                print(f"Changed {role.name} to color {rainbow_colors[color_index]}")
-            except discord.Forbidden:
-                print(f"Missing permissions to edit role in {guild.name}")
-    
-    # Move to the next color
-    color_index = (color_index + 1) % len(rainbow_colors)
+# --- Rarity Logic ---
+def get_rarity_settings(chance):
+    # chance is the denominator (e.g., 1000 for 1/1000)
+    if chance >= 1000000000: return {"color": discord.Color.default(), "ping": True, "special": True} # "Black" (Default is dark)
+    if chance >= 100000000: return {"color": discord.Color.from_str("#FF69B4"), "ping": True, "special": False} # Dark Pink
+    if chance >= 10000000: return {"color": discord.Color.blue(), "ping": True, "special": False}
+    if chance >= 1000000: return {"color": discord.Color.from_str("#FFC0CB"), "ping": False, "special": False} # Pink
+    if chance >= 100000: return {"color": discord.Color.teal(), "ping": False, "special": False} # Cyan
+    if chance >= 10000: return {"color": discord.Color.orange(), "ping": False, "special": False}
+    return {"color": discord.Color.light_gray(), "ping": False, "special": False}
 
-@bot.event
-async def on_ready():
-    print(f'Logged in as {bot.user.name} (ID: {bot.user.id})')
-    # Start the loop
-    if not rainbow_role_loop.is_running():
-        rainbow_role_loop.start()
+# --- Admin Prize Creation UI ---
+class PrizeModal(discord.ui.Modal, title='Create New Prize'):
+    name = discord.ui.TextInput(label='Prize Name', style=discord.TextStyle.short)
+    image_url = discord.ui.TextInput(label='Image URL', style=discord.TextStyle.short)
+    chance = discord.ui.TextInput(label='Chance (e.g. 1000 for 1/1000)', style=discord.TextStyle.short)
+    instruction = discord.ui.TextInput(label='Instructions (Use {user} and {prize})', style=discord.TextStyle.paragraph)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            c = int(self.chance.value)
+            new_prize = {
+                "name": self.name.value,
+                "image": self.image_url.value,
+                "chance": c,
+                "instruction": self.instruction.value
+            }
+            prizes.append(new_prize)
+            await interaction.response.send_message(f"Prize '{self.name.value}' created! (Chance: 1/{c})", ephemeral=True)
+        except ValueError:
+            await interaction.response.send_message("Chance must be a number!", ephemeral=True)
 
 # --- Commands ---
 @bot.command()
-async def changecolor(ctx, role_name: str, color_hex: str):
-    try:
-        clean_hex = color_hex.replace('0x', '').replace('#', '')
-        color = discord.Color(int(clean_hex, 16))
-    except ValueError:
-        await ctx.send("Invalid color format. Please use hex (e.g., 0xFF0000).")
-        return
+async def createprize(ctx):
+    # Check for Admin Role
+    if not any(role.id == ADMIN_ROLE_ID for role in ctx.author.roles):
+        return await ctx.send("You don't have permission to create prizes.")
+    await ctx.send_modal(PrizeModal())
 
-    role = discord.utils.get(ctx.guild.roles, name=role_name)
+@bot.event
+async def on_message(message):
+    if message.author.bot: return
     
-    if role:
-        try:
-            await role.edit(color=color)
-            await ctx.send(f'Successfully changed {role.name} color!')
-        except discord.Forbidden:
-            await ctx.send("I don't have permission to edit that role. Check my role hierarchy.")
-    else:
-        await ctx.send(f"Could not find a role named '{role_name}'.")
+    # RNG Logic
+    for prize in prizes:
+        if random.randint(1, prize['chance']) == 1:
+            rarity = get_rarity_settings(prize['chance'])
+            
+            # Build Embed
+            embed = discord.Embed(
+                title="🎉 Prize Rolled!",
+                description=prize['instruction'].format(user=message.author.mention, prize=prize['name']),
+                color=rarity['color']
+            )
+            embed.set_image(url=prize['image'])
+            
+            # Logic for Pings and Channels
+            content = "@everyone" if rarity['ping'] else None
+            channel = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID) if rarity['special'] else message.channel
+            
+            await channel.send(content=content, embed=embed)
+            break # One prize per message max
+            
+    await bot.process_commands(message)
 
-@bot.command()
-async def ping(ctx):
-    await ctx.send('Pong!')
-
-# Run the bot
 bot.run(TOKEN)
