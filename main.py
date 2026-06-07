@@ -1,6 +1,6 @@
 import os
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from flask import Flask
 from threading import Thread
 
@@ -14,40 +14,56 @@ def home():
 def run_flask():
     app.run(host='0.0.0.0', port=8080)
 
-# Start the web server in a separate thread
 t = Thread(target=run_flask)
 t.start()
 
 # --- Discord Bot Setup ---
-# Fetch the token from Render's Environment Variables
 TOKEN = os.getenv('DISCORD_TOKEN')
 
-# Safety check for missing token
 if not TOKEN:
-    print("ERROR: DISCORD_TOKEN is missing! Check your Render Environment Variables.")
+    print("ERROR: DISCORD_TOKEN is missing!")
     exit(1)
 
-# Set up intents
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
+# --- Rainbow Role Configuration ---
+# List of hex colors for the rainbow
+rainbow_colors = [0xFF0000, 0xFF7F00, 0xFFFF00, 0x00FF00, 0x0000FF, 0x4B0082, 0x8F00FF]
+color_index = 0
+TARGET_ROLE_ID = 920309927375933490
+
+@tasks.loop(minutes=10)
+async def rainbow_role_loop():
+    global color_index
+    # Iterate through all guilds the bot is in
+    for guild in bot.guilds:
+        role = guild.get_role(TARGET_ROLE_ID)
+        
+        if role:
+            try:
+                await role.edit(color=discord.Color(rainbow_colors[color_index]))
+                print(f"Changed {role.name} to color {rainbow_colors[color_index]}")
+            except discord.Forbidden:
+                print(f"Missing permissions to edit role in {guild.name}")
+    
+    # Move to the next color
+    color_index = (color_index + 1) % len(rainbow_colors)
+
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user.name} (ID: {bot.user.id})')
-    print('------')
+    # Start the loop
+    if not rainbow_role_loop.is_running():
+        rainbow_role_loop.start()
 
+# --- Commands ---
 @bot.command()
 async def changecolor(ctx, role_name: str, color_hex: str):
-    """
-    Usage: !changecolor "Role Name" 0xFF0000
-    Changes a role's color using a hex code.
-    """
-    # Convert hex string (e.g., 'FF0000') to discord.Color
     try:
-        # Strip '0x' or '#' if user includes it
         clean_hex = color_hex.replace('0x', '').replace('#', '')
         color = discord.Color(int(clean_hex, 16))
     except ValueError:
