@@ -158,14 +158,12 @@ def roll_loot_drop(user_id):
     else: tier = "secret"
 
     pool = []
-    # Reads directly out of live JSON data objects now!
     for k, v in GAME_DATA.get('weapons', {}).items():
         if v.get('tier', '').lower() == tier: pool.append((k, v, 'weapon'))
     for k, v in GAME_DATA.get('armors', {}).items():
         if v.get('tier', '').lower() == tier: pool.append((k, v, 'armor'))
 
     if not pool:
-        # Emergency safety handler if loaded json lacks specific tier elements
         all_weapons = list(GAME_DATA.get('weapons', {}).items())
         if all_weapons:
             chosen_key, chosen_item = random.choice(all_weapons)
@@ -213,7 +211,6 @@ async def automated_combat_tick():
                 max_hp = player['max_hp'] + armor_bonus
                 stage = player['current_stage']
                 
-                # Dynamic mapping straight from maps.json configuration files
                 map_config = GAME_DATA.get('maps', {}).get('bright_forest', {})
                 stages_config = map_config.get('stages', {})
                 stage_enemies = stages_config.get(str(stage), {})
@@ -223,12 +220,10 @@ async def automated_combat_tick():
                     
                 enemy_id = list(stage_enemies.keys())[0]
                 
-                # Dynamic mapping straight from enemies.json configuration files
                 enemy_template = GAME_DATA.get('enemies', {}).get(enemy_id)
                 if not enemy_template:
                     enemy_template = {"name": enemy_id.replace('_', ' ').title(), "hp": 10, "dmg": 1, "exp": 2}
                 
-                # Automatic verification check for boss profiles
                 is_boss = "boss" in enemy_template.get('name', '').lower() or stage == 10
 
                 if 'enemy_hp' not in session:
@@ -269,7 +264,6 @@ async def automated_combat_tick():
                 enemy_dmg = enemy_template.get('dmg', 0)
                 
                 if is_boss:
-                    # Hardened Spellcaster counter mechanics logic block
                     if session['turn_count'] % 3 == 0:
                         enemy_dmg = enemy_template.get('dmg', 8)
                         session['logs'].append(f"🔮 {enemy_template['name']} casts an ultimate spell!")
@@ -319,6 +313,21 @@ async def on_ready():
     print(f"✅ Logged in successfully as {bot.user}")
 
 # ─── Commands ─────────────────────────────────────────────────────────────────
+@bot.command()
+async def help(ctx):
+    """Custom manual overview configuration."""
+    embed = discord.Embed(
+        title="📜 SjpHelper RPG Help Menu", 
+        description="Welcome adventurer! Here are the active gameplay command modules:", 
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="⚔️ `-dungeon`", value="Enter the dungeon. Combats and updates process completely automatically.", inline=False)
+    embed.add_field(name="🎒 `-inventory`", value="View your collected items, loot drops, and custom stats upgrades.", inline=False)
+    embed.add_field(name="✨ `-equip [Item ID]`", value="Equip items to scale up your dynamic parameters (e.g., `-equip 1`).", inline=False)
+    embed.add_field(name="📊 `-stats`", value="Display your core hero stats profile (Level, current health metrics, ST, MN).", inline=False)
+    embed.set_footer(text="All game mechanics read live from your data/ configuration files.")
+    await ctx.send(embed=embed)
+
 @bot.command()
 async def dungeon(ctx):
     with get_pool().getconn() as conn:
