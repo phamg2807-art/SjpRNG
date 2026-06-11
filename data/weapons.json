@@ -1,1 +1,4 @@
-
+{
+    "rusty_sword": { "name": "Rusty Sword", "dmg": 10, "type": "physical" },
+    "wooden_staff": { "name": "Wooden Staff", "dmg": 8, "type": "magical" }
+}
