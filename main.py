@@ -36,6 +36,32 @@ def load_game_data():
                 json.dump({}, f)
             print(f"⚠️ Created empty {file}")
 
+# ─── Combat Math Logic ───────────────────────────────────────────────────────
+def calculate_damage(player, weapon, enemy):
+    """
+    player: dict (with 'st', 'mn')
+    weapon: dict (with 'dmg', 'type')
+    enemy: dict (with 'df')
+    """
+    base_dmg = weapon.get('dmg', 5)
+    w_type = weapon.get('type', 'physical')
+    
+    # Scaling Logic
+    if w_type == 'physical':
+        # Scale with ST
+        total_dmg = base_dmg * (1 + (player.get('st', 10) / 100))
+    elif w_type == 'magical':
+        # Scale with MN
+        total_dmg = base_dmg * (1 + (player.get('mn', 10) / 100))
+    else:
+        total_dmg = base_dmg
+        
+    # Mitigation (Defense)
+    enemy_df = enemy.get('df', 0)
+    final_dmg = max(1, total_dmg - enemy_df)
+    
+    return round(final_dmg)
+
 # ─── Flask Keep-Alive ─────────────────────────────────────────────────────────
 app = Flask('')
 
@@ -81,7 +107,6 @@ rd = redis.from_url(REDIS_URL, decode_responses=True)
 def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # Enhanced Player Table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS players (
                     user_id BIGINT PRIMARY KEY,
@@ -91,7 +116,6 @@ def init_db():
                     current_map INT DEFAULT 1, current_stage INT DEFAULT 1
                 );
             """)
-            # Parties Table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS parties (
                     party_id SERIAL PRIMARY KEY,
@@ -100,20 +124,17 @@ def init_db():
                     in_dungeon BOOLEAN DEFAULT FALSE
                 );
             """)
-            # Items Master List
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS items (
                     id SERIAL PRIMARY KEY, name TEXT, rarity TEXT, min_level INT, stats JSONB
                 );
             """)
-            # Inventory
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS inventory (
                     id SERIAL PRIMARY KEY, player_id BIGINT REFERENCES players(user_id),
                     item_id INT REFERENCES items(id), equipped BOOLEAN DEFAULT FALSE
                 );
             """)
-            # Market
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS market (
                     id SERIAL PRIMARY KEY, seller_id BIGINT REFERENCES players(user_id),
@@ -136,12 +157,12 @@ bot = commands.Bot(command_prefix='-', intents=intents, help_command=None)
 # ─── Idle Combat Loop ─────────────────────────────────────────────────────────
 @tasks.loop(seconds=30.0)
 async def idle_combat_loop():
-    # Logic: 
-    # 1. Fetch all active parties from Redis/DB
-    # 2. Iterate through parties
-    # 3. Simulate combat (Damage vs Defense)
-    # 4. Update status in Redis
-    # 5. Distribute XP/Gold
+    # This loop will eventually iterate through all parties in the 'parties' table
+    # Example logic skeleton:
+    # 1. Fetch parties with in_dungeon = TRUE
+    # 2. Get party member stats
+    # 3. Calculate combat damage vs current enemy
+    # 4. Save updates
     pass
 
 # ─── UI Components ────────────────────────────────────────────────────────────
@@ -158,23 +179,22 @@ class DungeonView(View):
 async def on_ready():
     init_db()
     load_game_data()
-    idle_combat_loop.start() # Start the engine
+    idle_combat_loop.start()
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
 
 # ─── Commands ─────────────────────────────────────────────────────────────────
 @bot.command()
 async def stats(ctx):
-    # Example command to view stats and unallocated points
+    # This would fetch the player from DB
     await ctx.send("Your Stats: HP 100 | ST 10 | DF 10 | MN 10 | Points: 5")
 
 @bot.command()
 async def upgrade(ctx, stat: str, amount: int):
-    # Example logic for manual stat distribution
+    # This will handle the manual stat distribution logic
     await ctx.send(f"Upgraded {stat} by {amount}!")
 
 @bot.command()
 async def party_create(ctx):
-    # Logic to create party in SQL/Redis
     await ctx.send("Party created! Invite friends with -invite")
 
 @bot.command()
