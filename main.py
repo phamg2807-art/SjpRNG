@@ -195,7 +195,7 @@ def db_apply_bank_interest(user_id):
             cur.execute("SELECT bank FROM wallets WHERE user_id=%s", (user_id,))
             row = cur.fetchone()
             if row and row["bank"] > 0:
-                interest = max(1, int(row["bank"] * 0.05))
+                interest = max(1, int(row["bank"] * 0.01))
                 cur.execute("UPDATE wallets SET bank=bank+%s, last_bank_interest_at=NOW() WHERE user_id=%s",
                             (interest, user_id))
         conn.commit()
@@ -358,11 +358,13 @@ def db_check_spam(user_id, content) -> bool:
 
 # ─── Credit Earning ───────────────────────────────────────────────────────────
 def compute_credit_award(total_messages: int) -> int:
-    """1 base credit + milestone multipliers (stack)."""
+    """1 base credit + milestone multipliers."""
     credits = 1
-    if total_messages % 1000 == 0: credits *= 5
-    elif total_messages % 500 == 0: credits *= 3
-    elif total_messages % 100 == 0: credits *= 2
+    if   total_messages % 100_000 == 0: credits *= 10
+    elif total_messages %  50_000 == 0: credits *= 5
+    elif total_messages %  25_000 == 0: credits *= 4
+    elif total_messages %  10_000 == 0: credits *= 3
+    elif total_messages %   1_000 == 0: credits *= 2
     return credits
 
 # ─── Existing DB Helpers ──────────────────────────────────────────────────────
@@ -1076,7 +1078,7 @@ async def balance_cmd(ctx, member: discord.Member = None):
     e.add_field(name="👛 Wallet",  value=f"**{w['balance']:,} ₡**", inline=True)
     e.add_field(name="🏦 Bank",   value=f"**{w['bank']:,} ₡**",    inline=True)
     e.add_field(name="💰 Total",  value=f"**{w['balance']+w['bank']:,} ₡**", inline=True)
-    e.add_field(name="📈 Interest", value="×1.05 per message on bank balance", inline=False)
+    e.add_field(name="📈 Interest", value="+1% per message on bank balance", inline=False)
     # Active effects summary
     if effects:
         eff_lines = []
@@ -1085,7 +1087,21 @@ async def balance_cmd(ctx, member: discord.Member = None):
             elif etype == "stack_mult": eff_lines.append(f"⚡ ×{int(row['value'])} rolls  ·  {int(row['remaining'])} msg left")
             elif etype == "skip_msgs":  eff_lines.append(f"⏩ Skipping  ·  {int(row['remaining'])} msgs left")
         if eff_lines: e.add_field(name="Active Effects", value="\n".join(eff_lines), inline=False)
-    e.set_footer(text="Earn credits by chatting  ·  Milestones: ×2 @100, ×3 @500, ×5 @1000 msgs")
+    e.set_footer(text="Earn credits by chatting  ·  Milestones: ×2 @1k, ×3 @10k, ×4 @25k, ×5 @50k, ×10 @100k msgs")
+    await ctx.send(embed=e)
+
+@bot.command(name="bank", aliases=["savings"])
+async def bank_cmd(ctx, member: discord.Member = None):
+    """Check your bank account details."""
+    target = member or ctx.author
+    w = db_get_wallet(target.id)
+    e = discord.Embed(title=f"🏦  {target.display_name}'s Bank", color=0x2ECC71)
+    e.set_thumbnail(url=target.display_avatar.url)
+    e.add_field(name="🏦 Bank Balance", value=f"**{w['bank']:,} ₡**", inline=True)
+    e.add_field(name="👛 Wallet",       value=f"**{w['balance']:,} ₡**", inline=True)
+    e.add_field(name="💰 Total",        value=f"**{w['balance']+w['bank']:,} ₡**", inline=True)
+    e.add_field(name="📈 Interest Rate", value="**+1%** of bank balance per message sent", inline=False)
+    e.set_footer(text="Use -deposit <amount|all> to move credits into the bank")
     await ctx.send(embed=e)
 
 @bot.command(name="deposit", aliases=["dep"])
@@ -1502,7 +1518,8 @@ async def help_cmd(ctx):
 
     e.add_field(name="💰 Credits & Economy", value=(
         "`-balance` (`-bal`) — Wallet, bank & active effects\n"
-        "`-deposit <amount|all>` (`-dep`) — Deposit to bank (+5% interest/msg)\n"
+        "`-bank` (`-savings`) — Detailed bank account view\n"
+        "`-deposit <amount|all>` (`-dep`) — Deposit to bank (+1% interest/msg)\n"
         "`-withdraw <amount|all>` (`-with`) — Withdraw from bank"
     ), inline=False)
 
