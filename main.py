@@ -16,7 +16,7 @@ sys.stdout.reconfigure(line_buffering=True)
 
 # ─── Game Data Config & Safe Initialization ─────────────────────────────────
 GAME_DATA = {}
-ACTIVE_DUNGEONS = {}  # Tracks running automated runs: {user_id: {message_object, current_enemy_hp, log_history}}
+ACTIVE_DUNGEONS = {}  # Tracks running automated runs: {user_id: {message_object, dungeon_id, current_enemy_hp, log_history}}
 
 # Clean templates used ONLY to heal empty or missing files on startup
 DEFAULT_WEAPONS = {
@@ -114,10 +114,11 @@ def get_pool():
 REDIS_URL = os.getenv('REDIS_URL') or exit("ERROR: REDIS_URL missing!")
 rd = redis.from_url(REDIS_URL, decode_responses=True)
 
-# ─── DB Initialization ────────────────────────────────────────────────────────
+# ─── DB Initialization & Migrations ──────────────────────────────────────────
 def init_db():
     with get_pool().getconn() as conn:
         with conn.cursor() as cur:
+            # 1. Base table schema generation
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS players (
                     user_id BIGINT PRIMARY KEY,
@@ -126,6 +127,19 @@ def init_db():
                     current_stage INT DEFAULT 1, is_exploring BOOLEAN DEFAULT FALSE
                 );
             """)
+            
+            # 2. Automated Hotpatch Migration: Forcefully injection check columns on pre-existing deployment data tables
+            cur.execute("ALTER TABLE players ADD COLUMN IF NOT EXISTS max_hp INT DEFAULT 100;")
+            cur.execute("ALTER TABLE players ADD COLUMN IF NOT EXISTS st INT DEFAULT 10;")
+            cur.execute("ALTER TABLE players ADD COLUMN IF NOT EXISTS df INT DEFAULT 10;")
+            cur.execute("ALTER TABLE players ADD COLUMN IF NOT EXISTS mn INT DEFAULT 10;")
+            cur.execute("ALTER TABLE players ADD COLUMN IF NOT EXISTS unallocated_points INT DEFAULT 5;")
+            cur.execute("ALTER TABLE players ADD COLUMN IF NOT EXISTS gold INT DEFAULT 0;")
+            cur.execute("ALTER TABLE players ADD COLUMN IF NOT EXISTS xp INT DEFAULT 0;")
+            cur.execute("ALTER TABLE players ADD COLUMN IF NOT EXISTS level INT DEFAULT 1;")
+            cur.execute("ALTER TABLE players ADD COLUMN IF NOT EXISTS current_stage INT DEFAULT 1;")
+            cur.execute("ALTER TABLE players ADD COLUMN IF NOT EXISTS is_exploring BOOLEAN DEFAULT FALSE;")
+            
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS user_inventory (
                     id SERIAL PRIMARY KEY,
@@ -140,7 +154,7 @@ def init_db():
             """)
         conn.commit()
         get_pool().putconn(conn)
-    print("✅ Database layers synced.")
+    print("✅ Database layers and existing tables successfully modified.")
 
 # ─── Bot Setup ────────────────────────────────────────────────────────────────
 TOKEN = os.getenv('DISCORD_TOKEN') or exit("ERROR: DISCORD_TOKEN missing!")
@@ -211,7 +225,11 @@ async def automated_combat_tick():
                 max_hp = player['max_hp'] + armor_bonus
                 stage = player['current_stage']
                 
-                map_config = GAME_DATA.get('maps', {}).get('bright_forest', {})
+                # Dynamic mapping straight from chosen dungeon identifier
+                dungeon_id = session.get('dungeon_id', 'bright_forest')
+                map_config = GAME_DATA.get('maps', {}).get(dungeon_id, {})
+                dungeon_name = map_config.get('name', dungeon_id.replace('_', ' ').title())
+                
                 stages_config = map_config.get('stages', {})
                 stage_enemies = stages_config.get(str(stage), {})
                 
@@ -248,7 +266,7 @@ async def automated_combat_tick():
                         drop2 = roll_loot_drop(user_id)
                         drop3 = roll_loot_drop(user_id)
                         
-                        embed = discord.Embed(title="🏆 DUNGEON CLEAR!", description=f"You successfully conquered the **Bright Forest**!\n\n🎁 **Boss Loot Drops Received:**\n1. {drop1}\n2. {drop2}\n3. {drop3}", color=discord.Color.gold())
+                        embed = discord.Embed(title=f"🏆 {dungeon_name.upper()} CLEAR!", description=f"You successfully conquered the **{dungeon_name}**!\n\n🎁 **Boss Loot Drops Received:**\n1. {drop1}\n2. {drop2}\n3. {drop3}", color=discord.Color.gold())
                         bot.loop.create_task(session['message'].edit(embed=embed, view=None))
                         to_remove.append(user_id)
                         continue
@@ -280,7 +298,7 @@ async def automated_combat_tick():
                         session['logs'].append("💀 You collapsed in battle! Fleeing safely to camp.")
                         cur.execute("UPDATE players SET is_exploring = FALSE, hp = 20, current_stage = 1 WHERE user_id = %s", (user_id,))
                         conn.commit()
-                        embed = discord.Embed(title="💀 Defeated!", description="Your party ran out of health and was forced out of the dungeon.", color=discord.Color.red())
+                        embed = discord.Embed(title="💀 Defeated!", description=f"Your party ran out of health and was forced out of {dungeon_name}.", color=discord.Color.red())
                         bot.loop.create_task(session['message'].edit(embed=embed, view=None))
                         to_remove.append(user_id)
                         continue
@@ -291,7 +309,7 @@ async def automated_combat_tick():
                 hp_bar_pct = max(0, min(10, int((player['hp'] / max_hp) * 10)))
                 hp_bar = "🟩" * hp_bar_pct + "⬛" * (10 - hp_bar_pct)
 
-                embed = discord.Embed(title="⚔️ Dungeon: Bright Forest (AUTO)", color=discord.Color.dark_green())
+                embed = discord.Embed(title=f"⚔️ Dungeon: {dungeon_name} (AUTO)", color=discord.Color.dark_green())
                 embed.add_field(name="❤️ Your HP Status", value=f"{hp_bar} ({player['hp']}/{max_hp})", inline=False)
                 embed.add_field(name="👾 Current Target Status", value=f"**{enemy_template['name']}**: {session['enemy_hp']} HP", inline=True)
                 embed.add_field(name="🚩 Stage Progress", value=f"Stage **{stage}/10**", inline=True)
@@ -303,6 +321,51 @@ async def automated_combat_tick():
 
     for uid in to_remove:
         if uid in ACTIVE_DUNGEONS: del ACTIVE_DUNGEONS[uid]
+
+# ─── Interactive Selection UI Component Modules ─────────────────────────────
+class DungeonDropdown(discord.ui.Select):
+    def __init__(self, options_list):
+        super().__init__(placeholder="Select a dungeon landscape map...", min_values=1, max_values=1, options=options_list)
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.view.author_id:
+            await interaction.response.send_message("❌ You are not the author initiating this dungeon sequence.", ephemeral=True)
+            return
+
+        dungeon_id = self.values[0]
+        user_id = interaction.user.id
+
+        if user_id in ACTIVE_DUNGEONS:
+            await interaction.response.send_message("⚠️ You are already executing an active dynamic run!", ephemeral=True)
+            return
+
+        with get_pool().getconn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO players (user_id, hp, max_hp) VALUES (%s, 100, 100)
+                    ON CONFLICT (user_id) DO NOTHING
+                """, (user_id,))
+                conn.commit()
+            get_pool().putconn(conn)
+
+        map_config = GAME_DATA.get('maps', {}).get(dungeon_id, {})
+        dungeon_name = map_config.get('name', dungeon_id.replace('_', ' ').title())
+
+        embed = discord.Embed(title=f"⚔️ Entering {dungeon_name}...", description="Initializing automatic battle sequence lines...", color=discord.Color.green())
+        await interaction.response.edit_message(embed=embed, view=None)
+        msg = await interaction.original_response()
+
+        ACTIVE_DUNGEONS[user_id] = {
+            "message": msg,
+            "dungeon_id": dungeon_id,
+            "logs": [f"🚀 Character entered {dungeon_name}."]
+        }
+
+class DungeonDropdownView(discord.ui.View):
+    def __init__(self, author_id, options_list):
+        super().__init__(timeout=30)
+        self.author_id = author_id
+        self.add_item(DungeonDropdown(options_list))
 
 # ─── Events ───────────────────────────────────────────────────────────────────
 @bot.event
@@ -321,7 +384,7 @@ async def help(ctx):
         description="Welcome adventurer! Here are the active gameplay command modules:", 
         color=discord.Color.blue()
     )
-    embed.add_field(name="⚔️ `-dungeon`", value="Enter the dungeon. Combats and updates process completely automatically.", inline=False)
+    embed.add_field(name="⚔️ `-dungeon [optional_name]`", value="Enter selection screen or pass name directly (e.g., `-dungeon bright_forest`).", inline=False)
     embed.add_field(name="🎒 `-inventory`", value="View your collected items, loot drops, and custom stats upgrades.", inline=False)
     embed.add_field(name="✨ `-equip [Item ID]`", value="Equip items to scale up your dynamic parameters (e.g., `-equip 1`).", inline=False)
     embed.add_field(name="📊 `-stats`", value="Display your core hero stats profile (Level, current health metrics, ST, MN).", inline=False)
@@ -329,29 +392,51 @@ async def help(ctx):
     await ctx.send(embed=embed)
 
 @bot.command()
-async def dungeon(ctx):
-    with get_pool().getconn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO players (user_id, hp, max_hp) VALUES (%s, 100, 100)
-                ON CONFLICT (user_id) DO NOTHING
-            """, (ctx.author.id,))
-            conn.commit()
-            cur.execute("SELECT * FROM players WHERE user_id = %s", (ctx.author.id,))
-            player = cur.fetchone()
-        get_pool().putconn(conn)
-
+async def dungeon(ctx, choice: str = None):
     if ctx.author.id in ACTIVE_DUNGEONS:
         await ctx.send("⚠️ You are already automatically playing in a dungeon session right now!")
         return
 
-    embed = discord.Embed(title="⚔️ Entering Bright Forest...", description="Initializing automatic battle sequence lines...", color=discord.Color.green())
-    msg = await ctx.send(embed=embed)
-    
-    ACTIVE_DUNGEONS[ctx.author.id] = {
-        "message": msg,
-        "logs": ["🚀 Character entered Bright Forest."]
-    }
+    maps_pool = GAME_DATA.get('maps', {})
+    if not maps_pool:
+        await ctx.send("❌ Error: No maps are loaded into the game architecture config files.")
+        return
+
+    # Direct Argument Route (e.g., `-dungeon bright_forest`)
+    if choice and choice in maps_pool:
+        with get_pool().getconn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO players (user_id, hp, max_hp) VALUES (%s, 100, 100)
+                    ON CONFLICT (user_id) DO NOTHING
+                """, (ctx.author.id,))
+                conn.commit()
+            get_pool().putconn(conn)
+
+        dungeon_name = maps_pool[choice].get('name', choice.replace('_', ' ').title())
+        embed = discord.Embed(title=f"⚔️ Entering {dungeon_name}...", description="Initializing automatic battle sequence lines...", color=discord.Color.green())
+        msg = await ctx.send(embed=embed)
+        
+        ACTIVE_DUNGEONS[ctx.author.id] = {
+            "message": msg,
+            "dungeon_id": choice,
+            "logs": [f"🚀 Character entered {dungeon_name}."]
+        }
+        return
+
+    # Dropdown Component Selection Layout Route
+    options = []
+    for key, data in maps_pool.items():
+        name = data.get('name', key.replace('_', ' ').title())
+        options.append(discord.SelectOption(label=name, value=key, description=f"Explore stages inside {name}"))
+
+    embed = discord.Embed(
+        title="🗺️ Dungeon Selection Hub",
+        description="Choose which region map from your configuration lines you want your automated party to venture into below:",
+        color=discord.Color.blurple()
+    )
+    view = DungeonDropdownView(ctx.author.id, options)
+    await ctx.send(embed=embed, view=view)
 
 @bot.command()
 async def inventory(ctx):
