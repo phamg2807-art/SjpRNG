@@ -103,6 +103,23 @@ def init_db():
                     last_msg_hash TEXT,
                     repeat_count  INT DEFAULT 0,
                     muted_until   TIMESTAMPTZ);
+
+                CREATE TABLE IF NOT EXISTS casino_stats (
+                    user_id     BIGINT PRIMARY KEY,
+                    total_bet   BIGINT DEFAULT 0,
+                    total_won   BIGINT DEFAULT 0,
+                    total_lost  BIGINT DEFAULT 0,
+                    games_played INT DEFAULT 0,
+                    biggest_win  BIGINT DEFAULT 0,
+                    biggest_loss BIGINT DEFAULT 0);
+
+                CREATE TABLE IF NOT EXISTS custom_replies (
+                    id          SERIAL PRIMARY KEY,
+                    trigger_uid BIGINT,
+                    trigger_kw  TEXT,
+                    reply       TEXT NOT NULL,
+                    match_type  TEXT DEFAULT 'contains',
+                    created_at  TIMESTAMPTZ DEFAULT NOW());
             """)
             for sql in [
                 "ALTER TABLE inventory ADD COLUMN IF NOT EXISTS last_found_at TIMESTAMPTZ DEFAULT NOW();",
@@ -112,22 +129,14 @@ def init_db():
     print("✅ Database tables ready")
 
 # ─── Item Catalog ─────────────────────────────────────────────────────────────
-# effect_type keys used in item_effects table:
-#   luck_bonus   – flat luck added to roll window (remaining = messages left)
-#   stack_mult   – roll multiplier per message   (remaining = messages left)
-#   skip_msgs    – pending message count to skip  (remaining = messages to skip)
-
 ITEMS = {
-    # Potions — luck_bonus
     "karma_potion":   {"name":"Karma Potion",   "tier":"common",    "price":140,  "effect":"luck_bonus",  "value":2_000,   "duration":1,    "desc":"+2,000 luck for your next message"},
     "blessed_potion": {"name":"Blessed Potion", "tier":"uncommon",  "price":430,  "effect":"luck_bonus",  "value":10_000,  "duration":1,    "desc":"+10,000 luck for your next message"},
     "godsend_potion": {"name":"Godsend Potion", "tier":"epic",      "price":780,  "effect":"luck_bonus",  "value":70_000,  "duration":1,    "desc":"+70,000 luck for your next message"},
     "divine_potion":  {"name":"Divine Potion",  "tier":"legendary", "price":1200, "effect":"luck_bonus",  "value":220_000, "duration":1,    "desc":"+220,000 luck for your next message"},
-    # Stack Syndrome — stack_mult
     "basic_stack":    {"name":"Basic Stack Syndrome",    "tier":"common",   "price":80,  "effect":"stack_mult", "value":2, "duration":100,   "desc":"×2 rolls per message for 100 messages"},
     "adv_stack":      {"name":"Advanced Stack Syndrome", "tier":"uncommon", "price":380, "effect":"stack_mult", "value":3, "duration":300,   "desc":"×3 rolls per message for 300 messages"},
     "master_stack":   {"name":"Master Stack Syndrome",   "tier":"epic",     "price":620, "effect":"stack_mult", "value":5, "duration":1000,  "desc":"×5 rolls per message for 1,000 messages"},
-    # Skip
     "basic_skip":     {"name":"Basic Skip",   "tier":"uncommon",  "price":450,  "effect":"skip_msgs",  "value":500,    "duration":0,    "desc":"Skip 500 messages (counts toward streaks)"},
     "adv_skip":       {"name":"Advanced Skip","tier":"legendary", "price":970,  "effect":"skip_msgs",  "value":5000,   "duration":0,    "desc":"Skip 5,000 messages"},
     "master_skip":    {"name":"Master Skip",  "tier":"secret",    "price":5000, "effect":"skip_msgs",  "value":15000,  "duration":0,    "desc":"Skip 15,000 messages"},
@@ -137,13 +146,113 @@ ITEM_TIER_COLOR  = {"common":0x8B9099,"uncommon":0x2ECC71,"epic":0xC97FD4,"legen
 ITEM_TIER_EMOJI  = {"common":"⚪","uncommon":"🟢","epic":"💜","legendary":"💎","secret":"🌟"}
 ITEM_TIER_BADGE  = {"common":"· COMMON","uncommon":"◉ UNCOMMON","epic":"◇ EPIC","legendary":"◆ LEGENDARY","secret":"✦ SECRET"}
 
-# Weights for daily store rotation
 DAILY_TIER_WEIGHTS = {"common":45,"uncommon":35,"epic":15,"legendary":4,"secret":1}
 DAILY_SLOT_COUNT   = 5
 DAILY_STOCK        = {"common":10,"uncommon":6,"epic":3,"legendary":2,"secret":1}
 
-GENERAL_CHANNEL_ID  = 900029761638793236
+GENERAL_CHANNEL_ID      = 900029761638793236
 ANNOUNCEMENT_CHANNEL_ID = 900015775069401128
+
+# ─── Casino Config ────────────────────────────────────────────────────────────
+MIN_BET      = 10
+MAX_BET      = 500_000
+CASINO_COLOR = 0xF1C40F
+
+# Slot machine symbols: (emoji, weight, multiplier)
+SLOT_SYMBOLS = [
+    ("🍒", 35, 2),
+    ("🍋", 25, 3),
+    ("🍊", 18, 4),
+    ("🍇", 12, 5),
+    ("💎", 6,  10),
+    ("7️⃣", 3,  20),
+    ("🌑", 1,  100),
+]
+
+# ─── DB: Casino Stats ─────────────────────────────────────────────────────────
+def db_ensure_casino(user_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO casino_stats(user_id) VALUES(%s) ON CONFLICT DO NOTHING", (user_id,))
+        conn.commit()
+
+def db_get_casino_stats(user_id):
+    db_ensure_casino(user_id)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM casino_stats WHERE user_id=%s", (user_id,))
+            return cur.fetchone()
+
+def db_record_casino(user_id, bet, net):
+    """net positive = won, net negative = lost."""
+    db_ensure_casino(user_id)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if net >= 0:
+                cur.execute("""UPDATE casino_stats SET
+                    total_bet=total_bet+%s, total_won=total_won+%s,
+                    games_played=games_played+1,
+                    biggest_win=GREATEST(biggest_win,%s)
+                    WHERE user_id=%s""", (bet, net, net, user_id))
+            else:
+                loss = abs(net)
+                cur.execute("""UPDATE casino_stats SET
+                    total_bet=total_bet+%s, total_lost=total_lost+%s,
+                    games_played=games_played+1,
+                    biggest_loss=GREATEST(biggest_loss,%s)
+                    WHERE user_id=%s""", (bet, loss, loss, user_id))
+        conn.commit()
+
+def db_casino_leaderboard():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT user_id, total_won, total_lost, biggest_win, games_played,
+                (total_won - total_lost) AS net
+                FROM casino_stats ORDER BY net DESC LIMIT 10""")
+            return cur.fetchall()
+
+# ─── DB: Custom Replies ───────────────────────────────────────────────────────
+def db_get_custom_replies():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM custom_replies ORDER BY id")
+            return cur.fetchall()
+
+def db_add_custom_reply(trigger_uid, trigger_kw, reply, match_type="contains"):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO custom_replies(trigger_uid,trigger_kw,reply,match_type) VALUES(%s,%s,%s,%s)",
+                        (trigger_uid, trigger_kw, reply, match_type))
+        conn.commit()
+
+def db_delete_custom_reply(reply_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM custom_replies WHERE id=%s", (reply_id,))
+        conn.commit()
+
+def db_check_custom_reply(user_id, content):
+    """Returns a matching reply text or None."""
+    content_lower = content.lower()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM custom_replies")
+            rows = cur.fetchall()
+    for row in rows:
+        # User trigger
+        if row["trigger_uid"] and row["trigger_uid"] != user_id:
+            continue
+        kw = (row["trigger_kw"] or "").lower()
+        mt = row["match_type"]
+        if kw:
+            if mt == "exact" and content_lower.strip() != kw:
+                continue
+            elif mt == "startswith" and not content_lower.startswith(kw):
+                continue
+            elif mt == "contains" and kw not in content_lower:
+                continue
+        return row["reply"]
+    return None
 
 # ─── DB: Wallets & Credits ────────────────────────────────────────────────────
 def db_ensure_wallet(user_id):
@@ -165,6 +274,17 @@ def db_add_credits(user_id, amount):
         with conn.cursor() as cur:
             cur.execute("UPDATE wallets SET balance=balance+%s WHERE user_id=%s", (amount, user_id))
         conn.commit()
+
+def db_deduct_credits(user_id, amount):
+    """Returns True if successful."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT balance FROM wallets WHERE user_id=%s FOR UPDATE", (user_id,))
+            row = cur.fetchone()
+            if not row or row["balance"] < amount: return False
+            cur.execute("UPDATE wallets SET balance=balance-%s WHERE user_id=%s", (amount, user_id))
+        conn.commit()
+    return True
 
 def db_transfer_to_bank(user_id, amount):
     with get_conn() as conn:
@@ -189,7 +309,6 @@ def db_transfer_from_bank(user_id, amount):
     return True, None
 
 def db_apply_bank_interest(user_id):
-    """Apply 5% interest per message on bank balance (compounded per message)."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT bank FROM wallets WHERE user_id=%s", (user_id,))
@@ -223,7 +342,6 @@ def db_apply_effect(user_id, effect_type, value, remaining):
         conn.commit()
 
 def db_tick_effect(user_id, effect_type, decrement=1):
-    """Decrement remaining; return (value, remaining_after). Returns (0,0) if gone."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT value,remaining FROM item_effects WHERE user_id=%s AND effect_type=%s",
@@ -256,7 +374,6 @@ def db_add_item(user_id, item_id, qty=1):
         conn.commit()
 
 def db_use_item(user_id, item_id):
-    """Returns True if item was consumed, False if not owned."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT quantity FROM item_inventory WHERE user_id=%s AND item_id=%s FOR UPDATE",
@@ -279,7 +396,6 @@ def db_rotate_store():
     weights = [DAILY_TIER_WEIGHTS[t] for t in tiers]
     chosen_items = []
     pool = [(iid, item) for iid, item in ITEMS.items()]
-    # Pick 5 unique items weighted by tier
     for _ in range(DAILY_SLOT_COUNT):
         available = [(iid, item) for iid, item in pool if iid not in [x[0] for x in chosen_items]]
         if not available: break
@@ -299,7 +415,6 @@ def db_rotate_store():
     return db_get_daily_store()
 
 def db_buy_store_item(slot, user_id):
-    """Returns (item_id, price) or raises ValueError with reason."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM daily_store WHERE slot=%s FOR UPDATE", (slot,))
@@ -317,8 +432,6 @@ def db_buy_store_item(slot, user_id):
 
 # ─── DB: Spam Guard ───────────────────────────────────────────────────────────
 def db_check_spam(user_id, content) -> bool:
-    """Returns True if message is spam/should be ignored for credits."""
-    # Normalize: strip, lowercase, collapse whitespace
     normalized = re.sub(r'\s+', ' ', content.strip().lower())
     msg_hash = normalized[:120]
     with get_conn() as conn:
@@ -326,28 +439,21 @@ def db_check_spam(user_id, content) -> bool:
             cur.execute("SELECT * FROM spam_guard WHERE user_id=%s", (user_id,))
             row = cur.fetchone()
             now = datetime.now(timezone.utc)
-
             if row and row["muted_until"] and row["muted_until"] > now:
-                return True  # still rate-limited
-
+                return True
             is_spam = False
             repeat_count = 0
-
             if row:
                 if row["last_msg_hash"] == msg_hash:
                     repeat_count = row["repeat_count"] + 1
                     if repeat_count >= 4: is_spam = True
                 else:
                     repeat_count = 0
-
-            # Too short / meaningless heuristic
             if len(normalized) < 2 or normalized in {".", ",", "!", "?", "-", "a", "i"}:
                 is_spam = True
-
             muted_until = None
             if is_spam and repeat_count >= 4:
                 muted_until = now + timedelta(minutes=2)
-
             cur.execute("""INSERT INTO spam_guard(user_id,last_msg_hash,repeat_count,muted_until)
                 VALUES(%s,%s,%s,%s) ON CONFLICT(user_id) DO UPDATE
                 SET last_msg_hash=%s, repeat_count=%s, muted_until=%s""",
@@ -358,7 +464,6 @@ def db_check_spam(user_id, content) -> bool:
 
 # ─── Credit Earning ───────────────────────────────────────────────────────────
 def compute_credit_award(total_messages: int) -> int:
-    """1 base credit + milestone multipliers."""
     credits = 1
     if   total_messages % 100_000 == 0: credits *= 10
     elif total_messages %  50_000 == 0: credits *= 5
@@ -592,11 +697,20 @@ def rarity_bar(chance):
     return "▰"*filled + "▱"*(6-filled)
 def owner_check(interaction, uid): return interaction.user.id == uid
 
+def parse_bet(amount_str: str, balance: int) -> int | None:
+    """Parse bet amount, supporting 'all', 'half', 'k', 'm' suffixes. Returns None on error."""
+    s = amount_str.lower().strip()
+    if s in ("all", "max"): return min(balance, MAX_BET)
+    if s == "half": return min(balance // 2, MAX_BET)
+    try:
+        if s.endswith("k"): return int(float(s[:-1]) * 1_000)
+        if s.endswith("m"): return int(float(s[:-1]) * 1_000_000)
+        return int(s)
+    except ValueError:
+        return None
+
 def build_daily_store_embed(rows):
-    """Build the embed for the daily store."""
-    e = discord.Embed(title="🛒  Daily Store", color=0xF4D03F,
-                      timestamp=datetime.now(timezone.utc))
-    # Next reroll at midnight UTC+7 = 17:00 UTC
+    e = discord.Embed(title="🛒  Daily Store", color=0xF4D03F, timestamp=datetime.now(timezone.utc))
     now_utc = datetime.now(timezone.utc)
     next_reroll = now_utc.replace(hour=17, minute=0, second=0, microsecond=0)
     if now_utc.hour >= 17: next_reroll += timedelta(days=1)
@@ -609,8 +723,7 @@ def build_daily_store_embed(rows):
         stock_bar = "▰" * row["stock"] + "▱" * max(0, DAILY_STOCK.get(tier,3) - row["stock"])
         e.add_field(
             name=f"{ITEM_TIER_EMOJI[tier]}  `{i+1}.`  {item['name']}",
-            value=(f"`{ITEM_TIER_BADGE[tier]}`\n"
-                   f"{item['desc']}\n"
+            value=(f"`{ITEM_TIER_BADGE[tier]}`\n{item['desc']}\n"
                    f"**{row['price']:,} ₡**  ·  Stock: `{stock_bar}` {row['stock']}"),
             inline=False)
     e.set_footer(text="Use -buy <slot number> to purchase")
@@ -670,6 +783,63 @@ async def do_animated_roll(channel, prize, user):
     if announce:
         ch = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
         if ch: await ch.send(content="@everyone  🌑  **A mythic prize has just been rolled!**", embed=final)
+
+# ─── Casino Helpers ───────────────────────────────────────────────────────────
+def card_value(card):
+    rank = card[:-1]
+    if rank in ("J","Q","K"): return 10
+    if rank == "A": return 11
+    return int(rank)
+
+def hand_value(hand):
+    total = sum(card_value(c) for c in hand)
+    aces = sum(1 for c in hand if c[:-1] == "A")
+    while total > 21 and aces:
+        total -= 10; aces -= 1
+    return total
+
+def hand_str(hand, hide_second=False):
+    if hide_second:
+        return f"`{hand[0]}`  `??`"
+    return "  ".join(f"`{c}`" for c in hand)
+
+def new_deck():
+    suits = ["♠","♥","♦","♣"]
+    ranks = ["2","3","4","5","6","7","8","9","10","J","Q","K","A"]
+    deck = [f"{r}{s}" for r in ranks for s in suits] * 6
+    random.shuffle(deck)
+    return deck
+
+def spin_slots():
+    symbols = [s[0] for s in SLOT_SYMBOLS]
+    weights = [s[1] for s in SLOT_SYMBOLS]
+    return random.choices(symbols, weights=weights, k=3)
+
+def slot_payout(reels, bet):
+    if reels[0] == reels[1] == reels[2]:
+        sym = reels[0]
+        mult = next(s[2] for s in SLOT_SYMBOLS if s[0] == sym)
+        return bet * mult, f"**JACKPOT!** ×{mult}"
+    if reels[0] == reels[1] or reels[1] == reels[2]:
+        return int(bet * 1.5), "Two in a row  ×1.5"
+    return 0, "No match"
+
+def roulette_resolve(bet_type: str, number: int):
+    """Returns multiplier or 0. bet_type: red/black/even/odd/0-36"""
+    reds = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
+    if bet_type.isdigit():
+        n = int(bet_type)
+        return 35 if number == n else 0
+    if bet_type == "red":    return 2 if number in reds and number != 0 else 0
+    if bet_type == "black":  return 2 if number not in reds and number != 0 else 0
+    if bet_type == "even":   return 2 if number != 0 and number % 2 == 0 else 0
+    if bet_type == "odd":    return 2 if number % 2 == 1 else 0
+    if bet_type == "low":    return 2 if 1 <= number <= 18 else 0
+    if bet_type == "high":   return 2 if 19 <= number <= 36 else 0
+    return 0
+
+# ─── Active Blackjack Sessions (in-memory) ───────────────────────────────────
+_bj_sessions: dict[int, dict] = {}  # user_id -> session
 
 # ─── Modals ───────────────────────────────────────────────────────────────────
 class PrizeMakerModal(discord.ui.Modal, title="Create / Edit Prize"):
@@ -769,6 +939,7 @@ class LeaderboardTypeSelect(discord.ui.Select):
             discord.SelectOption(label="Rarest Finds",    value="rarest",   default=(current=="rarest")),
             discord.SelectOption(label="Most Messages",   value="messages", default=(current=="messages")),
             discord.SelectOption(label="Richest",         value="credits",  default=(current=="credits")),
+            discord.SelectOption(label="Casino — Top Winners", value="casino", default=(current=="casino")),
         ])
         self.guild = guild; self.owner_id = owner_id
     async def callback(self, i):
@@ -949,6 +1120,18 @@ class LeaderboardView(discord.ui.View):
                 m = self.guild.get_member(r["user_id"])
                 name = m.display_name if m else f"User {r['user_id']}"
                 e.add_field(name=f"{medals[i]}  {name}", value=f"**{int(r['total_messages']):,}** messages", inline=False)
+        elif self.lb_type == "casino":
+            results = db_casino_leaderboard()
+            e = discord.Embed(title="🎰  Casino — Top Winners", color=CASINO_COLOR)
+            e.description = "Ranked by net profit in casino games.\n\u200b"
+            for i, r in enumerate(results):
+                m = self.guild.get_member(r["user_id"])
+                name = m.display_name if m else f"User {r['user_id']}"
+                net = int(r["net"])
+                sign = "+" if net >= 0 else ""
+                e.add_field(name=f"{medals[i]}  {name}",
+                    value=(f"Net  **{sign}{net:,} ₡**  ·  {int(r['games_played'])} games\n"
+                           f"Biggest win  **{int(r['biggest_win']):,} ₡**"), inline=False)
         else:  # credits
             results = db_leaderboard_credits()
             e = discord.Embed(title="Richest Players", color=0xF1C40F)
@@ -991,6 +1174,117 @@ class DailyStoreView(discord.ui.View):
         rows = db_get_daily_store()
         await i.response.edit_message(embed=build_daily_store_embed(rows), view=DailyStoreView(rows, self.owner_id))
 
+# ─── Blackjack View ───────────────────────────────────────────────────────────
+class BlackjackView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=60)
+        self.user_id = user_id
+
+    def _check(self, i):
+        return i.user.id == self.user_id
+
+    @discord.ui.button(label="🃏 Hit",      style=discord.ButtonStyle.primary,   row=0)
+    async def hit_btn(self, i, b):
+        if not self._check(i): await i.response.send_message("This isn't your game!", ephemeral=True); return
+        sess = _bj_sessions.get(self.user_id)
+        if not sess: await i.response.edit_message(content="Session expired.", view=None); return
+        sess["player"].append(sess["deck"].pop())
+        pv = hand_value(sess["player"])
+        if pv > 21:
+            # bust
+            bet = sess["bet"]
+            db_add_credits(self.user_id, 0)  # no refund
+            db_record_casino(self.user_id, bet, -bet)
+            _bj_sessions.pop(self.user_id, None)
+            e = _bj_embed(sess, bust=True)
+            await i.response.edit_message(embed=e, view=None)
+        else:
+            e = _bj_embed(sess)
+            await i.response.edit_message(embed=e, view=self)
+
+    @discord.ui.button(label="🛑 Stand",    style=discord.ButtonStyle.secondary, row=0)
+    async def stand_btn(self, i, b):
+        if not self._check(i): await i.response.send_message("This isn't your game!", ephemeral=True); return
+        await _bj_resolve(i, self.user_id, action="stand")
+
+    @discord.ui.button(label="⚡ Double",   style=discord.ButtonStyle.success,   row=0)
+    async def double_btn(self, i, b):
+        if not self._check(i): await i.response.send_message("This isn't your game!", ephemeral=True); return
+        sess = _bj_sessions.get(self.user_id)
+        if not sess: await i.response.edit_message(content="Session expired.", view=None); return
+        # Double down: pay extra bet then force one card + stand
+        extra = sess["bet"]
+        w = db_get_wallet(self.user_id)
+        if w["balance"] < extra:
+            await i.response.send_message("❌ Not enough credits to double down!", ephemeral=True); return
+        db_deduct_credits(self.user_id, extra)
+        sess["bet"] *= 2
+        sess["player"].append(sess["deck"].pop())
+        await _bj_resolve(i, self.user_id, action="double")
+
+def _bj_embed(sess, bust=False, result=None):
+    pv = hand_value(sess["player"])
+    dv = hand_value(sess["dealer"])
+    hide = (result is None and not bust)
+    e = discord.Embed(title="🃏  Blackjack", color=CASINO_COLOR)
+    e.add_field(name=f"Your hand  ({pv})",
+                value=hand_str(sess["player"]),
+                inline=False)
+    if hide:
+        e.add_field(name="Dealer's hand  (?)",
+                    value=hand_str(sess["dealer"], hide_second=True),
+                    inline=False)
+    else:
+        e.add_field(name=f"Dealer's hand  ({dv})",
+                    value=hand_str(sess["dealer"]),
+                    inline=False)
+    e.add_field(name="Bet", value=f"**{sess['bet']:,} ₡**", inline=True)
+    if bust:
+        e.add_field(name="Result", value="💥 **BUST!**  You lose.", inline=True)
+        e.color = 0xFF4444
+    elif result == "win":
+        payout = sess["bet"] * (2 if not sess.get("bj") else 3) if not sess.get("bj") else int(sess["bet"] * 2.5)
+        e.add_field(name="Result", value=f"✅ **WIN!**  +{payout - sess['bet'] if not sess.get('bj') else int(sess['bet']*1.5):,} ₡", inline=True)
+        e.color = 0x2ECC71
+    elif result == "lose":
+        e.add_field(name="Result", value=f"❌ **LOSE!**  -{sess['bet']:,} ₡", inline=True)
+        e.color = 0xFF4444
+    elif result == "push":
+        e.add_field(name="Result", value="🤝 **PUSH!**  Bet returned.", inline=True)
+        e.color = 0x8B9099
+    elif result == "blackjack":
+        e.add_field(name="Result", value=f"🌟 **BLACKJACK!**  +{int(sess['bet']*1.5):,} ₡", inline=True)
+        e.color = 0xF1C40F
+    else:
+        e.set_footer(text="Hit · Stand · Double Down")
+    return e
+
+async def _bj_resolve(interaction, user_id, action="stand"):
+    sess = _bj_sessions.get(user_id)
+    if not sess:
+        await interaction.response.edit_message(content="Session expired.", view=None); return
+    # Dealer draws to 17
+    while hand_value(sess["dealer"]) < 17:
+        sess["dealer"].append(sess["deck"].pop())
+    pv = hand_value(sess["player"])
+    dv = hand_value(sess["dealer"])
+    bet = sess["bet"]
+    if dv > 21 or pv > dv:
+        payout = int(bet * 2.5) if sess.get("bj") else bet * 2
+        db_add_credits(user_id, payout)
+        db_record_casino(user_id, bet, payout - bet)
+        result = "blackjack" if sess.get("bj") else "win"
+    elif pv == dv:
+        db_add_credits(user_id, bet)  # refund
+        db_record_casino(user_id, bet, 0)
+        result = "push"
+    else:
+        db_record_casino(user_id, bet, -bet)
+        result = "lose"
+    e = _bj_embed(sess, result=result)
+    _bj_sessions.pop(user_id, None)
+    await interaction.response.edit_message(embed=e, view=None)
+
 # ─── on_message ───────────────────────────────────────────────────────────────
 @bot.event
 async def on_message(message: discord.Message):
@@ -998,29 +1292,27 @@ async def on_message(message: discord.Message):
 
     uid  = message.author.id
     now  = datetime.now(timezone.utc)
+
+    # ── Custom replies (check before spam guard) ──
+    if not message.content.startswith(bot.command_prefix):
+        reply = db_check_custom_reply(uid, message.content)
+        if reply:
+            await message.channel.send(reply)
+
     spam = db_check_spam(uid, message.content)
 
     if not spam:
-        # ── Skip effect: burn down remaining skips ──
         skip_val, skip_rem = db_tick_effect(uid, "skip_msgs", decrement=1)
-
-        # ── Credit earning ──
         db_ensure_wallet(uid)
         profile = db_get_profile(uid)
         total_msgs = (profile["total_messages"] + 1) if profile else 1
         credits_earned = compute_credit_award(total_msgs)
         db_add_credits(uid, credits_earned)
         db_apply_bank_interest(uid)
-
-        # ── Stack multiplier: how many roll attempts this message ──
         stack_val, stack_rem = db_tick_effect(uid, "stack_mult", decrement=1)
         roll_attempts = int(stack_val) if stack_val > 0 else 1
-
-        # ── Luck bonus for this message ──
         luck_val, luck_rem = db_tick_effect(uid, "luck_bonus", decrement=1)
         luck_bonus = int(luck_val) if luck_val > 0 else 0
-
-        # ── Roll prizes ──
         prizes = get_prizes_cached()
         won = False
         for _ in range(roll_attempts):
@@ -1031,20 +1323,15 @@ async def on_message(message: discord.Message):
                     db_record_roll(prize["name"], uid, message.author.display_name, now)
                     await do_animated_roll(message.channel, prize, message.author)
                     won = True; break
-
         if not won:
             try: db_increment_messages(uid)
             except Exception: pass
-    else:
-        # Still process commands even if spam
-        pass
 
     await bot.process_commands(message)
 
 # ─── Scheduled Tasks ──────────────────────────────────────────────────────────
 @tasks.loop(minutes=1)
 async def daily_store_task():
-    """Reroll store at midnight UTC+7 = 17:00 UTC."""
     now = datetime.now(timezone.utc)
     if now.hour == 17 and now.minute == 0:
         rows = db_rotate_store()
@@ -1057,19 +1344,455 @@ async def daily_store_task():
 @bot.event
 async def on_ready():
     init_db()
-    # Ensure store has items on startup
     if not db_get_daily_store():
         db_rotate_store()
     daily_store_task.start()
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
     print(f"   {len(db_load_prizes())} prize(s) in database")
 
-# ─── Commands ─────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# ─── CASINO COMMANDS ──────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ── Balance & Bank ────────────────────────────────────────────────────────────
+def _bet_check(ctx, amount_str: str):
+    """Returns (bet, None) or (None, error_msg)."""
+    db_ensure_wallet(ctx.author.id)
+    w = db_get_wallet(ctx.author.id)
+    bet = parse_bet(amount_str, w["balance"])
+    if bet is None:
+        return None, "❌ Invalid amount. Use a number, `all`, `half`, `10k`, etc."
+    if bet < MIN_BET:
+        return None, f"❌ Minimum bet is **{MIN_BET:,} ₡**."
+    if bet > MAX_BET:
+        return None, f"❌ Maximum bet is **{MAX_BET:,} ₡**."
+    if w["balance"] < bet:
+        return None, f"❌ Not enough credits. You have **{w['balance']:,} ₡**."
+    return bet, None
+
+# ── Coinflip ──────────────────────────────────────────────────────────────────
+@bot.command(name="coinflip", aliases=["cf","flip"])
+async def coinflip_cmd(ctx, amount: str, side: str = "heads"):
+    """Bet on heads or tails. -coinflip <amount> [heads|tails]"""
+    bet, err = _bet_check(ctx, amount)
+    if err: await ctx.send(err); return
+    side = side.lower()
+    if side not in ("heads","tails","h","t"):
+        await ctx.send("❌ Choose `heads` or `tails`."); return
+    side = "heads" if side in ("heads","h") else "tails"
+    if not db_deduct_credits(ctx.author.id, bet):
+        await ctx.send("❌ Could not deduct credits."); return
+    result = random.choice(["heads","tails"])
+    won = result == side
+    payout = bet * 2 if won else 0
+    if payout: db_add_credits(ctx.author.id, payout)
+    db_record_casino(ctx.author.id, bet, bet if won else -bet)
+    coin_emoji = "🪙" if result == "heads" else "🌑"
+    color = 0x2ECC71 if won else 0xFF4444
+    e = discord.Embed(title=f"{coin_emoji}  Coin Flip", color=color)
+    e.add_field(name="Your call",  value=f"**{side.capitalize()}**",   inline=True)
+    e.add_field(name="Result",     value=f"**{result.capitalize()}**", inline=True)
+    e.add_field(name="Bet",        value=f"**{bet:,} ₡**",             inline=True)
+    if won:
+        e.add_field(name="Outcome", value=f"✅  **WIN!**  +{bet:,} ₡", inline=False)
+    else:
+        e.add_field(name="Outcome", value=f"❌  **LOSE!**  -{bet:,} ₡", inline=False)
+    e.set_footer(text=f"{ctx.author.display_name}  ·  Wallet: {db_get_wallet(ctx.author.id)['balance']:,} ₡",
+                 icon_url=ctx.author.display_avatar.url)
+    await ctx.send(embed=e)
+
+# ── Slots ─────────────────────────────────────────────────────────────────────
+@bot.command(name="slots", aliases=["slot","sl"])
+async def slots_cmd(ctx, amount: str):
+    """Spin the slot machine. -slots <amount>"""
+    bet, err = _bet_check(ctx, amount)
+    if err: await ctx.send(err); return
+    if not db_deduct_credits(ctx.author.id, bet):
+        await ctx.send("❌ Could not deduct credits."); return
+
+    # Animated spin
+    e = discord.Embed(title="🎰  Slot Machine", color=CASINO_COLOR)
+    e.description = "```\n[ 🌀 | 🌀 | 🌀 ]\n```"
+    e.add_field(name="Bet", value=f"**{bet:,} ₡**", inline=True)
+    msg = await ctx.send(embed=e)
+    await asyncio.sleep(0.8)
+
+    reels = spin_slots()
+    payout, label = slot_payout(reels, bet)
+    if payout: db_add_credits(ctx.author.id, payout)
+    net = payout - bet
+    db_record_casino(ctx.author.id, bet, net)
+
+    color = 0x2ECC71 if net > 0 else (0x8B9099 if net == 0 else 0xFF4444)
+    e2 = discord.Embed(title="🎰  Slot Machine", color=color)
+    e2.description = f"```\n[ {reels[0]} | {reels[1]} | {reels[2]} ]\n```"
+    e2.add_field(name="Bet",    value=f"**{bet:,} ₡**",                             inline=True)
+    e2.add_field(name="Result", value=label,                                          inline=True)
+    if net > 0:
+        e2.add_field(name="Payout", value=f"✅  **+{net:,} ₡**  (×{payout//bet})", inline=False)
+    elif net == 0:
+        e2.add_field(name="Payout", value=f"🤝  Break even",                         inline=False)
+    else:
+        e2.add_field(name="Payout", value=f"❌  **-{bet:,} ₡**",                    inline=False)
+
+    # Symbol guide
+    guide = "  ".join(f"{s[0]}=×{s[2]}" for s in SLOT_SYMBOLS)
+    e2.set_footer(text=f"Payouts: {guide}")
+    await msg.edit(embed=e2)
+
+# ── Blackjack ─────────────────────────────────────────────────────────────────
+@bot.command(name="blackjack", aliases=["bj","21"])
+async def blackjack_cmd(ctx, amount: str):
+    """Play blackjack against the dealer. -bj <amount>"""
+    if ctx.author.id in _bj_sessions:
+        await ctx.send("❌ You already have an active blackjack game! Finish it first."); return
+    bet, err = _bet_check(ctx, amount)
+    if err: await ctx.send(err); return
+    if not db_deduct_credits(ctx.author.id, bet):
+        await ctx.send("❌ Could not deduct credits."); return
+
+    deck = new_deck()
+    player = [deck.pop(), deck.pop()]
+    dealer = [deck.pop(), deck.pop()]
+    sess = {"player": player, "dealer": dealer, "deck": deck, "bet": bet, "bj": False}
+
+    # Check natural blackjack
+    if hand_value(player) == 21:
+        sess["bj"] = True
+        payout = int(bet * 2.5)
+        db_add_credits(ctx.author.id, payout)
+        db_record_casino(ctx.author.id, bet, payout - bet)
+        e = _bj_embed(sess, result="blackjack")
+        await ctx.send(embed=e); return
+
+    _bj_sessions[ctx.author.id] = sess
+    e = _bj_embed(sess)
+    await ctx.send(embed=e, view=BlackjackView(ctx.author.id))
+
+# ── Roulette ──────────────────────────────────────────────────────────────────
+@bot.command(name="roulette", aliases=["rl","rlt"])
+async def roulette_cmd(ctx, amount: str, *, bet_type: str = "red"):
+    """Bet on roulette. -roulette <amount> <red|black|even|odd|low|high|0-36>"""
+    bet, err = _bet_check(ctx, amount)
+    if err: await ctx.send(err); return
+    bt = bet_type.lower().strip()
+    valid = {"red","black","even","odd","low","high"} | {str(n) for n in range(37)}
+    if bt not in valid:
+        await ctx.send("❌ Valid bets: `red` `black` `even` `odd` `low` `high` or a number `0`–`36`."); return
+    if not db_deduct_credits(ctx.author.id, bet):
+        await ctx.send("❌ Could not deduct credits."); return
+
+    number = random.randint(0, 36)
+    reds = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
+    color_str = "🟥 Red" if number in reds else ("⬛ Black" if number > 0 else "🟩 Zero")
+    mult = roulette_resolve(bt, number)
+    payout = bet * mult
+    net = payout - bet
+    if payout: db_add_credits(ctx.author.id, payout)
+    db_record_casino(ctx.author.id, bet, net)
+
+    color = 0x2ECC71 if net > 0 else (0x8B9099 if net == 0 else 0xFF4444)
+    e = discord.Embed(title="🎡  Roulette", color=color)
+    e.add_field(name="Ball lands on", value=f"**{number}**  {color_str}", inline=True)
+    e.add_field(name="Your bet",      value=f"**{bt.capitalize()}**",     inline=True)
+    e.add_field(name="Wagered",       value=f"**{bet:,} ₡**",             inline=True)
+    if net > 0:
+        e.add_field(name="Outcome", value=f"✅  **WIN!**  +{net:,} ₡  (×{mult})", inline=False)
+    elif net == 0:
+        e.add_field(name="Outcome", value=f"🤝  **PUSH**  Bet returned", inline=False)
+    else:
+        e.add_field(name="Outcome", value=f"❌  **LOSE!**  -{bet:,} ₡", inline=False)
+    e.set_footer(
+        text="Payouts: color/even-odd/low-high=×2 · exact number=×35",
+        )
+    await ctx.send(embed=e)
+
+# ── Dice ──────────────────────────────────────────────────────────────────────
+@bot.command(name="dice", aliases=["roll","dr"])
+async def dice_cmd(ctx, amount: str, guess: int = None):
+    """
+    Roll two dice. -dice <amount> [guess 2-12]
+    Exact guess pays ×6. High (7+) or Low (≤6) pays ×1.8.
+    If no guess: high/low auto selected.
+    """
+    bet, err = _bet_check(ctx, amount)
+    if err: await ctx.send(err); return
+    if guess is not None and not (2 <= guess <= 12):
+        await ctx.send("❌ Guess must be between 2 and 12."); return
+    if not db_deduct_credits(ctx.author.id, bet):
+        await ctx.send("❌ Could not deduct credits."); return
+
+    d1, d2 = random.randint(1,6), random.randint(1,6)
+    total = d1 + d2
+    dice_faces = ["⚀","⚁","⚂","⚃","⚄","⚅"]
+
+    if guess is not None:
+        won = total == guess
+        mult = 6
+        outcome_str = f"Exact guess **{guess}**"
+    else:
+        # Auto: player guesses high (7+) if they didn't provide guess
+        player_high = total >= 7
+        won = player_high  # by default player wins on high
+        mult = 2
+        outcome_str = "High (7+) auto-bet"
+
+    payout = int(bet * mult) if won else 0
+    net = payout - bet
+    if payout: db_add_credits(ctx.author.id, payout)
+    db_record_casino(ctx.author.id, bet, net)
+
+    color = 0x2ECC71 if won else 0xFF4444
+    e = discord.Embed(title="🎲  Dice Roll", color=color)
+    e.add_field(name="Roll",   value=f"{dice_faces[d1-1]} {dice_faces[d2-1]}  =  **{total}**", inline=True)
+    e.add_field(name="Bet",    value=f"**{bet:,} ₡**",                                          inline=True)
+    e.add_field(name="Type",   value=outcome_str,                                                inline=True)
+    if won:
+        e.add_field(name="Outcome", value=f"✅  **WIN!**  +{net:,} ₡  (×{mult})", inline=False)
+    else:
+        e.add_field(name="Outcome", value=f"❌  **LOSE!**  -{bet:,} ₡",            inline=False)
+    e.set_footer(text="-dice <amount> <2-12> to guess exact (×6 payout)  ·  Default: high/low (×2)")
+    await ctx.send(embed=e)
+
+# ── Higher or Lower ───────────────────────────────────────────────────────────
+@bot.command(name="highlow", aliases=["hl","hilo"])
+async def highlow_cmd(ctx, amount: str, guess: str = "higher"):
+    """
+    Draw a card, guess if next is higher or lower. -highlow <amount> [higher|lower]
+    Pays ×1.9. Tie = push.
+    """
+    bet, err = _bet_check(ctx, amount)
+    if err: await ctx.send(err); return
+    guess = guess.lower()
+    if guess not in ("higher","lower","h","l","hi","lo"):
+        await ctx.send("❌ Choose `higher` or `lower`."); return
+    guess = "higher" if guess in ("higher","h","hi") else "lower"
+    if not db_deduct_credits(ctx.author.id, bet):
+        await ctx.send("❌ Could not deduct credits."); return
+
+    ranks = [2,3,4,5,6,7,8,9,10,11,12,13,14]  # 11=J 12=Q 13=K 14=A
+    rank_names = {11:"J",12:"Q",13:"K",14:"A"}
+    def rank_name(r): return rank_names.get(r, str(r))
+    suits = ["♠","♥","♦","♣"]
+
+    c1 = random.choice(ranks); s1 = random.choice(suits)
+    c2 = random.choice(ranks); s2 = random.choice(suits)
+
+    if c1 == c2:   result = "push"
+    elif guess == "higher" and c2 > c1: result = "win"
+    elif guess == "lower"  and c2 < c1: result = "win"
+    else: result = "lose"
+
+    payout = int(bet * 1.9) if result == "win" else (bet if result == "push" else 0)
+    net = payout - bet
+    if payout: db_add_credits(ctx.author.id, payout)
+    db_record_casino(ctx.author.id, bet, net)
+
+    color = 0x2ECC71 if result=="win" else (0x8B9099 if result=="push" else 0xFF4444)
+    e = discord.Embed(title="📈  Higher or Lower", color=color)
+    e.add_field(name="First card",  value=f"`{rank_name(c1)}{s1}`", inline=True)
+    e.add_field(name="Your guess",  value=f"**{guess.capitalize()}**", inline=True)
+    e.add_field(name="Second card", value=f"`{rank_name(c2)}{s2}`", inline=True)
+    if result == "win":
+        e.add_field(name="Outcome", value=f"✅  **WIN!**  +{net:,} ₡", inline=False)
+    elif result == "push":
+        e.add_field(name="Outcome", value=f"🤝  **TIE!**  Bet returned", inline=False)
+    else:
+        e.add_field(name="Outcome", value=f"❌  **LOSE!**  -{bet:,} ₡", inline=False)
+    e.set_footer(text="Pays ×1.9 on win  ·  Tie returns your bet")
+    await ctx.send(embed=e)
+
+# ── Rock Paper Scissors ───────────────────────────────────────────────────────
+@bot.command(name="rps")
+async def rps_cmd(ctx, amount: str, choice: str = "rock"):
+    """Rock, paper, scissors vs the bot. -rps <amount> [rock|paper|scissors]"""
+    bet, err = _bet_check(ctx, amount)
+    if err: await ctx.send(err); return
+    choice = choice.lower()
+    aliases_map = {"r":"rock","p":"paper","s":"scissors","sc":"scissors"}
+    choice = aliases_map.get(choice, choice)
+    if choice not in ("rock","paper","scissors"):
+        await ctx.send("❌ Choose `rock`, `paper`, or `scissors`."); return
+    if not db_deduct_credits(ctx.author.id, bet):
+        await ctx.send("❌ Could not deduct credits."); return
+
+    bot_choice = random.choice(["rock","paper","scissors"])
+    emojis = {"rock":"🪨","paper":"📄","scissors":"✂️"}
+    beats = {"rock":"scissors","paper":"rock","scissors":"paper"}
+
+    if choice == bot_choice:
+        result = "push"
+    elif beats[choice] == bot_choice:
+        result = "win"
+    else:
+        result = "lose"
+
+    payout = bet * 2 if result == "win" else (bet if result == "push" else 0)
+    net = payout - bet
+    if payout: db_add_credits(ctx.author.id, payout)
+    db_record_casino(ctx.author.id, bet, net)
+
+    color = 0x2ECC71 if result=="win" else (0x8B9099 if result=="push" else 0xFF4444)
+    e = discord.Embed(title="✂️  Rock Paper Scissors", color=color)
+    e.add_field(name="You",     value=f"{emojis[choice]} **{choice.capitalize()}**",     inline=True)
+    e.add_field(name="Bot",     value=f"{emojis[bot_choice]} **{bot_choice.capitalize()}**", inline=True)
+    e.add_field(name="Bet",     value=f"**{bet:,} ₡**",                                  inline=True)
+    if result == "win":
+        e.add_field(name="Outcome", value=f"✅  **WIN!**  +{bet:,} ₡", inline=False)
+    elif result == "push":
+        e.add_field(name="Outcome", value=f"🤝  **TIE!**  Bet returned", inline=False)
+    else:
+        e.add_field(name="Outcome", value=f"❌  **LOSE!**  -{bet:,} ₡", inline=False)
+    await ctx.send(embed=e)
+
+# ── Number Guess ──────────────────────────────────────────────────────────────
+@bot.command(name="guess", aliases=["numguess","ng"])
+async def guess_cmd(ctx, amount: str, number: int = None):
+    """
+    Guess a number 1–10. -guess <amount> <1-10>
+    Correct = ×8 payout. One off = ×1.5.
+    """
+    bet, err = _bet_check(ctx, amount)
+    if err: await ctx.send(err); return
+    if number is None or not (1 <= number <= 10):
+        await ctx.send("❌ Guess a number between 1 and 10."); return
+    if not db_deduct_credits(ctx.author.id, bet):
+        await ctx.send("❌ Could not deduct credits."); return
+
+    answer = random.randint(1, 10)
+    diff = abs(number - answer)
+
+    if diff == 0:
+        payout = bet * 8; result = "exact"; net = payout - bet
+    elif diff == 1:
+        payout = int(bet * 1.5); result = "close"; net = payout - bet
+    else:
+        payout = 0; result = "miss"; net = -bet
+
+    if payout: db_add_credits(ctx.author.id, payout)
+    db_record_casino(ctx.author.id, bet, net)
+
+    color = 0xF1C40F if result=="exact" else (0x5EC4B8 if result=="close" else 0xFF4444)
+    e = discord.Embed(title="🔢  Number Guess", color=color)
+    e.add_field(name="Your guess", value=f"**{number}**",  inline=True)
+    e.add_field(name="Answer",     value=f"**{answer}**",  inline=True)
+    e.add_field(name="Bet",        value=f"**{bet:,} ₡**", inline=True)
+    if result == "exact":
+        e.add_field(name="Outcome", value=f"🎯  **EXACT!**  +{net:,} ₡  (×8)", inline=False)
+    elif result == "close":
+        e.add_field(name="Outcome", value=f"🔥  **ONE OFF!**  +{net:,} ₡  (×1.5)", inline=False)
+    else:
+        e.add_field(name="Outcome", value=f"❌  **MISS!**  -{bet:,} ₡", inline=False)
+    e.set_footer(text="Exact = ×8  ·  One off = ×1.5  ·  Otherwise lose")
+    await ctx.send(embed=e)
+
+# ── Casino Stats ──────────────────────────────────────────────────────────────
+@bot.command(name="casinostats", aliases=["cs","mygamble"])
+async def casinostats_cmd(ctx, member: discord.Member = None):
+    """View your casino statistics."""
+    target = member or ctx.author
+    s = db_get_casino_stats(target.id)
+    net = int(s["total_won"]) - int(s["total_lost"])
+    sign = "+" if net >= 0 else ""
+    color = 0x2ECC71 if net >= 0 else 0xFF4444
+    e = discord.Embed(title=f"🎰  {target.display_name}'s Casino Stats", color=color)
+    e.set_thumbnail(url=target.display_avatar.url)
+    e.add_field(name="🎮 Games Played", value=f"**{int(s['games_played']):,}**",      inline=True)
+    e.add_field(name="💸 Total Wagered", value=f"**{int(s['total_bet']):,} ₡**",      inline=True)
+    e.add_field(name="📊 Net P&L",       value=f"**{sign}{net:,} ₡**",                inline=True)
+    e.add_field(name="✅ Won",           value=f"**{int(s['total_won']):,} ₡**",      inline=True)
+    e.add_field(name="❌ Lost",          value=f"**{int(s['total_lost']):,} ₡**",     inline=True)
+    e.add_field(name="🏆 Biggest Win",   value=f"**{int(s['biggest_win']):,} ₡**",   inline=True)
+    if int(s['games_played']) > 0:
+        roi = round((net / int(s['total_bet'])) * 100, 1) if s['total_bet'] else 0
+        e.add_field(name="📈 ROI", value=f"**{'+' if roi>=0 else ''}{roi}%**", inline=True)
+    e.set_footer(text="-casinostats  ·  Use -lb casino for leaderboard")
+    await ctx.send(embed=e)
+
+# ─── Casino Hub ───────────────────────────────────────────────────────────────
+@bot.command(name="casino", aliases=["games","gamble"])
+async def casino_cmd(ctx):
+    """Show all available casino games."""
+    e = discord.Embed(title="🎰  Casino", color=CASINO_COLOR)
+    e.description = (f"Bet range: **{MIN_BET:,}** – **{MAX_BET:,}** ₡\n"
+                     f"Use `all`, `half`, `10k`, `500k` as shortcuts.\n\u200b")
+    e.add_field(name="🪙  Coin Flip",        value="`-coinflip <amount> [heads|tails]`\nBet on heads or tails.  Pays ×2", inline=False)
+    e.add_field(name="🎰  Slots",            value="`-slots <amount>`\nSpin three reels.  Up to ×100 jackpot!", inline=False)
+    e.add_field(name="🃏  Blackjack",        value="`-bj <amount>`\nBeat the dealer to 21.  Hit, Stand or Double Down.", inline=False)
+    e.add_field(name="🎡  Roulette",         value="`-roulette <amount> <red|black|even|odd|low|high|0-36>`\nSingle number pays ×35!", inline=False)
+    e.add_field(name="🎲  Dice",             value="`-dice <amount> [2-12]`\nRoll two dice.  Exact guess = ×6.", inline=False)
+    e.add_field(name="📈  Higher or Lower",  value="`-highlow <amount> [higher|lower]`\nGuess the next card.  Pays ×1.9.", inline=False)
+    e.add_field(name="✂️  Rock Paper Scissors", value="`-rps <amount> [rock|paper|scissors]`\nBeat the bot.  Pays ×2.", inline=False)
+    e.add_field(name="🔢  Number Guess",     value="`-guess <amount> <1-10>`\nExact = ×8  ·  One off = ×1.5.", inline=False)
+    e.add_field(name="📊  Stats",            value="`-casinostats` — Your win/loss record\n`-lb casino` — Casino leaderboard", inline=False)
+    e.set_footer(text="Good luck! 🍀  Credits are earned by chatting.")
+    await ctx.send(embed=e)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ─── CUSTOM REPLY COMMANDS ────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@bot.command(name="addreply", aliases=["ar"])
+async def addreply_cmd(ctx, target: str, match_type: str, trigger: str, *, reply: str):
+    """
+    [Admin] Add a custom auto-reply.
+    -addreply <@user|everyone> <contains|exact|startswith> <trigger> <reply>
+
+    Examples:
+      -addreply @user123 contains hello  Hello there!
+      -addreply everyone exact !hi       Hi everyone!
+    """
+    if not is_admin(ctx.author): await ctx.send("❌ No permission."); return
+    match_type = match_type.lower()
+    if match_type not in ("contains","exact","startswith"):
+        await ctx.send("❌ match_type must be `contains`, `exact`, or `startswith`."); return
+
+    uid = None
+    if target.lower() != "everyone":
+        try:
+            member = await commands.MemberConverter().convert(ctx, target)
+            uid = member.id
+        except Exception:
+            await ctx.send("❌ Could not find that user. Use @mention or `everyone`."); return
+
+    db_add_custom_reply(uid, trigger, reply, match_type)
+    scope = f"<@{uid}>" if uid else "**everyone**"
+    e = discord.Embed(title="✅  Custom Reply Added", color=0x2ECC71)
+    e.add_field(name="Scope",      value=scope,                     inline=True)
+    e.add_field(name="Match",      value=f"`{match_type}`",         inline=True)
+    e.add_field(name="Trigger",    value=f"`{trigger}`",            inline=True)
+    e.add_field(name="Reply",      value=reply[:500],               inline=False)
+    await ctx.send(embed=e)
+
+@bot.command(name="listreplies", aliases=["lsr","replies"])
+async def listreplies_cmd(ctx):
+    """[Admin] List all custom replies."""
+    if not is_admin(ctx.author): await ctx.send("❌ No permission."); return
+    rows = db_get_custom_replies()
+    if not rows: await ctx.send("No custom replies set."); return
+    e = discord.Embed(title="Custom Replies", color=0x5865F2)
+    e.description = f"{len(rows)} rule(s) active\n\u200b"
+    for row in rows[:20]:
+        scope = f"<@{row['trigger_uid']}>" if row["trigger_uid"] else "everyone"
+        e.add_field(
+            name=f"ID `{row['id']}`  ·  {scope}",
+            value=(f"**Match:** `{row['match_type']}`  **Trigger:** `{row['trigger_kw'] or '(any)'}`\n"
+                   f"**Reply:** {row['reply'][:120]}"),
+            inline=False)
+    await ctx.send(embed=e)
+
+@bot.command(name="delreply", aliases=["dr2","removereply"])
+async def delreply_cmd(ctx, reply_id: int):
+    """[Admin] Delete a custom reply by ID. -delreply <id>"""
+    if not is_admin(ctx.author): await ctx.send("❌ No permission."); return
+    db_delete_custom_reply(reply_id)
+    await ctx.send(f"🗑️ Deleted reply ID `{reply_id}`.")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ─── EXISTING COMMANDS (unchanged) ───────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+
 @bot.command(name="balance", aliases=["bal","credits","wallet"])
 async def balance_cmd(ctx, member: discord.Member = None):
-    """Check your credit balance and bank."""
     target = member or ctx.author
     w = db_get_wallet(target.id)
     effects = db_get_effects(target.id)
@@ -1079,7 +1802,6 @@ async def balance_cmd(ctx, member: discord.Member = None):
     e.add_field(name="🏦 Bank",   value=f"**{w['bank']:,} ₡**",    inline=True)
     e.add_field(name="💰 Total",  value=f"**{w['balance']+w['bank']:,} ₡**", inline=True)
     e.add_field(name="📈 Interest", value="+1% per message on bank balance", inline=False)
-    # Active effects summary
     if effects:
         eff_lines = []
         for etype, row in effects.items():
@@ -1092,7 +1814,6 @@ async def balance_cmd(ctx, member: discord.Member = None):
 
 @bot.command(name="bank", aliases=["savings"])
 async def bank_cmd(ctx, member: discord.Member = None):
-    """Check your bank account details."""
     target = member or ctx.author
     w = db_get_wallet(target.id)
     e = discord.Embed(title=f"🏦  {target.display_name}'s Bank", color=0x2ECC71)
@@ -1106,7 +1827,6 @@ async def bank_cmd(ctx, member: discord.Member = None):
 
 @bot.command(name="deposit", aliases=["dep"])
 async def deposit_cmd(ctx, amount: str):
-    """Deposit credits into your bank. Use 'all' to deposit everything."""
     w = db_get_wallet(ctx.author.id)
     if amount.lower() == "all": amount = str(w["balance"])
     try: amt = int(amount)
@@ -1118,7 +1838,6 @@ async def deposit_cmd(ctx, amount: str):
 
 @bot.command(name="withdraw", aliases=["with"])
 async def withdraw_cmd(ctx, amount: str):
-    """Withdraw credits from your bank."""
     w = db_get_wallet(ctx.author.id)
     if amount.lower() == "all": amount = str(w["bank"])
     try: amt = int(amount)
@@ -1128,10 +1847,8 @@ async def withdraw_cmd(ctx, amount: str):
     if not ok: await ctx.send(f"❌ {err}"); return
     await ctx.send(f"👛 Withdrew **{amt:,} ₡** to your wallet.")
 
-# ── Items ─────────────────────────────────────────────────────────────────────
 @bot.command(name="items", aliases=["bag","backpack"])
 async def items_cmd(ctx, member: discord.Member = None):
-    """View your item inventory."""
     target = member or ctx.author
     rows = db_get_item_inventory(target.id)
     effects = db_get_effects(target.id)
@@ -1156,24 +1873,17 @@ async def items_cmd(ctx, member: discord.Member = None):
 
 @bot.command(name="use")
 async def use_cmd(ctx, *, item_name: str):
-    """Use an item from your inventory."""
-    # Match item by name
     match = next((iid for iid, item in ITEMS.items() if item["name"].lower() == item_name.lower()), None)
     if not match:
-        # fuzzy
         match = next((iid for iid, item in ITEMS.items() if item_name.lower() in item["name"].lower()), None)
     if not match:
         await ctx.send(f"❌ Unknown item `{item_name}`. Use `-items` to see what you own."); return
-
     ok = db_use_item(ctx.author.id, match)
     if not ok:
         await ctx.send(f"❌ You don't own **{ITEMS[match]['name']}**."); return
-
     item = ITEMS[match]
     effect = item["effect"]
-
     if effect == "skip_msgs":
-        # Skip items: add to remaining directly, no value stored
         db_apply_effect(ctx.author.id, "skip_msgs", item["value"], item["value"])
         e = discord.Embed(title=f"⏩  {item['name']} activated!", color=ITEM_TIER_COLOR[item['tier']])
         e.description = f"Skipping the next **{item['value']:,}** messages (counts toward streaks & credits)."
@@ -1182,56 +1892,41 @@ async def use_cmd(ctx, *, item_name: str):
         e = discord.Embed(title=f"✅  {item['name']} activated!", color=ITEM_TIER_COLOR[item['tier']])
         e.description = item["desc"]
         if effect == "luck_bonus":
-            e.add_field(name="Effect",    value=f"+{item['value']:,} luck", inline=True)
-            e.add_field(name="Duration",  value=f"{item['duration']} message", inline=True)
+            e.add_field(name="Effect",   value=f"+{item['value']:,} luck", inline=True)
+            e.add_field(name="Duration", value=f"{item['duration']} message", inline=True)
         elif effect == "stack_mult":
-            e.add_field(name="Multiplier",value=f"×{item['value']} rolls",  inline=True)
-            e.add_field(name="Duration",  value=f"{item['duration']:,} messages", inline=True)
-
+            e.add_field(name="Multiplier", value=f"×{item['value']} rolls", inline=True)
+            e.add_field(name="Duration",   value=f"{item['duration']:,} messages", inline=True)
     e.set_footer(text="Effects stack — use multiple potions to combine bonuses!")
     await ctx.send(embed=e)
 
-# ── Daily Store ───────────────────────────────────────────────────────────────
 @bot.command(name="store", aliases=["shop","dailystore"])
 async def store_cmd(ctx):
-    """Browse today's daily item store."""
     rows = db_get_daily_store()
     if not rows: rows = db_rotate_store()
     await ctx.send(embed=build_daily_store_embed(rows), view=DailyStoreView(rows, ctx.author.id))
 
 @bot.command(name="buy")
 async def buy_cmd(ctx, slot: int):
-    """Buy an item from the daily store by slot number (1–5)."""
     slot_idx = slot - 1
     db_ensure_wallet(ctx.author.id)
     try:
         item_id, price = db_buy_store_item(slot_idx, ctx.author.id)
     except ValueError as err:
         await ctx.send(f"❌ {err}"); return
-
     item = ITEMS.get(item_id)
     db_add_item(ctx.author.id, item_id, 1)
     tier = item["tier"]
     e = discord.Embed(title=f"{ITEM_TIER_EMOJI[tier]}  Purchased: {item['name']}", color=ITEM_TIER_COLOR[tier])
-    e.add_field(name="Paid",  value=f"**{price:,} ₡**",        inline=True)
-    e.add_field(name="Tier",  value=f"`{ITEM_TIER_BADGE[tier]}`", inline=True)
-    e.add_field(name="Effect",value=item["desc"],               inline=False)
+    e.add_field(name="Paid",   value=f"**{price:,} ₡**",          inline=True)
+    e.add_field(name="Tier",   value=f"`{ITEM_TIER_BADGE[tier]}`", inline=True)
+    e.add_field(name="Effect", value=item["desc"],                 inline=False)
     e.set_footer(text="Use -use <item name> to activate it")
     await ctx.send(embed=e)
 
-# ── Admin: Give Credits / Items ───────────────────────────────────────────────
 @bot.command(name="give")
 async def give_cmd(ctx, target: str, kind: str, *, amount_or_item: str):
-    """
-    [Admin] Give credits or items to a user or everyone.
-    -give @user credits 500
-    -give everyone credits 100
-    -give @user item "Karma Potion"
-    -give everyone item "Basic Stack Syndrome"
-    """
     if not is_admin(ctx.author): await ctx.send("❌ No permission."); return
-
-    # Resolve targets
     targets = []
     if target.lower() == "everyone":
         targets = [m for m in ctx.guild.members if not m.bot]
@@ -1241,9 +1936,7 @@ async def give_cmd(ctx, target: str, kind: str, *, amount_or_item: str):
             targets = [member]
         except Exception:
             await ctx.send("❌ Could not find that user."); return
-
     kind = kind.lower()
-
     if kind == "credits":
         try: amt = int(amount_or_item)
         except ValueError: await ctx.send("❌ Amount must be a number."); return
@@ -1252,7 +1945,6 @@ async def give_cmd(ctx, target: str, kind: str, *, amount_or_item: str):
             db_add_credits(m.id, amt)
         noun = "everyone" if len(targets) > 1 else targets[0].display_name
         await ctx.send(f"✅ Gave **{amt:,} ₡** to **{noun}** ({len(targets)} user(s)).")
-
     elif kind == "item":
         item_name = amount_or_item.strip()
         match = next((iid for iid, item in ITEMS.items() if item["name"].lower() == item_name.lower()), None)
@@ -1265,29 +1957,22 @@ async def give_cmd(ctx, target: str, kind: str, *, amount_or_item: str):
             db_add_item(m.id, match, 1)
         noun = "everyone" if len(targets) > 1 else targets[0].display_name
         await ctx.send(f"✅ Gave **{ITEMS[match]['name']}** to **{noun}** ({len(targets)} user(s)).")
-
     else:
         await ctx.send("❌ Kind must be `credits` or `item`.")
 
 @bot.command(name="admingive", aliases=["ag"])
 async def admingive_cmd(ctx, member: discord.Member, kind: str, *, value: str):
-    """Alias: -admingive @user credits 500  /  -admingive @user item Karma Potion"""
     if not is_admin(ctx.author): await ctx.send("❌ No permission."); return
-    fake_ctx = ctx
-    fake_ctx.author = ctx.author  # keep admin check
-    await give_cmd(fake_ctx, member.mention, kind, amount_or_item=value)
+    await give_cmd(ctx, member.mention, kind, amount_or_item=value)
 
-# ── Admin: Force Store Reroll ─────────────────────────────────────────────────
 @bot.command(name="rerollstore", aliases=["reroll"])
 async def reroll_store_cmd(ctx):
-    """[Admin] Force reroll the daily store immediately."""
     if not is_admin(ctx.author): await ctx.send("❌ No permission."); return
     rows = db_rotate_store()
     e = build_daily_store_embed(rows)
     e.title = "🛒  Store Manually Rerolled"
     await ctx.send(embed=e)
 
-# ── Existing Commands ─────────────────────────────────────────────────────────
 @bot.command(name="prizemaker", aliases=["pm"])
 async def prizemaker(ctx):
     if not is_admin(ctx.author): await ctx.send("❌ You don't have permission to use this."); return
@@ -1341,7 +2026,7 @@ async def search_cmd(ctx, *, query: str):
 
 @bot.command(name="leaderboard", aliases=["lb","top"])
 async def leaderboard_cmd(ctx, lb_type: str = "collected"):
-    if lb_type not in ("collected","rarest","messages","credits"): lb_type = "collected"
+    if lb_type not in ("collected","rarest","messages","credits","casino"): lb_type = "collected"
     v = LeaderboardView(ctx.guild, lb_type=lb_type, owner_id=ctx.author.id)
     await ctx.send(embed=v.build_embed(), view=v)
 
@@ -1439,9 +2124,9 @@ async def compare_cmd(ctx, member: discord.Member):
     if member == ctx.author: await ctx.send("You can't compare with yourself."); return
     data = db_compare_inventories(ctx.author.id, member.id)
     e = discord.Embed(title=f"{ctx.author.display_name}  vs  {member.display_name}", color=0x5865F2)
-    e.add_field(name=f"Both have  ({len(data['shared'])})",                             value=", ".join(sorted(data["shared"]))[:1000]  or "*None*", inline=False)
-    e.add_field(name=f"Only {ctx.author.display_name}  ({len(data['only_u1'])})",       value=", ".join(sorted(data["only_u1"]))[:1000] or "*None*", inline=False)
-    e.add_field(name=f"Only {member.display_name}  ({len(data['only_u2'])})",           value=", ".join(sorted(data["only_u2"]))[:1000] or "*None*", inline=False)
+    e.add_field(name=f"Both have  ({len(data['shared'])})",               value=", ".join(sorted(data["shared"]))[:1000]  or "*None*", inline=False)
+    e.add_field(name=f"Only {ctx.author.display_name}  ({len(data['only_u1'])})", value=", ".join(sorted(data["only_u1"]))[:1000] or "*None*", inline=False)
+    e.add_field(name=f"Only {member.display_name}  ({len(data['only_u2'])})",     value=", ".join(sorted(data["only_u2"]))[:1000] or "*None*", inline=False)
     await ctx.send(embed=e)
 
 @bot.command(name="prizeinfo", aliases=["pi"])
@@ -1530,8 +2215,21 @@ async def help_cmd(ctx):
         "`-use <item name>` — Activate an item"
     ), inline=False)
 
+    e.add_field(name="🎰 Casino", value=(
+        "`-casino` — Show all games & rules\n"
+        "`-coinflip <amt> [heads|tails]` (`-cf`) — ×2\n"
+        "`-slots <amt>` (`-sl`) — up to ×100 jackpot\n"
+        "`-blackjack <amt>` (`-bj`) — Beat the dealer\n"
+        "`-roulette <amt> <bet>` (`-rl`) — up to ×35\n"
+        "`-dice <amt> [2-12]` (`-dr`) — Exact guess ×6\n"
+        "`-highlow <amt> [higher|lower]` (`-hl`) — ×1.9\n"
+        "`-rps <amt> [rock|paper|scissors]` — ×2\n"
+        "`-guess <amt> <1-10>` (`-ng`) — Exact ×8\n"
+        "`-casinostats` (`-cs`) — Your casino record"
+    ), inline=False)
+
     e.add_field(name="📊 Leaderboard & Misc", value=(
-        "`-leaderboard [type]` (`-lb`) — Rankings: `collected` `rarest` `messages` `credits`\n"
+        "`-leaderboard [type]` (`-lb`) — Rankings: `collected` `rarest` `messages` `credits` `casino`\n"
         "`-ping` — Check bot latency"
     ), inline=False)
 
@@ -1540,7 +2238,10 @@ async def help_cmd(ctx):
             "`-prizemaker` (`-pm`) — Open prize management panel\n"
             "`-give <@user|everyone> credits <amount>` — Give credits\n"
             "`-give <@user|everyone> item <name>` — Give an item\n"
-            "`-rerollstore` — Force-reroll the daily store"
+            "`-rerollstore` — Force-reroll the daily store\n"
+            "`-addreply <@user|everyone> <contains|exact|startswith> <trigger> <reply>` — Auto-reply\n"
+            "`-listreplies` — View all auto-replies\n"
+            "`-delreply <id>` — Delete an auto-reply"
         ), inline=False)
 
     e.set_footer(text="Every message gives you a chance to win a prize AND earns credits!")
