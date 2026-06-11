@@ -1,4 +1,6 @@
 import os
+import redis
+import json
 from flask import Flask
 from threading import Thread
 import discord
