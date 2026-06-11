@@ -46,6 +46,10 @@ class _Conn:
 def get_conn():
     return _Conn()
 
+# ─── Redis Setup ──────────────────────────────────────────────────────────────
+REDIS_URL = os.getenv('REDIS_URL') or exit("ERROR: REDIS_URL missing!")
+rd = redis.from_url(REDIS_URL, decode_responses=True)
+
 # ─── DB Init ──────────────────────────────────────────────────────────────────
 def init_db():
     with get_conn() as conn:
@@ -72,6 +76,8 @@ bot = commands.Bot(command_prefix='-', intents=intents, help_command=None)
 @bot.event
 async def on_ready():
     init_db()
+    rd.set("test", "hello")
+    print("Redis test:", rd.get("test"))  # should print: Redis test: hello
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
 
 # ─── Run ──────────────────────────────────────────────────────────────────────
