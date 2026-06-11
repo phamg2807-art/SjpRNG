@@ -4,9 +4,10 @@ import json
 import redis
 import discord
 import psycopg2
+import asyncio
 from flask import Flask
 from threading import Thread
-from discord.ext import commands
+from discord.ext import commands, tasks
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 from discord.ui import Button, View
@@ -31,7 +32,6 @@ def load_game_data():
                 GAME_DATA[file.replace('.json', '')] = json.load(f)
             print(f"✅ Loaded {file}")
         else:
-            # Create empty file if not exists
             with open(path, 'w') as f:
                 json.dump({}, f)
             print(f"⚠️ Created empty {file}")
@@ -81,43 +81,43 @@ rd = redis.from_url(REDIS_URL, decode_responses=True)
 def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # Enhanced Player Table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS players (
                     user_id BIGINT PRIMARY KEY,
-                    hp INT DEFAULT 100,
-                    st INT DEFAULT 10,
-                    df INT DEFAULT 10,
-                    mn INT DEFAULT 10,
-                    gold INT DEFAULT 0,
-                    xp INT DEFAULT 0,
-                    level INT DEFAULT 1,
-                    current_map INT DEFAULT 1,
-                    current_stage INT DEFAULT 1
+                    hp INT DEFAULT 100, st INT DEFAULT 10, df INT DEFAULT 10, mn INT DEFAULT 10,
+                    unallocated_points INT DEFAULT 0,
+                    gold INT DEFAULT 0, xp INT DEFAULT 0, level INT DEFAULT 1,
+                    current_map INT DEFAULT 1, current_stage INT DEFAULT 1
                 );
             """)
+            # Parties Table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS parties (
+                    party_id SERIAL PRIMARY KEY,
+                    leader_id BIGINT UNIQUE,
+                    members BIGINT[],
+                    in_dungeon BOOLEAN DEFAULT FALSE
+                );
+            """)
+            # Items Master List
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS items (
-                    id SERIAL PRIMARY KEY,
-                    name TEXT,
-                    rarity TEXT,
-                    min_level INT,
-                    stats JSONB
+                    id SERIAL PRIMARY KEY, name TEXT, rarity TEXT, min_level INT, stats JSONB
                 );
             """)
+            # Inventory
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS inventory (
-                    id SERIAL PRIMARY KEY,
-                    player_id BIGINT REFERENCES players(user_id),
-                    item_id INT REFERENCES items(id),
-                    equipped BOOLEAN DEFAULT FALSE
+                    id SERIAL PRIMARY KEY, player_id BIGINT REFERENCES players(user_id),
+                    item_id INT REFERENCES items(id), equipped BOOLEAN DEFAULT FALSE
                 );
             """)
+            # Market
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS market (
-                    id SERIAL PRIMARY KEY,
-                    seller_id BIGINT REFERENCES players(user_id),
-                    item_id INT REFERENCES items(id),
-                    price INT,
+                    id SERIAL PRIMARY KEY, seller_id BIGINT REFERENCES players(user_id),
+                    item_id INT REFERENCES items(id), price INT,
                     listed_at TIMESTAMPTZ DEFAULT NOW()
                 );
             """)
@@ -133,41 +133,56 @@ intents.members = True
 
 bot = commands.Bot(command_prefix='-', intents=intents, help_command=None)
 
+# ─── Idle Combat Loop ─────────────────────────────────────────────────────────
+@tasks.loop(seconds=30.0)
+async def idle_combat_loop():
+    # Logic: 
+    # 1. Fetch all active parties from Redis/DB
+    # 2. Iterate through parties
+    # 3. Simulate combat (Damage vs Defense)
+    # 4. Update status in Redis
+    # 5. Distribute XP/Gold
+    pass
+
 # ─── UI Components ────────────────────────────────────────────────────────────
 class DungeonView(View):
     def __init__(self):
-        super().__init__(timeout=60)
+        super().__init__(timeout=None)
     
     @discord.ui.button(label="Attack", style=discord.ButtonStyle.danger)
     async def attack(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.send_message("You attacked the monster!", ephemeral=True)
-
-    @discord.ui.button(label="Heal", style=discord.ButtonStyle.success)
-    async def heal(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.send_message("You recovered 20 HP!", ephemeral=True)
+        await interaction.response.send_message("Combat is idle! Your party is fighting automatically.", ephemeral=True)
 
 # ─── Events ───────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
     init_db()
-    load_game_data() # Load JSON files here
-    try:
-        rd.set("test", "hello")
-        val = rd.get("test")
-        print(f"✅ Redis test: {val}")
-    except Exception as e:
-        print(f"❌ Redis error: {e}")
+    load_game_data()
+    idle_combat_loop.start() # Start the engine
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
 
 # ─── Commands ─────────────────────────────────────────────────────────────────
 @bot.command()
+async def stats(ctx):
+    # Example command to view stats and unallocated points
+    await ctx.send("Your Stats: HP 100 | ST 10 | DF 10 | MN 10 | Points: 5")
+
+@bot.command()
+async def upgrade(ctx, stat: str, amount: int):
+    # Example logic for manual stat distribution
+    await ctx.send(f"Upgraded {stat} by {amount}!")
+
+@bot.command()
+async def party_create(ctx):
+    # Logic to create party in SQL/Redis
+    await ctx.send("Party created! Invite friends with -invite")
+
+@bot.command()
 async def dungeon(ctx):
-    # Example: How to access your data
-    # monster = GAME_DATA['enemies'].get('slime') 
     embed = discord.Embed(
-        title="⚔️ Dungeon: Forest of Echoes",
-        description="Stage 1/5 | Monster: Slime",
-        color=discord.Color.red()
+        title="⚔️ Dungeon: Idle Mode Active",
+        description="Your party is currently fighting in the forest.",
+        color=discord.Color.green()
     )
     await ctx.send(embed=embed, view=DungeonView())
 
