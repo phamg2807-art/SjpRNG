@@ -1,4 +1,3 @@
-cat > /home/claude/main.py << 'ENDOFFILE'
 import os, random, asyncio, time, re
 from datetime import datetime, timezone, timedelta
 from discord.ext import commands, tasks
@@ -1531,4 +1530,3 @@ async def help_cmd(ctx):
 
 # ─── Run ──────────────────────────────────────────────────────────────────────
 bot.run(TOKEN)
-ENDOFFILE
