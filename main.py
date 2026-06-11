@@ -1,15 +1,40 @@
 import os
 import sys
-sys.stdout.reconfigure(line_buffering=True)  # ← add this line
-import redis
 import json
+import redis
+import discord
+import psycopg2
 from flask import Flask
 from threading import Thread
-import discord
 from discord.ext import commands
-import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
+from discord.ui import Button, View
+
+sys.stdout.reconfigure(line_buffering=True)
+
+# ─── Game Data (Global Storage) ───────────────────────────────────────────────
+GAME_DATA = {}
+
+def load_game_data():
+    global GAME_DATA
+    data_dir = "data"
+    if not os.path.exists(data_dir):
+        os.makedirs(data_dir)
+        print(f"📁 Created {data_dir} directory.")
+    
+    files = ['enemies.json', 'weapons.json', 'armors.json', 'maps.json']
+    for file in files:
+        path = os.path.join(data_dir, file)
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                GAME_DATA[file.replace('.json', '')] = json.load(f)
+            print(f"✅ Loaded {file}")
+        else:
+            # Create empty file if not exists
+            with open(path, 'w') as f:
+                json.dump({}, f)
+            print(f"⚠️ Created empty {file}")
 
 # ─── Flask Keep-Alive ─────────────────────────────────────────────────────────
 app = Flask('')
@@ -57,9 +82,43 @@ def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS example (
+                CREATE TABLE IF NOT EXISTS players (
+                    user_id BIGINT PRIMARY KEY,
+                    hp INT DEFAULT 100,
+                    st INT DEFAULT 10,
+                    df INT DEFAULT 10,
+                    mn INT DEFAULT 10,
+                    gold INT DEFAULT 0,
+                    xp INT DEFAULT 0,
+                    level INT DEFAULT 1,
+                    current_map INT DEFAULT 1,
+                    current_stage INT DEFAULT 1
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS items (
                     id SERIAL PRIMARY KEY,
-                    created_at TIMESTAMPTZ DEFAULT NOW()
+                    name TEXT,
+                    rarity TEXT,
+                    min_level INT,
+                    stats JSONB
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS inventory (
+                    id SERIAL PRIMARY KEY,
+                    player_id BIGINT REFERENCES players(user_id),
+                    item_id INT REFERENCES items(id),
+                    equipped BOOLEAN DEFAULT FALSE
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS market (
+                    id SERIAL PRIMARY KEY,
+                    seller_id BIGINT REFERENCES players(user_id),
+                    item_id INT REFERENCES items(id),
+                    price INT,
+                    listed_at TIMESTAMPTZ DEFAULT NOW()
                 );
             """)
         conn.commit()
@@ -74,10 +133,24 @@ intents.members = True
 
 bot = commands.Bot(command_prefix='-', intents=intents, help_command=None)
 
+# ─── UI Components ────────────────────────────────────────────────────────────
+class DungeonView(View):
+    def __init__(self):
+        super().__init__(timeout=60)
+    
+    @discord.ui.button(label="Attack", style=discord.ButtonStyle.danger)
+    async def attack(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_message("You attacked the monster!", ephemeral=True)
+
+    @discord.ui.button(label="Heal", style=discord.ButtonStyle.success)
+    async def heal(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_message("You recovered 20 HP!", ephemeral=True)
+
 # ─── Events ───────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
     init_db()
+    load_game_data() # Load JSON files here
     try:
         rd.set("test", "hello")
         val = rd.get("test")
@@ -85,5 +158,18 @@ async def on_ready():
     except Exception as e:
         print(f"❌ Redis error: {e}")
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+
+# ─── Commands ─────────────────────────────────────────────────────────────────
+@bot.command()
+async def dungeon(ctx):
+    # Example: How to access your data
+    # monster = GAME_DATA['enemies'].get('slime') 
+    embed = discord.Embed(
+        title="⚔️ Dungeon: Forest of Echoes",
+        description="Stage 1/5 | Monster: Slime",
+        color=discord.Color.red()
+    )
+    await ctx.send(embed=embed, view=DungeonView())
+
 # ─── Run ──────────────────────────────────────────────────────────────────────
 bot.run(TOKEN)
