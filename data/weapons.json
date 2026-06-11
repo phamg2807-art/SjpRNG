@@ -1,4 +1,44 @@
 {
-    "rusty_sword": { "name": "Rusty Sword", "dmg": 10, "type": "physical" },
-    "wooden_staff": { "name": "Wooden Staff", "dmg": 8, "type": "magical" }
+  "rusty_sword": {
+    "name": "Rusty Sword",
+    "type": "physical",
+    "dmg": 2,
+    "tier": "common",
+    "image": "https://cdn.discordapp.com/attachments/1514648232268005436/1514648256313823316/content.png?ex=6a2c219d&is=6a2ad01d&hm=9c83656b0c962c6294ccf802225796287549958e8334f05229c41987205d16f9&"
+  },
+  "old_branch": {
+    "name": "Old Branch",
+    "type": "magical",
+    "dmg": 1,
+    "tier": "common",
+    "image": "https://cdn.discordapp.com/attachments/1514648232268005436/1514648666588319938/content.png?ex=6a2c21fe&is=6a2ad07e&hm=da0e1f9aa4e533cfd61519e226d102e234209d30f26f3c00609e833d409feb22&"
+  },
+  "wooden_greatsword": {
+    "name": "Wooden Greatsword",
+    "type": "physical",
+    "dmg": 6,
+    "tier": "uncommon",
+    "image": "https://cdn.discordapp.com/attachments/1514648232268005436/1514650422931886202/content.png?ex=6a2c23a1&is=6a2ad221&hm=26d00817a02fcd73c56a0d4df37d02d9beb81af0df8b03e7f0699578df665941&"
+  },
+  "basic_branch": {
+    "name": "Basic Branch",
+    "type": "magical",
+    "dmg": 5,
+    "tier": "uncommon",
+    "image": "https://cdn.discordapp.com/attachments/1514648232268005436/1514650908456390736/content.png?ex=6a2c2415&is=6a2ad295&hm=747ea378d7304c68e890b5cfd8eb4cee86bb05891478a92483ce2ee1e0410796&"
+  },
+  "enchanted_spellblade": {
+    "name": "Enchanted Spellblade",
+    "type": "magical",
+    "dmg": 15,
+    "tier": "epic",
+    "image": "https://cdn.discordapp.com/attachments/1514648232268005436/1514652861911273652/content.png?ex=6a2c25e7&is=6a2ad467&hm=efde82b21a2b027fa668ddd10ac012814ad93bf0a627ab126794140d950f9be0&"
+  },
+  "timber_darkblade": {
+    "name": "Timber Darkblade",
+    "type": "physical",
+    "dmg": 45,
+    "tier": "legendary",
+    "image": "https://cdn.discordapp.com/attachments/1514648232268005436/1514654812703297606/content.png?ex=6a2c27b8&is=6a2ad638&hm=026a963fc9550744c09eaa7ffa8a18ccd29f65d33630b773112690209aa68b1a&"
+  }
 }
