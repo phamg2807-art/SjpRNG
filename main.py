@@ -157,12 +157,7 @@ bot = commands.Bot(command_prefix='-', intents=intents, help_command=None)
 # ─── Idle Combat Loop ─────────────────────────────────────────────────────────
 @tasks.loop(seconds=30.0)
 async def idle_combat_loop():
-    # This loop will eventually iterate through all parties in the 'parties' table
-    # Example logic skeleton:
-    # 1. Fetch parties with in_dungeon = TRUE
-    # 2. Get party member stats
-    # 3. Calculate combat damage vs current enemy
-    # 4. Save updates
+    # Logic to process combat for active parties will go here
     pass
 
 # ─── UI Components ────────────────────────────────────────────────────────────
@@ -184,13 +179,33 @@ async def on_ready():
 
 # ─── Commands ─────────────────────────────────────────────────────────────────
 @bot.command()
+async def help(ctx):
+    help_text = """
+    **⚔️ Dungeon Quest Bot - Commands**
+    
+    `-dungeon`: Enter the dungeon and start idle farming.
+    `-stats`: View your current stats and unallocated points.
+    `-upgrade [stat] [amount]`: Upgrade your HP, ST, DF, or MN.
+    `-party_create`: Create a party to tackle dungeons with friends (up to 4 players).
+    `-shop`: View the daily shop rotation.
+
+    **Instructions:**
+    1. **Builds:** Spend points using `-upgrade`. ST increases physical weapon power, MN increases magical weapon power.
+    2. **Combat:** Your party fights automatically while in a dungeon.
+    3. **Economy:** Sell items in the market or buy from the global shop.
+    """
+    try:
+        await ctx.author.send(help_text)
+        await ctx.send("✅ Check your DMs for the help guide!")
+    except discord.Forbidden:
+        await ctx.send("❌ I couldn't send you a DM. Please enable DMs from server members.")
+
+@bot.command()
 async def stats(ctx):
-    # This would fetch the player from DB
     await ctx.send("Your Stats: HP 100 | ST 10 | DF 10 | MN 10 | Points: 5")
 
 @bot.command()
 async def upgrade(ctx, stat: str, amount: int):
-    # This will handle the manual stat distribution logic
     await ctx.send(f"Upgraded {stat} by {amount}!")
 
 @bot.command()
