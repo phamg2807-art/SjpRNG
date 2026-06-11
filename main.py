@@ -1,4 +1,6 @@
 import os
+import sys
+sys.stdout.reconfigure(line_buffering=True)  # ← add this line
 import redis
 import json
 from flask import Flask
