@@ -77,8 +77,7 @@ bot = commands.Bot(command_prefix='-', intents=intents, help_command=None)
 async def on_ready():
     init_db()
     rd.set("test", "hello")
-    print("Redis test:", rd.get("test"))  # should print: Redis test: hello
+    print("Redis test:", rd.get("test"))
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
-
 # ─── Run ──────────────────────────────────────────────────────────────────────
 bot.run(TOKEN)
