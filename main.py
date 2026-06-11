@@ -26,15 +26,25 @@ def load_game_data():
     
     files = ['enemies.json', 'weapons.json', 'armors.json', 'maps.json']
     for file in files:
+        name = file.replace('.json', '')
         path = os.path.join(data_dir, file)
-        if os.path.exists(path):
-            with open(path, 'r') as f:
-                GAME_DATA[file.replace('.json', '')] = json.load(f)
-            print(f"✅ Loaded {file}")
-        else:
+        
+        # Ensure file exists
+        if not os.path.exists(path):
             with open(path, 'w') as f:
                 json.dump({}, f)
-            print(f"⚠️ Created empty {file}")
+        
+        # Load with error handling (Prevents crash if JSON is empty/corrupt)
+        try:
+            with open(path, 'r') as f:
+                content = json.load(f)
+                GAME_DATA[name] = content
+                print(f"✅ Loaded {file}")
+        except json.JSONDecodeError:
+            print(f"⚠️ {file} was corrupted/empty. Resetting to empty object.")
+            GAME_DATA[name] = {}
+            with open(path, 'w') as f:
+                json.dump({}, f)
 
 # ─── Combat Math Logic ───────────────────────────────────────────────────────
 def calculate_damage(player, weapon, enemy):
@@ -46,7 +56,7 @@ def calculate_damage(player, weapon, enemy):
     base_dmg = weapon.get('dmg', 5)
     w_type = weapon.get('type', 'physical')
     
-    # Scaling Logic
+    # Scaling Logic based on player stats
     if w_type == 'physical':
         # Scale with ST
         total_dmg = base_dmg * (1 + (player.get('st', 10) / 100))
@@ -107,6 +117,7 @@ rd = redis.from_url(REDIS_URL, decode_responses=True)
 def init_db():
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # Player Table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS players (
                     user_id BIGINT PRIMARY KEY,
@@ -116,6 +127,7 @@ def init_db():
                     current_map INT DEFAULT 1, current_stage INT DEFAULT 1
                 );
             """)
+            # Parties Table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS parties (
                     party_id SERIAL PRIMARY KEY,
@@ -124,17 +136,20 @@ def init_db():
                     in_dungeon BOOLEAN DEFAULT FALSE
                 );
             """)
+            # Items Master List
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS items (
                     id SERIAL PRIMARY KEY, name TEXT, rarity TEXT, min_level INT, stats JSONB
                 );
             """)
+            # Inventory
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS inventory (
                     id SERIAL PRIMARY KEY, player_id BIGINT REFERENCES players(user_id),
                     item_id INT REFERENCES items(id), equipped BOOLEAN DEFAULT FALSE
                 );
             """)
+            # Market
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS market (
                     id SERIAL PRIMARY KEY, seller_id BIGINT REFERENCES players(user_id),
@@ -157,7 +172,7 @@ bot = commands.Bot(command_prefix='-', intents=intents, help_command=None)
 # ─── Idle Combat Loop ─────────────────────────────────────────────────────────
 @tasks.loop(seconds=30.0)
 async def idle_combat_loop():
-    # Logic to process combat for active parties will go here
+    # Placeholder for combat processing
     pass
 
 # ─── UI Components ────────────────────────────────────────────────────────────
@@ -173,7 +188,7 @@ class DungeonView(View):
 @bot.event
 async def on_ready():
     init_db()
-    load_game_data()
+    load_game_data() # Load files on startup
     idle_combat_loop.start()
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
 
