@@ -1477,54 +1477,55 @@ async def ping_cmd(ctx): await ctx.send(f"Pong!  `{round(bot.latency*1000)} ms`"
 async def help_cmd(ctx):
     e = discord.Embed(title="Commands", color=0x5865F2)
     e.description = "Prefix: `-`  ·  `[optional]`  `<required>`\n\u200b"
-    sections = [
-        ("Collection", [
-            ("`-collection`  (`-col`, `-c`)",    "Browse all server prizes and their discovery status."),
-            ("`-rarest`  (`-rare`)",             "Show the rarest prizes ever found here."),
-            ("`-recent`  (`-feed`)",             "Live feed of the last 10 prize finds."),
-            ("`-prizeinfo <name>`  (`-pi`)",     "Detailed info on a prize. Partial names work."),
-            ("`-stats`",                          "Full server statistics dashboard."),
-        ]),
-        ("Inventory", [
-            ("`-inventory [sort]`  (`-inv`, `-i`)", "Your prize collection. Add `@user` to view someone else's.\nSort: `rarity` · `quantity` · `name` · `recent` · `oldest`"),
-            ("`-search <name>`  (`-find`, `-s`)",   "Search your inventory by prize name."),
-            ("`-compare <@user>`  (`-vs`)",          "See which prizes you share or don't with another user."),
-        ]),
-        ("Profile", [
-            ("`-profile [@user]`  (`-p`, `-prof`)", "View your profile card, or someone else's."),
-            ("`-setbio [text]`",                    "Set a bio. Leave blank to clear it."),
-            ("`-showcase`",                         "Pin a prize to the front of your profile."),
-            ("`-equip <prize name>`",               "Wear a prize as a nickname tag: `[PrizeName] YourName`"),
-            ("`-unequip`",                          "Remove your equipped prize and restore your nickname."),
-        ]),
-        ("Credits & Economy", [
-            ("`-balance`  (`-bal`, `-wallet`)",     "Check your wallet, bank balance, and active effects."),
-            ("`-deposit <amount|all>`  (`-dep`)",   "Deposit credits into your bank (+5% interest per msg)."),
-            ("`-withdraw <amount|all>`  (`-with`)", "Withdraw credits from your bank."),
-        ]),
-        ("Items", [
-            ("`-store`  (`-shop`)",    "Browse today's daily item store (refreshes midnight UTC+7)."),
-            ("`-buy <slot>`",          "Buy an item from the store by slot number."),
-            ("`-items`  (`-bag`)",     "View your item inventory and active effects."),
-            ("`-use <item name>`",     "Activate an item from your bag."),
-        ]),
-        ("Leaderboard", [
-            ("`-leaderboard [type]`  (`-lb`, `-top`)", "Rankings. Types: `collected` · `rarest` · `messages` · `credits`"),
-        ]),
-        ("Misc", [
-            ("`-ping`", "Check bot latency."),
-        ]),
-    ]
-    for section, cmds in sections:
-        e.add_field(name="\u200b", value=f"**{section}**", inline=False)
-        for name, desc in cmds:
-            e.add_field(name=name, value=desc, inline=False)
+
+    e.add_field(name="🏆 Collection", value=(
+        "`-collection` (`-col`) — Browse all prizes & discovery status\n"
+        "`-rarest` — Show the rarest prizes ever found\n"
+        "`-recent` (`-feed`) — Live feed of last 10 finds\n"
+        "`-prizeinfo <name>` (`-pi`) — Detailed prize info\n"
+        "`-stats` — Server statistics dashboard"
+    ), inline=False)
+
+    e.add_field(name="🎒 Inventory", value=(
+        "`-inventory [sort]` (`-inv`) — Your collection. Sorts: `rarity` `quantity` `name` `recent` `oldest`\n"
+        "`-search <name>` (`-find`) — Search your inventory\n"
+        "`-compare <@user>` (`-vs`) — Compare prizes with someone"
+    ), inline=False)
+
+    e.add_field(name="👤 Profile", value=(
+        "`-profile [@user]` (`-p`) — View a profile card\n"
+        "`-setbio [text]` — Set your bio (leave blank to clear)\n"
+        "`-showcase` — Pin a prize to your profile\n"
+        "`-equip <prize>` — Wear a prize as a nickname tag\n"
+        "`-unequip` — Remove equipped prize & restore nickname"
+    ), inline=False)
+
+    e.add_field(name="💰 Credits & Economy", value=(
+        "`-balance` (`-bal`) — Wallet, bank & active effects\n"
+        "`-deposit <amount|all>` (`-dep`) — Deposit to bank (+5% interest/msg)\n"
+        "`-withdraw <amount|all>` (`-with`) — Withdraw from bank"
+    ), inline=False)
+
+    e.add_field(name="🛒 Items", value=(
+        "`-store` (`-shop`) — Daily item store (resets midnight UTC+7)\n"
+        "`-buy <slot>` — Buy item by slot number\n"
+        "`-items` (`-bag`) — Your items & active effects\n"
+        "`-use <item name>` — Activate an item"
+    ), inline=False)
+
+    e.add_field(name="📊 Leaderboard & Misc", value=(
+        "`-leaderboard [type]` (`-lb`) — Rankings: `collected` `rarest` `messages` `credits`\n"
+        "`-ping` — Check bot latency"
+    ), inline=False)
+
     if is_admin(ctx.author):
-        e.add_field(name="\u200b", value="**Admin**", inline=False)
-        e.add_field(name="`-prizemaker`  (`-pm`)",                                  value="Open the prize management panel.", inline=False)
-        e.add_field(name="`-give <@user|everyone> credits <amount>`",               value="Give credits to a user or everyone.", inline=False)
-        e.add_field(name="`-give <@user|everyone> item <item name>`",               value="Give an item to a user or everyone.", inline=False)
-        e.add_field(name="`-rerollstore`",                                          value="Force-reroll the daily store.", inline=False)
+        e.add_field(name="⚙️ Admin", value=(
+            "`-prizemaker` (`-pm`) — Open prize management panel\n"
+            "`-give <@user|everyone> credits <amount>` — Give credits\n"
+            "`-give <@user|everyone> item <name>` — Give an item\n"
+            "`-rerollstore` — Force-reroll the daily store"
+        ), inline=False)
+
     e.set_footer(text="Every message gives you a chance to win a prize AND earns credits!")
     await ctx.send(embed=e)
 
