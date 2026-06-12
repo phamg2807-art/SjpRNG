@@ -221,9 +221,8 @@ def prestige_multiplier(prestige: int) -> float:
 def init_db():
     conn = db()
     cur = conn.cursor()
-
-    # Drop and recreate with full schema to ensure all columns exist
-    # We use CREATE TABLE IF NOT EXISTS with full column list
+    
+    # Create tables with full schema
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id       BIGINT PRIMARY KEY,
@@ -237,18 +236,18 @@ def init_db():
             prestige      INT DEFAULT 0,
             total_coins   INT DEFAULT 0,
             joined_at     TIMESTAMP DEFAULT NOW()
-        );
+        )
     """)
-
+    
     cur.execute("""
         CREATE TABLE IF NOT EXISTS coins (
             id          SERIAL PRIMARY KEY,
             owner_id    BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
-            material    TEXT,
-            variant     TEXT,
-            status      TEXT,
-            float       TEXT,
-            serial      INT,
+            material    TEXT NOT NULL,
+            variant     TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            float       TEXT NOT NULL,
+            serial      INT NOT NULL,
             base_value  FLOAT DEFAULT 0,
             mat_mult    FLOAT DEFAULT 1,
             var_mult    FLOAT DEFAULT 1,
@@ -259,70 +258,68 @@ def init_db():
             value       FLOAT DEFAULT 0,
             custom_name TEXT DEFAULT NULL,
             obtained_at TIMESTAMP DEFAULT NOW()
-        );
+        )
     """)
-
-    # Safe migrations for users table
-    user_cols = [
-        ("last_msg_ts",  "BIGINT DEFAULT 0"),
+    
+    # Check and add missing columns to users table
+    existing_user_cols = set()
+    try:
+        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='users'")
+        existing_user_cols = {row[0] for row in cur.fetchall()}
+    except:
+        pass
+    
+    user_columns = [
+        ("last_msg_ts", "BIGINT DEFAULT 0"),
         ("last_work_ts", "BIGINT DEFAULT 0"),
-        ("last_rob_ts",  "BIGINT DEFAULT 0"),
-        ("prestige",     "INT DEFAULT 0"),
-        ("total_coins",  "INT DEFAULT 0"),
+        ("last_rob_ts", "BIGINT DEFAULT 0"),
+        ("prestige", "INT DEFAULT 0"),
+        ("total_coins", "INT DEFAULT 0"),
         ("daily_streak", "INT DEFAULT 0"),
-        ("joined_at",    "TIMESTAMP DEFAULT NOW()"),
-        ("credits",      "INT DEFAULT 0"),
-        ("last_daily",   "DATE"),
+        ("joined_at", "TIMESTAMP DEFAULT NOW()"),
+        ("credits", "INT DEFAULT 0"),
     ]
-    for col, col_def in user_cols:
-        try:
-            cur.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {col_def};")
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            print(f"User migration {col}: {e}")
-
-    # Safe migrations for coins table
-    coin_cols = [
-        ("base_value",  "FLOAT DEFAULT 0"),
-        ("mat_mult",    "FLOAT DEFAULT 1"),
-        ("var_mult",    "FLOAT DEFAULT 1"),
-        ("sta_mult",    "FLOAT DEFAULT 1"),
-        ("flt_mult",    "FLOAT DEFAULT 1"),
-        ("ser_mult",    "FLOAT DEFAULT 1"),
-        ("total_mult",  "FLOAT DEFAULT 1"),
-        ("value",       "FLOAT DEFAULT 0"),
+    
+    for col, col_def in user_columns:
+        if col not in existing_user_cols:
+            try:
+                cur.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {col_def}")
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                print(f"User migration {col}: {e}")
+    
+    # Check and add missing columns to coins table
+    existing_coin_cols = set()
+    try:
+        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='coins'")
+        existing_coin_cols = {row[0] for row in cur.fetchall()}
+    except:
+        pass
+    
+    coin_columns = [
+        ("base_value", "FLOAT DEFAULT 0"),
+        ("mat_mult", "FLOAT DEFAULT 1"),
+        ("var_mult", "FLOAT DEFAULT 1"),
+        ("sta_mult", "FLOAT DEFAULT 1"),
+        ("flt_mult", "FLOAT DEFAULT 1"),
+        ("ser_mult", "FLOAT DEFAULT 1"),
+        ("total_mult", "FLOAT DEFAULT 1"),
+        ("value", "FLOAT DEFAULT 0"),
         ("custom_name", "TEXT DEFAULT NULL"),
         ("obtained_at", "TIMESTAMP DEFAULT NOW()"),
     ]
-    for col, col_def in coin_cols:
-        try:
-            cur.execute(f"ALTER TABLE coins ADD COLUMN IF NOT EXISTS {col} {col_def};")
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            print(f"Coin migration {col}: {e}")
-
-    # Fix any coins that might have NULL values from old data
-    try:
-        cur.execute("""
-            UPDATE coins SET
-                base_value = COALESCE(base_value, 1.0),
-                mat_mult   = COALESCE(mat_mult,   1.0),
-                var_mult   = COALESCE(var_mult,   1.0),
-                sta_mult   = COALESCE(sta_mult,   1.0),
-                flt_mult   = COALESCE(flt_mult,   1.0),
-                ser_mult   = COALESCE(ser_mult,   1.0),
-                total_mult = COALESCE(total_mult, 1.0),
-                value      = COALESCE(value,      0.0)
-            WHERE base_value IS NULL OR value IS NULL OR total_mult IS NULL;
-        """)
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        print(f"Null fix migration: {e}")
-
-    # Other tables
+    
+    for col, col_def in coin_columns:
+        if col not in existing_coin_cols:
+            try:
+                cur.execute(f"ALTER TABLE coins ADD COLUMN IF NOT EXISTS {col} {col_def}")
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                print(f"Coin migration {col}: {e}")
+    
+    # Create other tables
     cur.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id            SERIAL PRIMARY KEY,
@@ -332,7 +329,7 @@ def init_db():
             credits_offer INT DEFAULT 0,
             status        TEXT DEFAULT 'pending',
             created_at    TIMESTAMP DEFAULT NOW()
-        );
+        )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS auctions (
@@ -345,29 +342,29 @@ def init_db():
             ends_at      TIMESTAMP,
             status       TEXT DEFAULT 'active',
             created_at   TIMESTAMP DEFAULT NOW()
-        );
+        )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bank (
             id    INT PRIMARY KEY DEFAULT 1,
             total INT DEFAULT 0
-        );
+        )
     """)
-    cur.execute("INSERT INTO bank(id,total) VALUES(1,0) ON CONFLICT DO NOTHING;")
+    cur.execute("INSERT INTO bank(id,total) VALUES(1,0) ON CONFLICT (id) DO NOTHING")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bank_log (
             id        SERIAL PRIMARY KEY,
             source    TEXT,
             amount    INT,
             logged_at TIMESTAMP DEFAULT NOW()
-        );
+        )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS daily_log (
             paid_date DATE PRIMARY KEY,
             amount    INT,
             paid_at   TIMESTAMP DEFAULT NOW()
-        );
+        )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS credit_log (
@@ -376,9 +373,9 @@ def init_db():
             amount    INT,
             reason    TEXT,
             logged_at TIMESTAMP DEFAULT NOW()
-        );
+        )
     """)
-
+    
     conn.commit()
     release(conn)
     print("✅ Database initialized!")
@@ -406,7 +403,20 @@ def get_user(user_id: int):
     cur = conn.cursor()
     try:
         cur.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
-        return cur.fetchone()
+        row = cur.fetchone()
+        if row:
+            # Ensure all expected fields exist
+            defaults = {
+                'credits': 0, 'last_msg_ts': 0, 'last_work_ts': 0, 'last_rob_ts': 0,
+                'prestige': 0, 'total_coins': 0, 'daily_streak': 0
+            }
+            for key, val in defaults.items():
+                if key not in row or row[key] is None:
+                    row[key] = val
+        return row
+    except Exception as e:
+        print(f"get_user error: {e}")
+        return None
     finally:
         release(conn)
 
@@ -1253,7 +1263,7 @@ async def buy(ctx, item: str = None, *args):
         except Exception as ex:
             conn.rollback()
             print(f"buy crate error: {ex}")
-            await ctx.send("❌ An error occurred opening crates. Try again.")
+            await ctx.send(f"❌ An error occurred opening crates. Error: {str(ex)[:100]}")
             return
         finally:
             release(conn)
@@ -1456,10 +1466,9 @@ async def coin(ctx, coin_id: int):
     conn = db()
     cur = conn.cursor()
     try:
-        cur.execute(
-            "SELECT c.*, u.username FROM coins c JOIN users u ON u.user_id = c.owner_id WHERE c.id = %s",
-            (coin_id,)
-        )
+        cur.execute("""
+            SELECT c.*, u.username FROM coins c JOIN users u ON u.user_id = c.owner_id WHERE c.id = %s
+        """, (coin_id,))
         c = cur.fetchone()
     except Exception as ex:
         print(f"coin command error: {ex}")
@@ -1749,7 +1758,13 @@ async def market(ctx, page: int = 1):
     cur = conn.cursor()
     try:
         cur.execute("SELECT COUNT(*) as c FROM auctions WHERE status = 'active'")
-        total = cur.fetchone()['c']
+        total_row = cur.fetchone()
+        total = total_row['c'] if total_row else 0
+        
+        if total == 0:
+            await ctx.send("🏪 No active auctions. List yours with `-auction <coin_id> <price>`.")
+            return
+            
         cur.execute("""
             SELECT a.*, c.material, c.variant, c.status as cond, c.float, c.serial,
                    c.value as coin_val, c.custom_name, u.username as seller_name
@@ -1763,13 +1778,16 @@ async def market(ctx, page: int = 1):
         rows = cur.fetchall()
     except Exception as ex:
         print(f"market error: {ex}")
-        await ctx.send("❌ An error occurred loading the market.")
+        await ctx.send("❌ An error occurred loading the market. Please try again later.")
         return
     finally:
         release(conn)
 
     if not rows:
-        await ctx.send("🏪 No active auctions. List yours with `-auction <coin_id> <price>`.")
+        if page > 1:
+            await ctx.send(f"❌ No auctions on page {page}.")
+        else:
+            await ctx.send("🏪 No active auctions. List yours with `-auction <coin_id> <price>`.")
         return
 
     pages = max(1, math.ceil(total / per_page))
