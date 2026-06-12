@@ -1,9 +1,0 @@
-{
-  "small_slime": { "name": "Small Slime", "hp": 4, "dmg": 0, "exp": 1, "behavior": "harmless" },
-  "basic_slime": { "name": "Basic Slime", "hp": 8, "dmg": 0, "exp": 2, "behavior": "harmless" },
-  "large_slime": { "name": "Large Slime", "hp": 12, "dmg": 0, "exp": 5, "behavior": "harmless" },
-  "small_goblin": { "name": "Small Goblin", "hp": 2, "dmg": 1, "exp": 2, "behavior": "retaliate_always" },
-  "goblin": { "name": "Goblin", "hp": 6, "dmg": 2, "exp": 6, "behavior": "retaliate_always" },
-  "ripped_goblin": { "name": "Ripped Goblin", "hp": 12, "dmg": 5, "exp": 15, "behavior": "retaliate_always" },
-  "hardened_spellcaster": { "name": "Hardened Spellcaster (BOSS)", "hp": 70, "dmg": 8, "exp": 60, "behavior": "retaliate_every_3" }
-}
