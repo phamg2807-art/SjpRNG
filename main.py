@@ -222,6 +222,39 @@ def init_db():
     conn = db()
     cur = conn.cursor()
     
+    # First, check if coins table exists and has id column
+    cur.execute("""
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables 
+            WHERE table_name = 'coins'
+        )
+    """)
+    coins_exists = cur.fetchone()['exists']
+    
+    if coins_exists:
+        # Check if id column exists
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.columns 
+                WHERE table_name = 'coins' AND column_name = 'id'
+            )
+        """)
+        id_exists = cur.fetchone()['exists']
+        
+        if not id_exists:
+            print("⚠️ coins table missing 'id' column! Adding it now...")
+            # Drop and recreate coins table - this will preserve data by backing it up
+            try:
+                # Backup existing data
+                cur.execute("CREATE TABLE IF NOT EXISTS coins_backup AS SELECT * FROM coins")
+                # Drop old table
+                cur.execute("DROP TABLE coins CASCADE")
+                conn.commit()
+                print("✅ Dropped old coins table, creating new one...")
+            except Exception as e:
+                print(f"Table drop error: {e}")
+                conn.rollback()
+    
     # Create tables with full schema
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -261,11 +294,40 @@ def init_db():
         )
     """)
     
+    # Restore backup data if exists
+    try:
+        cur.execute("SELECT COUNT(*) as c FROM coins_backup")
+        backup_count = cur.fetchone()['c']
+        if backup_count > 0:
+            print(f"🔄 Restoring {backup_count} coins from backup...")
+            # Get column list from new table
+            cur.execute("""
+                SELECT column_name FROM information_schema.columns 
+                WHERE table_name = 'coins' ORDER BY ordinal_position
+            """)
+            new_cols = [row['column_name'] for row in cur.fetchall()]
+            col_list = ', '.join(new_cols)
+            
+            cur.execute(f"""
+                INSERT INTO coins ({col_list})
+                SELECT {col_list} FROM coins_backup 
+                WHERE owner_id IN (SELECT user_id FROM users)
+            """)
+            conn.commit()
+            print("✅ Backup data restored!")
+            
+            # Drop backup table
+            cur.execute("DROP TABLE IF EXISTS coins_backup")
+            conn.commit()
+    except Exception as e:
+        print(f"Backup restore notice: {e}")
+        conn.rollback()
+    
     # Check and add missing columns to users table
     existing_user_cols = set()
     try:
         cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='users'")
-        existing_user_cols = {row[0] for row in cur.fetchall()}
+        existing_user_cols = {row['column_name'] for row in cur.fetchall()}
     except:
         pass
     
@@ -288,36 +350,6 @@ def init_db():
             except Exception as e:
                 conn.rollback()
                 print(f"User migration {col}: {e}")
-    
-    # Check and add missing columns to coins table
-    existing_coin_cols = set()
-    try:
-        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='coins'")
-        existing_coin_cols = {row[0] for row in cur.fetchall()}
-    except:
-        pass
-    
-    coin_columns = [
-        ("base_value", "FLOAT DEFAULT 0"),
-        ("mat_mult", "FLOAT DEFAULT 1"),
-        ("var_mult", "FLOAT DEFAULT 1"),
-        ("sta_mult", "FLOAT DEFAULT 1"),
-        ("flt_mult", "FLOAT DEFAULT 1"),
-        ("ser_mult", "FLOAT DEFAULT 1"),
-        ("total_mult", "FLOAT DEFAULT 1"),
-        ("value", "FLOAT DEFAULT 0"),
-        ("custom_name", "TEXT DEFAULT NULL"),
-        ("obtained_at", "TIMESTAMP DEFAULT NOW()"),
-    ]
-    
-    for col, col_def in coin_columns:
-        if col not in existing_coin_cols:
-            try:
-                cur.execute(f"ALTER TABLE coins ADD COLUMN IF NOT EXISTS {col} {col_def}")
-                conn.commit()
-            except Exception as e:
-                conn.rollback()
-                print(f"Coin migration {col}: {e}")
     
     # Create other tables
     cur.execute("""
@@ -377,6 +409,20 @@ def init_db():
     """)
     
     conn.commit()
+    
+    # Verify the id column exists
+    cur.execute("""
+        SELECT EXISTS (
+            SELECT FROM information_schema.columns 
+            WHERE table_name = 'coins' AND column_name = 'id'
+        )
+    """)
+    id_exists = cur.fetchone()['exists']
+    if id_exists:
+        print("✅ coins.id column verified!")
+    else:
+        print("❌ CRITICAL: coins.id column still missing!")
+    
     release(conn)
     print("✅ Database initialized!")
 
@@ -1246,15 +1292,19 @@ async def buy(ctx, item: str = None, *args):
             opened = []
             for _ in range(n):
                 coin = generate_coin()
+                # Insert without RETURNING, then fetch the id separately
                 cur.execute("""
                     INSERT INTO coins (owner_id, material, variant, status, float, serial,
                                        base_value, mat_mult, var_mult, sta_mult, flt_mult,
                                        ser_mult, total_mult, value)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """, (uid, coin['material'], coin['variant'], coin['status'], coin['float'],
                       coin['serial'], coin['base_value'], coin['mat_mult'], coin['var_mult'],
                       coin['sta_mult'], coin['flt_mult'], coin['ser_mult'], coin['total_mult'],
                       coin['value']))
+                
+                # Get the last inserted id
+                cur.execute("SELECT lastval() as id")
                 coin['id'] = cur.fetchone()['id']
                 opened.append(coin)
 
