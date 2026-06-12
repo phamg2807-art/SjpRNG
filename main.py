@@ -41,21 +41,21 @@ def release(conn):
     get_pool().putconn(conn)
 
 # ─── Game Constants ────────────────────────────────────────────────────────────
-CRATE_COST          = 100    # credits
-CRATE_FEE_CREDITS   = 5      # credits to bank on each crate purchase
-TRADE_TAX_PCT       = 0.05   # 5% tax on cash trades
-MARKET_FEE_PCT      = 0.08   # 8% auction fee on sale
+CRATE_COST          = 100
+CRATE_FEE_CREDITS   = 5
+TRADE_TAX_PCT       = 0.05
+MARKET_FEE_PCT      = 0.08
 CREDITS_PER_MSG     = 1
 MSG_COOLDOWN_S      = 30
-DAILY_CREDITS       = 50     # base daily claim
-DAILY_STREAK_BONUS  = 5      # extra credits per streak day (max 7)
-WORK_COOLDOWN_H     = 4      # hours between -work
-WORK_MIN            = 10     # min credits from work
-WORK_MAX            = 40     # max credits from work
+DAILY_CREDITS       = 50
+DAILY_STREAK_BONUS  = 5
+WORK_COOLDOWN_H     = 4
+WORK_MIN            = 10
+WORK_MAX            = 40
 ROB_COOLDOWN_H      = 6
-ROB_SUCCESS_PCT     = 0.40   # 40% rob success
-ROB_MAX_STEAL_PCT   = 0.20   # steal up to 20% of target's credits
-ROB_FINE_PCT        = 0.15   # pay 15% of your credits as fine if caught
+ROB_SUCCESS_PCT     = 0.40
+ROB_MAX_STEAL_PCT   = 0.20
+ROB_FINE_PCT        = 0.15
 GAMBLE_MIN          = 10
 SHOP_ITEMS = {
     "rename":    {"cost": 200, "desc": "Rename one of your coins (cosmetic only)"},
@@ -64,7 +64,7 @@ SHOP_ITEMS = {
     "crate_x3":  {"cost": 270, "desc": "Open 3 crates at once (10% discount)"},
     "crate_x5":  {"cost": 420, "desc": "Open 5 crates at once (16% discount)"},
 }
-PRESTIGE_COST = 5000         # credits to prestige (resets credits, gives prestige multiplier)
+PRESTIGE_COST = 5000
 
 # ─── Coin Attribute Tables ────────────────────────────────────────────────────
 MATERIALS = [
@@ -206,6 +206,7 @@ def init_db():
     conn = db()
     cur = conn.cursor()
 
+    # ── users table ──────────────────────────────────────────────────────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id       BIGINT PRIMARY KEY,
@@ -221,18 +222,17 @@ def init_db():
             joined_at     TIMESTAMP DEFAULT NOW()
         );
     """)
-
-    # Add missing columns to existing tables (safe migration)
+    # Safe column migrations for users — run BEFORE any SELECT on users
     for col, definition in [
         ("daily_streak", "INT DEFAULT 0"),
         ("last_work_ts", "BIGINT DEFAULT 0"),
         ("last_rob_ts",  "BIGINT DEFAULT 0"),
         ("prestige",     "INT DEFAULT 0"),
+        ("total_coins",  "INT DEFAULT 0"),
     ]:
-        cur.execute(f"""
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {definition};
-        """)
+        cur.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {definition};")
 
+    # ── coins table ───────────────────────────────────────────────────────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS coins (
             id          SERIAL PRIMARY KEY,
@@ -256,6 +256,7 @@ def init_db():
     """)
     cur.execute("ALTER TABLE coins ADD COLUMN IF NOT EXISTS custom_name TEXT DEFAULT NULL;")
 
+    # ── trades table ──────────────────────────────────────────────────────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id           SERIAL PRIMARY KEY,
@@ -268,6 +269,7 @@ def init_db():
         );
     """)
 
+    # ── auctions table ────────────────────────────────────────────────────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS auctions (
             id           SERIAL PRIMARY KEY,
@@ -282,14 +284,20 @@ def init_db():
         );
     """)
 
+    # ── bank table ────────────────────────────────────────────────────────────
+    # Create with correct schema first
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bank (
             id    INT PRIMARY KEY DEFAULT 1,
             total INT DEFAULT 0
         );
-        INSERT INTO bank (id, total) VALUES (1, 0) ON CONFLICT DO NOTHING;
     """)
+    # Migrate: add 'total' column if it somehow doesn't exist (old schema guard)
+    cur.execute("ALTER TABLE bank ADD COLUMN IF NOT EXISTS total INT DEFAULT 0;")
+    # Ensure the single bank row exists
+    cur.execute("INSERT INTO bank (id, total) VALUES (1, 0) ON CONFLICT (id) DO NOTHING;")
 
+    # ── bank_log table ────────────────────────────────────────────────────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bank_log (
             id        SERIAL PRIMARY KEY,
@@ -299,6 +307,7 @@ def init_db():
         );
     """)
 
+    # ── daily_log table ───────────────────────────────────────────────────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS daily_log (
             paid_date DATE PRIMARY KEY,
@@ -307,6 +316,7 @@ def init_db():
         );
     """)
 
+    # ── credit_log table ──────────────────────────────────────────────────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS credit_log (
             id        SERIAL PRIMARY KEY,
@@ -390,7 +400,7 @@ def count_users():
     return row['c'] if row else 1
 
 def prestige_multiplier(prestige: int) -> float:
-    return 1.0 + (prestige * 0.1)   # +10% credits per prestige level
+    return 1.0 + (prestige * 0.1)
 
 # ─── Spam Prevention ──────────────────────────────────────────────────────────
 MSG_COOLDOWNS = {}
@@ -412,7 +422,8 @@ async def on_message(message):
     if now - last >= MSG_COOLDOWN_S:
         MSG_COOLDOWNS[uid] = now
         u = get_user(uid)
-        bonus = int(CREDITS_PER_MSG * prestige_multiplier(u['prestige'] if u else 0))
+        prestige_val = u['prestige'] if u and 'prestige' in u and u['prestige'] is not None else 0
+        bonus = int(CREDITS_PER_MSG * prestige_multiplier(prestige_val))
         add_credits(uid, bonus, "message")
     await bot.process_commands(message)
 
@@ -541,7 +552,6 @@ class TradeView(discord.ui.View):
         coin_ids     = [int(x) for x in trade['coin_ids'].split(',') if x.strip()] if trade['coin_ids'] else []
         credits_offer = trade['credits_offer']
 
-        # Validate coins still belong to initiator
         if coin_ids:
             cur.execute("SELECT id, owner_id FROM coins WHERE id = ANY(%s)", (coin_ids,))
             rows = cur.fetchall()
@@ -553,7 +563,6 @@ class TradeView(discord.ui.View):
                     await interaction.response.edit_message(content="❌ Coin ownership changed; trade cancelled.", embed=None, view=None)
                     return
 
-        # Validate credits
         if credits_offer > 0:
             cur.execute("SELECT credits FROM users WHERE user_id = %s", (trade['initiator_id'],))
             init_user = cur.fetchone()
@@ -564,7 +573,6 @@ class TradeView(discord.ui.View):
                 await interaction.response.edit_message(content="❌ Initiator has insufficient credits.", embed=None, view=None)
                 return
 
-        # Execute trade
         if coin_ids:
             cur.execute("UPDATE coins SET owner_id = %s WHERE id = ANY(%s)", (trade['receiver_id'], coin_ids))
 
@@ -634,11 +642,9 @@ class BidModal(discord.ui.Modal, title="Place a Bid"):
             release(conn)
             return
 
-        # Refund previous bidder
         if a['bidder_id'] and a['current_bid']:
             cur.execute("UPDATE users SET credits = credits + %s WHERE user_id = %s", (a['current_bid'], a['bidder_id']))
 
-        # Reserve credits
         cur.execute("UPDATE users SET credits = credits - %s WHERE user_id = %s", (bid, uid))
         cur.execute("UPDATE auctions SET current_bid = %s, bidder_id = %s WHERE id = %s",
                     (bid, uid, self.auction_id))
@@ -690,13 +696,12 @@ class CoinflipView(discord.ui.View):
             color  = discord.Color.green()
             title  = "🎉 You Won!"
             desc   = f"The coin landed **{result}**! You win **{self.bet:,} credits**."
-            # Small portion to bank on every gamble (win or lose)
             bank_cut = max(1, int(self.bet * 0.02))
             cur.execute("UPDATE bank SET total = total + %s WHERE id = 1", (bank_cut,))
             cur.execute("INSERT INTO bank_log (source,amount) VALUES ('gamble_tax',%s)", (bank_cut,))
         else:
             cur.execute("UPDATE users SET credits = GREATEST(0, credits - %s) WHERE user_id = %s", (self.bet, self.uid))
-            bank_cut = max(1, int(self.bet * 0.50))   # house keeps 50% of losses
+            bank_cut = max(1, int(self.bet * 0.50))
             cur.execute("UPDATE bank SET total = total + %s WHERE id = 1", (bank_cut,))
             cur.execute("INSERT INTO bank_log (source,amount) VALUES ('gamble_house',%s)", (bank_cut,))
             color  = discord.Color.red()
@@ -730,7 +735,6 @@ async def on_command_error(ctx, error):
 
 # ─── COMMANDS ─────────────────────────────────────────────────────────────────
 
-# ── -help ─────────────────────────────────────────────────────────────────────
 @bot.command()
 async def help(ctx):
     e = discord.Embed(title="🪙 CoinVault — Command Reference", color=0x5865F2)
@@ -779,7 +783,6 @@ async def help(ctx):
     e.set_footer(text="Credits are the ONLY currency • Earn from messages, daily, work, gamble, trading & selling coins")
     await ctx.send(embed=e)
 
-# ── -balance ──────────────────────────────────────────────────────────────────
 @bot.command(aliases=['bal', 'wallet'])
 async def balance(ctx):
     uid = ctx.author.id
@@ -792,16 +795,16 @@ async def balance(ctx):
     portfolio = cur.fetchone()['pv']
     release(conn)
 
-    pmult = prestige_multiplier(u['prestige'])
+    prestige_val = u['prestige'] if u['prestige'] is not None else 0
+    pmult = prestige_multiplier(prestige_val)
     e = discord.Embed(title=f"💳 {ctx.author.display_name}'s Balance", color=0x57F287)
     e.add_field(name="🎟️ Credits",         value=f"**{u['credits']:,}**",         inline=True)
     e.add_field(name="🪙 Coins Owned",      value=f"**{u['total_coins']}**",        inline=True)
     e.add_field(name="📈 Portfolio Value",  value=f"**${portfolio:.4f}**",          inline=True)
-    e.add_field(name="⭐ Prestige",         value=f"**{u['prestige']}** (×{pmult:.1f} earnings)", inline=True)
+    e.add_field(name="⭐ Prestige",         value=f"**{prestige_val}** (×{pmult:.1f} earnings)", inline=True)
     e.add_field(name="🔥 Daily Streak",     value=f"**{u['daily_streak']}** days",  inline=True)
     await ctx.send(embed=e)
 
-# ── -daily ────────────────────────────────────────────────────────────────────
 @bot.command()
 async def daily(ctx):
     uid = ctx.author.id
@@ -817,12 +820,12 @@ async def daily(ctx):
         await ctx.send(f"⏳ Already claimed today! Come back in **{h}h {m}m**.")
         return
 
-    # Streak logic
     yesterday = today - timedelta(days=1)
     streak = (u['daily_streak'] + 1) if u['last_daily'] == yesterday else 1
 
     streak_bonus = min(streak - 1, 7) * DAILY_STREAK_BONUS
-    prestige_mult = prestige_multiplier(u['prestige'])
+    prestige_val = u['prestige'] if u['prestige'] is not None else 0
+    prestige_mult = prestige_multiplier(prestige_val)
     total = int((DAILY_CREDITS + streak_bonus) * prestige_mult)
 
     conn = db()
@@ -845,7 +848,6 @@ async def daily(ctx):
     e.set_footer(text="Come back tomorrow to keep your streak! Max streak bonus at day 8.")
     await ctx.send(embed=e)
 
-# ── -work ─────────────────────────────────────────────────────────────────────
 @bot.command()
 async def work(ctx):
     uid = ctx.author.id
@@ -864,7 +866,8 @@ async def work(ctx):
         return
 
     earned = random.randint(WORK_MIN, WORK_MAX)
-    earned = int(earned * prestige_multiplier(u['prestige']))
+    prestige_val = u['prestige'] if u['prestige'] is not None else 0
+    earned = int(earned * prestige_multiplier(prestige_val))
     action = random.choice(WORK_ACTIONS)
 
     conn = db()
@@ -882,7 +885,6 @@ async def work(ctx):
     e.set_footer(text=f"Next work available in {WORK_COOLDOWN_H} hours")
     await ctx.send(embed=e)
 
-# ── -rob @user ────────────────────────────────────────────────────────────────
 @bot.command()
 async def rob(ctx, target: discord.Member):
     if target.bot or target.id == ctx.author.id:
@@ -936,7 +938,6 @@ async def rob(ctx, target: discord.Member):
 
     await ctx.send(embed=e)
 
-# ── -gamble <amount> ──────────────────────────────────────────────────────────
 @bot.command()
 async def gamble(ctx, amount: int):
     uid = ctx.author.id
@@ -958,7 +959,6 @@ async def gamble(ctx, amount: int):
     view = CoinflipView(uid, amount)
     await ctx.send(embed=e, view=view)
 
-# ── -slots <amount> ───────────────────────────────────────────────────────────
 SLOT_SYMBOLS = ["🍒","🍊","🍋","🍇","💎","🌟","🎰"]
 SLOT_PAYOUTS = {
     ("💎","💎","💎"): 20,
@@ -983,16 +983,10 @@ async def slots(ctx, amount: int):
         await ctx.send(f"❌ You have **{u['credits']:,} credits**.")
         return
 
-    # Weighted pull — rare symbols less common
     weights = [30, 25, 25, 15, 5, 3, 2]
     reel = random.choices(SLOT_SYMBOLS, weights=weights, k=3)
     result_key = tuple(reel)
-
     multiplier = SLOT_PAYOUTS.get(result_key, 0)
-
-    # Check two-of-a-kind (small consolation)
-    if multiplier == 0 and (reel[0]==reel[1] or reel[1]==reel[2] or reel[0]==reel[2]):
-        multiplier = 0  # no consolation to keep economy tight
 
     conn = db()
     cur = conn.cursor()
@@ -1021,7 +1015,6 @@ async def slots(ctx, amount: int):
     e.set_footer(text="3× 🎰 = 50x | 3× 💎 = 20x | 3× 🌟 = 15x | 3× 🍇 = 8x | ...")
     await ctx.send(embed=e)
 
-# ── -prestige ─────────────────────────────────────────────────────────────────
 @bot.command()
 async def prestige(ctx):
     uid = ctx.author.id
@@ -1032,7 +1025,8 @@ async def prestige(ctx):
         await ctx.send(f"❌ Prestige costs **{PRESTIGE_COST:,} credits**. You have **{u['credits']:,}**.")
         return
 
-    new_prestige = u['prestige'] + 1
+    prestige_val = u['prestige'] if u['prestige'] is not None else 0
+    new_prestige = prestige_val + 1
     conn = db()
     cur = conn.cursor()
     cur.execute(
@@ -1053,7 +1047,6 @@ async def prestige(ctx):
     e.set_footer(text=f"Cost: {PRESTIGE_COST:,} credits • Half went to the bank treasury")
     await ctx.send(embed=e)
 
-# ── -shop ─────────────────────────────────────────────────────────────────────
 @bot.command()
 async def shop(ctx):
     e = discord.Embed(title="🛒 CoinVault Shop", color=0xEB459E)
@@ -1063,7 +1056,6 @@ async def shop(ctx):
     e.set_footer(text="Credits are earned by chatting, daily, work, gambling, and selling coins")
     await ctx.send(embed=e)
 
-# ── -buy ──────────────────────────────────────────────────────────────────────
 @bot.command()
 async def buy(ctx, item: str = None, *args):
     if item is None:
@@ -1074,7 +1066,6 @@ async def buy(ctx, item: str = None, *args):
     ensure_user(uid, str(ctx.author))
     item = item.lower()
 
-    # ── crate / crate_x3 / crate_x5 ──
     if item in ("crate", "crate_x3", "crate_x5"):
         count_map = {"crate": 1, "crate_x3": 3, "crate_x5": 5}
         cost_map  = {"crate": 100, "crate_x3": 270, "crate_x5": 420}
@@ -1143,7 +1134,6 @@ async def buy(ctx, item: str = None, *args):
             await ctx.send(embed=e)
         return
 
-    # ── polish <coin_id> ──
     if item == "polish":
         if not args:
             await ctx.send("❌ Usage: `-buy polish <coin_id>`")
@@ -1181,7 +1171,6 @@ async def buy(ctx, item: str = None, *args):
             return
 
         new_status = STATUS_ORDER[idx + 1]
-        # Recalculate value with new status multiplier
         new_sta_mult = next(m for n, m, _ in STATUSES if n == new_status)
         new_total    = round(c['mat_mult'] * c['var_mult'] * new_sta_mult * c['flt_mult'] * c['ser_mult'], 4)
         new_value    = round(c['base_value'] * new_total, 4)
@@ -1199,7 +1188,6 @@ async def buy(ctx, item: str = None, *args):
         await ctx.send(embed=e)
         return
 
-    # ── rename <coin_id> <new name> ──
     if item == "rename":
         if len(args) < 2:
             await ctx.send("❌ Usage: `-buy rename <coin_id> <new name>`")
@@ -1234,7 +1222,6 @@ async def buy(ctx, item: str = None, *args):
 
     await ctx.send(f"❌ Unknown item `{item}`. See `-shop`.")
 
-# ── -inventory ────────────────────────────────────────────────────────────────
 @bot.command(aliases=['inv'])
 async def inventory(ctx, page: int = 1):
     uid = ctx.author.id
@@ -1272,7 +1259,6 @@ async def inventory(ctx, page: int = 1):
     e.set_footer(text=f"-coin <id> for details • -inventory {page+1} for next page")
     await ctx.send(embed=e)
 
-# ── -coin <id> ────────────────────────────────────────────────────────────────
 @bot.command()
 async def coin(ctx, coin_id: int):
     conn = db()
@@ -1306,9 +1292,7 @@ async def coin(ctx, coin_id: int):
     ), inline=True)
     await ctx.send(embed=e)
 
-# ── -sell <coin_id> ───────────────────────────────────────────────────────────
 def coin_value_to_credits(value: float) -> int:
-    """Convert coin's float value to credits (1 credit per $0.01 value, min 1)."""
     return max(1, int(value * 100))
 
 @bot.command()
@@ -1346,14 +1330,12 @@ async def sell(ctx, coin_id: int):
     )
     await ctx.send(embed=e)
 
-# ── -sellall ──────────────────────────────────────────────────────────────────
 @bot.command()
 async def sellall(ctx):
     uid = ctx.author.id
     conn = db()
     cur = conn.cursor()
 
-    # Don't sell coins in active auctions
     cur.execute("""
         SELECT c.* FROM coins c
         WHERE c.owner_id = %s
@@ -1380,7 +1362,6 @@ async def sellall(ctx):
     e.description = f"Sold **{len(coins)}** coin(s) for **{total_credits:,} credits** total."
     await ctx.send(embed=e)
 
-# ── -trade ────────────────────────────────────────────────────────────────────
 @bot.command()
 async def trade(ctx, member: discord.Member, *, args: str = ""):
     if member.bot or member.id == ctx.author.id:
@@ -1456,7 +1437,6 @@ async def trade(ctx, member: discord.Member, *, args: str = ""):
     view = TradeView(trade_id, uid, member.id)
     await ctx.send(f"{member.mention}", embed=e, view=view)
 
-# ── -trades ───────────────────────────────────────────────────────────────────
 @bot.command()
 async def trades(ctx):
     uid = ctx.author.id
@@ -1483,7 +1463,6 @@ async def trades(ctx):
         )
     await ctx.send(embed=e)
 
-# ── -auction ──────────────────────────────────────────────────────────────────
 @bot.command()
 async def auction(ctx, coin_id: int, start_price: int, hours: float = 24.0):
     uid = ctx.author.id
@@ -1529,7 +1508,6 @@ async def auction(ctx, coin_id: int, start_price: int, hours: float = 24.0):
     e.set_footer(text=f"Auction ID: #{auction_id}")
     await ctx.send(embed=e)
 
-# ── -market ───────────────────────────────────────────────────────────────────
 @bot.command()
 async def market(ctx, page: int = 1):
     per_page = 5
@@ -1578,7 +1556,6 @@ async def market(ctx, page: int = 1):
     e.set_footer(text="Use -bid <auction_id> to place a bid")
     await ctx.send(embed=e)
 
-# ── -bid ──────────────────────────────────────────────────────────────────────
 @bot.command()
 async def bid(ctx, auction_id: int):
     ensure_user(ctx.author.id, str(ctx.author))
@@ -1596,7 +1573,6 @@ async def bid(ctx, auction_id: int):
     view = AuctionView(auction_id)
     await ctx.send(f"💰 Bidding on Auction **#{auction_id}** | Min bid: **{min_bid:,} credits**", view=view)
 
-# ── -myauctions ───────────────────────────────────────────────────────────────
 @bot.command()
 async def myauctions(ctx):
     uid = ctx.author.id
@@ -1627,7 +1603,6 @@ async def myauctions(ctx):
         )
     await ctx.send(embed=e)
 
-# ── -cancelauction ────────────────────────────────────────────────────────────
 @bot.command()
 async def cancelauction(ctx, auction_id: int):
     uid = ctx.author.id
@@ -1651,7 +1626,6 @@ async def cancelauction(ctx, auction_id: int):
 
     await ctx.send(f"✅ Auction **#{auction_id}** cancelled. Coin returned to your inventory.")
 
-# ── -profile ──────────────────────────────────────────────────────────────────
 @bot.command()
 async def profile(ctx, member: discord.Member = None):
     target = member or ctx.author
@@ -1672,12 +1646,13 @@ async def profile(ctx, member: discord.Member = None):
     trades_done = cur.fetchone()['c']
     release(conn)
 
-    pmult = prestige_multiplier(u['prestige'])
+    prestige_val = u['prestige'] if u['prestige'] is not None else 0
+    pmult = prestige_multiplier(prestige_val)
     e = discord.Embed(title=f"👤 {target.display_name}'s Profile", color=0x5865F2)
     e.set_thumbnail(url=target.display_avatar.url)
     e.add_field(name="🎟️ Credits",        value=f"{u['credits']:,}",            inline=True)
     e.add_field(name="🪙 Coins",           value=str(u['total_coins']),           inline=True)
-    e.add_field(name="⭐ Prestige",        value=f"{u['prestige']} (×{pmult:.1f})", inline=True)
+    e.add_field(name="⭐ Prestige",        value=f"{prestige_val} (×{pmult:.1f})", inline=True)
     e.add_field(name="📈 Portfolio",       value=f"${total_val:.4f}",             inline=True)
     e.add_field(name="🏆 Best Coin",       value=f"${best['value']:.4f}" if best else "None", inline=True)
     e.add_field(name="🛒 Sales / Trades",  value=f"{sales} / {trades_done}",      inline=True)
@@ -1685,7 +1660,6 @@ async def profile(ctx, member: discord.Member = None):
     e.set_footer(text=f"Member since {u['joined_at'].strftime('%Y-%m-%d')}")
     await ctx.send(embed=e)
 
-# ── -leaderboard ──────────────────────────────────────────────────────────────
 @bot.command(aliases=['lb'])
 async def leaderboard(ctx):
     conn = db()
@@ -1705,7 +1679,8 @@ async def leaderboard(ctx):
     medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
     e = discord.Embed(title="🏆 CoinVault — Top Collectors (by Portfolio)", color=0xFFD700)
     for i, r in enumerate(rows):
-        star = f"⭐×{r['prestige']}" if r['prestige'] else ""
+        prestige_val = r['prestige'] if r['prestige'] is not None else 0
+        star = f"⭐×{prestige_val}" if prestige_val else ""
         e.add_field(
             name=f"{medals[i]} {r['username']} {star}",
             value=f"Portfolio: **${r['portfolio']:.4f}** | Credits: **{r['credits']:,}** | Coins: **{r['total_coins']}**",
@@ -1713,7 +1688,6 @@ async def leaderboard(ctx):
         )
     await ctx.send(embed=e)
 
-# ── -richlist ─────────────────────────────────────────────────────────────────
 @bot.command()
 async def richlist(ctx):
     conn = db()
@@ -1730,7 +1704,8 @@ async def richlist(ctx):
     medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
     e = discord.Embed(title="💰 CoinVault — Credit Rich List", color=0x57F287)
     for i, r in enumerate(rows):
-        star = f" ⭐×{r['prestige']}" if r['prestige'] else ""
+        prestige_val = r['prestige'] if r['prestige'] is not None else 0
+        star = f" ⭐×{prestige_val}" if prestige_val else ""
         e.add_field(
             name=f"{medals[i]} {r['username']}{star}",
             value=f"**{r['credits']:,} credits**",
@@ -1738,7 +1713,6 @@ async def richlist(ctx):
         )
     await ctx.send(embed=e)
 
-# ── -bank ─────────────────────────────────────────────────────────────────────
 @bot.command()
 async def bank(ctx):
     total = get_bank()
@@ -1763,7 +1737,6 @@ async def bank(ctx):
     e.set_footer(text="Funded by: crate fees • trade taxes • gambling house edge • rob fines • prestige")
     await ctx.send(embed=e)
 
-# ── -stats ────────────────────────────────────────────────────────────────────
 @bot.command()
 async def stats(ctx):
     uid = ctx.author.id
@@ -1783,11 +1756,12 @@ async def stats(ctx):
     top_mats = cur.fetchall()
     release(conn)
 
-    pmult = prestige_multiplier(u['prestige'])
+    prestige_val = u['prestige'] if u['prestige'] is not None else 0
+    pmult = prestige_multiplier(prestige_val)
     e = discord.Embed(title=f"📊 Stats — {ctx.author.display_name}", color=0x5865F2)
     e.add_field(name="🎟️ Credits",          value=f"{u['credits']:,}",          inline=True)
     e.add_field(name="💹 Total Earned",      value=f"{total_earned:,} credits",  inline=True)
-    e.add_field(name="⭐ Prestige",          value=f"{u['prestige']} (×{pmult:.1f})", inline=True)
+    e.add_field(name="⭐ Prestige",          value=f"{prestige_val} (×{pmult:.1f})", inline=True)
     e.add_field(name="🪙 Coins Owned",       value=str(cs['c'] or 0),            inline=True)
     e.add_field(name="📈 Portfolio Value",   value=f"${cs['s']:.4f}",            inline=True)
     e.add_field(name="🤝 Trades Done",       value=str(trades_done),             inline=True)
