@@ -70,6 +70,21 @@ PRESTIGE_COST      = 5000
 BANK_INTEREST_PCT  = 0.05
 BANK_INTEREST_MINS = 10
 
+# ─── Economy Growth Constants ─────────────────────────────────────────────────
+# Supply & demand: each material tracks how many have been sold recently.
+# High sales volume → price dips (oversupply). Low sales → price rises (scarcity).
+SUPPLY_DECAY_MINS      = 60        # How often supply counters decay toward baseline
+SUPPLY_DECAY_RATE      = 0.85      # Each decay tick multiplies supply by this (forgetting old sales)
+DEMAND_IMPACT          = 0.15      # How strongly supply/demand shifts market price (max ±15%)
+INFLATION_RATE         = 0.0002    # Tiny credit-sink multiplier applied to crate cost over time
+MAX_CRATE_COST         = 250       # Hard cap so crates don't get unaffordable
+ECONOMY_SINK_SELL_PCT  = 0.05      # 5% of every market sale goes to a "sink" (burned, not bank)
+BOOM_CHANCE            = 0.08      # 8% chance per market update of a random material "boom"
+BUST_CHANCE            = 0.05      # 5% chance per market update of a random material "bust"
+BOOM_MULT              = 2.5       # Boom temporarily multiplies price by up to this
+BUST_MULT              = 0.4       # Bust temporarily multiplies price by down to this
+EVENT_DURATION_MINS    = 40        # How long boom/bust events last
+
 SHOP_ITEMS = {
     "rename":   {"cost": 200, "desc": "Rename one of your coins (cosmetic only)"},
     "polish":   {"cost": 150, "desc": "Upgrade a coin's Status by one tier"},
@@ -250,6 +265,7 @@ STATUS_PRICE_RANGES = {
     "Stunning": (2.75, 10.0),
 }
 
+# ─── Economy State (in-memory) ────────────────────────────────────────────────
 _market_prices = {
     "materials": {},
     "floats": {},
@@ -257,21 +273,140 @@ _market_prices = {
     "last_updated": None,
 }
 
+# Supply tracking: material -> recent sale count (decays over time)
+_supply_counters = {mat: 0.0 for mat in MATERIAL_PRICE_RANGES}
+_supply_last_decay = time.monotonic()
+
+# Active boom/bust events: material -> {"type": "boom"/"bust", "mult": float, "expires": datetime}
+_market_events = {}
+
+# Dynamic crate cost (inflates as economy grows)
+_dynamic_crate_cost = CRATE_COST
+
+# ─── Supply & Demand ──────────────────────────────────────────────────────────
+def record_material_sale(material: str, quantity: int = 1):
+    """Call when a coin is sold to track supply pressure."""
+    if material in _supply_counters:
+        _supply_counters[material] += quantity
+
+def decay_supply_counters():
+    """Gradually forget old sales so the market can recover."""
+    global _supply_last_decay
+    now = time.monotonic()
+    elapsed_mins = (now - _supply_last_decay) / 60
+    ticks = int(elapsed_mins // SUPPLY_DECAY_MINS)
+    if ticks > 0:
+        for mat in _supply_counters:
+            _supply_counters[mat] *= (SUPPLY_DECAY_RATE ** ticks)
+        _supply_last_decay = now
+
+def get_supply_demand_mult(material: str) -> float:
+    """
+    Returns a multiplier offset based on supply pressure.
+    High supply (many sold recently) → lower price (< 1.0 offset)
+    Low supply (few sold recently)   → higher price (> 1.0 offset)
+    Centered around 1.0, clamped within ±DEMAND_IMPACT.
+    """
+    decay_supply_counters()
+    sales = _supply_counters.get(material, 0.0)
+    # Normalise: treat 20+ sales as "max oversupply"
+    normalised = min(sales / 20.0, 1.0)
+    # Range: (1 + DEMAND_IMPACT) at 0 sales → (1 - DEMAND_IMPACT) at max sales
+    return round(1.0 + DEMAND_IMPACT - (normalised * DEMAND_IMPACT * 2), 4)
+
+# ─── Boom/Bust Events ─────────────────────────────────────────────────────────
+def maybe_trigger_market_event():
+    """Randomly trigger boom or bust events on a material."""
+    now = datetime.now(timezone.utc)
+    # Clean up expired events
+    expired = [m for m, ev in _market_events.items() if now >= ev["expires"]]
+    for m in expired:
+        del _market_events[m]
+
+    materials = list(MATERIAL_PRICE_RANGES.keys())
+
+    if random.random() < BOOM_CHANCE:
+        mat = random.choice([m for m in materials if m not in _market_events])
+        mult = round(random.uniform(1.5, BOOM_MULT), 2)
+        _market_events[mat] = {
+            "type": "boom",
+            "mult": mult,
+            "expires": now + timedelta(minutes=EVENT_DURATION_MINS),
+        }
+        print(f"📈 MARKET BOOM: {mat} ×{mult} for {EVENT_DURATION_MINS} mins")
+        return ("boom", mat, mult)
+
+    if random.random() < BUST_CHANCE:
+        mat = random.choice([m for m in materials if m not in _market_events])
+        mult = round(random.uniform(BUST_MULT, 0.7), 2)
+        _market_events[mat] = {
+            "type": "bust",
+            "mult": mult,
+            "expires": now + timedelta(minutes=EVENT_DURATION_MINS),
+        }
+        print(f"📉 MARKET BUST: {mat} ×{mult} for {EVENT_DURATION_MINS} mins")
+        return ("bust", mat, mult)
+
+    return None
+
+def get_event_mult(material: str) -> float:
+    """Returns boom/bust multiplier for a material, or 1.0 if no event."""
+    now = datetime.now(timezone.utc)
+    ev = _market_events.get(material)
+    if ev and now < ev["expires"]:
+        return ev["mult"]
+    return 1.0
+
+# ─── Dynamic Crate Cost ───────────────────────────────────────────────────────
+def get_dynamic_crate_cost() -> int:
+    """
+    Crate cost inflates based on the number of users and total coins in circulation.
+    Encourages a sink as the economy grows.
+    """
+    conn = db()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT COUNT(*) as c FROM users")
+        users = cur.fetchone()['c'] or 1
+        cur.execute("SELECT COUNT(*) as c FROM coins")
+        total_coins = cur.fetchone()['c'] or 0
+    except Exception:
+        return CRATE_COST
+    finally:
+        release(conn)
+
+    # Every 500 coins in circulation adds 1% to base cost
+    inflation_factor = 1.0 + (total_coins / 500) * INFLATION_RATE * 100
+    cost = int(CRATE_COST * inflation_factor)
+    return min(cost, MAX_CRATE_COST)
+
+# ─── Market Price Generation ──────────────────────────────────────────────────
 def generate_market_prices():
+    event = maybe_trigger_market_event()
+
     mat = {}
     for name, (lo, hi) in MATERIAL_PRICE_RANGES.items():
-        mat[name] = round(random.uniform(lo, hi), 4)
+        base = random.uniform(lo, hi)
+        sd_mult = get_supply_demand_mult(name)
+        ev_mult = get_event_mult(name)
+        raw = base * sd_mult * ev_mult
+        # Clamp within a generous 3× range around the normal range
+        mat[name] = round(max(lo * 0.5, min(raw, hi * 3.0)), 4)
+
     flt = {}
     for name, (lo, hi) in FLOAT_PRICE_RANGES.items():
         flt[name] = round(random.uniform(lo, hi), 4)
+
     sta = {}
     for name, (lo, hi) in STATUS_PRICE_RANGES.items():
         sta[name] = round(random.uniform(lo, hi), 4)
+
     _market_prices["materials"] = mat
     _market_prices["floats"]    = flt
     _market_prices["statuses"]  = sta
     _market_prices["last_updated"] = datetime.now(timezone.utc)
     print(f"✅ Market prices updated at {_market_prices['last_updated'].strftime('%H:%M UTC')}")
+    return event
 
 def get_status_market_mult(coin_row) -> float:
     status = coin_row.get("status", "Normal")
@@ -474,6 +609,32 @@ def init_db():
         )
     """)
 
+    # Economy event log — tracks boom/bust events for -marketevents
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS market_event_log (
+            id         SERIAL PRIMARY KEY,
+            event_type TEXT,
+            material   TEXT,
+            multiplier FLOAT,
+            started_at TIMESTAMP DEFAULT NOW(),
+            expires_at TIMESTAMP
+        )
+    """)
+
+    # Tracks cumulative sell volume per material for -economy command
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS material_sales_log (
+            material   TEXT PRIMARY KEY,
+            total_sold INT DEFAULT 0,
+            last_reset TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    for mat in MATERIAL_PRICE_RANGES:
+        cur.execute("""
+            INSERT INTO material_sales_log (material, total_sold)
+            VALUES (%s, 0) ON CONFLICT (material) DO NOTHING
+        """, (mat,))
+
     try:
         cur.execute("SELECT COUNT(*) as c FROM coins_backup")
         backup_count = cur.fetchone()['c']
@@ -545,7 +706,6 @@ def init_db():
             try:
                 cur.execute("ALTER TABLE trades RENAME COLUMN from_user TO initiator_id")
                 conn.commit()
-                print("✅ Renamed trades.from_user → initiator_id")
             except Exception as e:
                 conn.rollback()
                 print(f"Trade migration: {e}")
@@ -553,7 +713,6 @@ def init_db():
             try:
                 cur.execute("ALTER TABLE trades RENAME COLUMN to_user TO receiver_id")
                 conn.commit()
-                print("✅ Renamed trades.to_user → receiver_id")
             except Exception as e:
                 conn.rollback()
                 print(f"Trade migration: {e}")
@@ -579,11 +738,9 @@ def init_db():
         if 'initiator_id' not in trade_cols_now:
             cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS initiator_id BIGINT")
             conn.commit()
-            print("✅ Added missing trades.initiator_id column")
         if 'receiver_id' not in trade_cols_now:
             cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS receiver_id BIGINT")
             conn.commit()
-            print("✅ Added missing trades.receiver_id column")
     except Exception as e:
         conn.rollback()
         print(f"trades column check: {e}")
@@ -843,6 +1000,23 @@ def get_coin_trade_history(coin_id: int) -> list:
     finally:
         release(conn)
 
+def log_material_sale_db(material: str):
+    """Persist sale count to DB for the -economy command."""
+    conn = db()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO material_sales_log (material, total_sold)
+            VALUES (%s, 1)
+            ON CONFLICT (material) DO UPDATE
+            SET total_sold = material_sales_log.total_sold + 1
+        """, (material,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    finally:
+        release(conn)
+
 # ─── Spam Prevention ──────────────────────────────────────────────────────────
 MSG_COOLDOWNS = {}
 
@@ -850,6 +1024,9 @@ MSG_COOLDOWNS = {}
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='-', intents=intents, help_command=None)
+
+# ─── Announce Channel (set by admin or auto-detected) ─────────────────────────
+_announce_channel_id = None
 
 # ─── Message Listener ─────────────────────────────────────────────────────────
 @bot.event
@@ -871,7 +1048,29 @@ async def on_message(message):
 # ─── Background Tasks ─────────────────────────────────────────────────────────
 @tasks.loop(minutes=20)
 async def update_market_prices():
-    generate_market_prices()
+    event = generate_market_prices()
+
+    # Announce boom/bust to a channel if configured
+    if event and _announce_channel_id:
+        ch = bot.get_channel(_announce_channel_id)
+        if ch:
+            ev_type, mat, mult = event
+            if ev_type == "boom":
+                msg = (
+                    f"📈 **MARKET BOOM!** The **{mat}** market is surging! "
+                    f"Prices are **×{mult}** for the next {EVENT_DURATION_MINS} minutes! "
+                    f"Now is a great time to sell {mat} coins! 💰"
+                )
+            else:
+                msg = (
+                    f"📉 **MARKET BUST!** The **{mat}** market is crashing! "
+                    f"Prices dropped to **×{mult}** for {EVENT_DURATION_MINS} minutes. "
+                    f"Hold your {mat} coins or buy the dip! 🔻"
+                )
+            try:
+                await ch.send(msg)
+            except Exception:
+                pass
 
 @tasks.loop(minutes=5)
 async def auction_checker():
@@ -890,18 +1089,29 @@ async def auction_checker():
                 winner_id  = a['bidder_id']
                 sale_price = a['current_bid']
                 fee        = int(round(sale_price * MARKET_FEE_PCT))
-                seller_net = sale_price - fee
+                sink       = int(round(sale_price * ECONOMY_SINK_SELL_PCT))
+                seller_net = sale_price - fee - sink
 
                 cur.execute("UPDATE coins SET owner_id = %s WHERE id = %s", (winner_id, coin_id))
                 cur.execute("UPDATE users SET credits = credits + %s WHERE user_id = %s", (seller_net, seller_id))
                 cur.execute("UPDATE bank SET total = total + %s WHERE id = 1", (fee,))
                 cur.execute("INSERT INTO bank_log (source, amount) VALUES (%s,%s)", (f"auction_fee:{a['id']}", fee))
+                # sink is burned (removed from economy entirely — no one gets it)
+                cur.execute("INSERT INTO bank_log (source, amount) VALUES (%s,%s)", (f"auction_sink:{a['id']}", -sink))
                 cur.execute("""
                     INSERT INTO coin_trades (coin_id, seller_id, buyer_id, price)
                     VALUES (%s, %s, %s, %s)
                 """, (coin_id, seller_id, winner_id, sale_price))
                 sync_coin_count(winner_id, cur)
                 sync_coin_count(seller_id, cur)
+
+                # Track supply
+                cur.execute("SELECT material FROM coins WHERE id = %s", (coin_id,))
+                mat_row = cur.fetchone()
+                if mat_row:
+                    record_material_sale(mat_row['material'])
+                    log_material_sale_db(mat_row['material'])
+
                 cur.execute("UPDATE auctions SET status = 'sold' WHERE id = %s", (a['id'],))
                 conn.commit()
 
@@ -1045,11 +1255,14 @@ class TradeView(discord.ui.View):
 
             if credits_offer > 0:
                 tax = int(round(credits_offer * TRADE_TAX_PCT))
-                net = credits_offer - tax
+                sink = int(round(credits_offer * ECONOMY_SINK_SELL_PCT))
+                net = credits_offer - tax - sink
                 cur.execute("UPDATE users SET credits = credits - %s WHERE user_id = %s", (credits_offer, trade['initiator_id']))
                 cur.execute("UPDATE users SET credits = credits + %s WHERE user_id = %s", (net, trade['receiver_id']))
                 cur.execute("UPDATE bank SET total = total + %s WHERE id = 1", (tax,))
                 cur.execute("INSERT INTO bank_log (source, amount) VALUES (%s,%s)", (f"trade_tax:{self.trade_id}", tax))
+                # sink burned
+                cur.execute("INSERT INTO bank_log (source, amount) VALUES (%s,%s)", (f"trade_sink:{self.trade_id}", -sink))
 
             for uid in (trade['initiator_id'], trade['receiver_id']):
                 sync_coin_count(uid, cur)
@@ -1254,9 +1467,9 @@ async def help(ctx):
     ), inline=False)
     e.add_field(name="🛒 Shop", value=(
         "`-shop` — Browse the credit shop\n"
-        "`-buy crate [all]` — 100 credits → open a crate (10% to bank)\n"
-        "`-buy crate_x3 [all]` — 270 credits → 3 crates\n"
-        "`-buy crate_x5 [all]` — 420 credits → 5 crates\n"
+        "`-buy crate [all]` — Open a crate (dynamic cost, 10% to bank)\n"
+        "`-buy crate_x3 [all]` — 3 crates\n"
+        "`-buy crate_x5 [all]` — 5 crates\n"
         "`-buy polish <coin_id>` — 150 credits → upgrade coin status\n"
         "`-buy rename <coin_id> <name>` — 200 credits → rename coin\n"
     ), inline=False)
@@ -1264,8 +1477,8 @@ async def help(ctx):
         "`-inventory [page]` / `-inv` — View your coins\n"
         "`-inventory @user [page]` — View another user's coins (if public)\n"
         "`-coin <id>` — Detailed coin view with RAP\n"
-        "`-sell <coin_id|all>` — Sell coin(s) for credits\n"
-        "`-sellall` — Sell all coins (get credits)\n"
+        "`-sell <coin_id|all>` — Sell coin(s) at **live market price**\n"
+        "`-sellall` — Sell all coins at live market prices\n"
         "`-privacy on/off` — Toggle if others can see your inventory/wallet\n"
     ), inline=False)
     e.add_field(name="🤝 Trading", value=(
@@ -1275,7 +1488,7 @@ async def help(ctx):
     ), inline=False)
     e.add_field(name="🏪 Marketplace", value=(
         "`-market [page]` — Browse auctions\n"
-        "`-auction <coin_id> <start_price> [hours]` — List coin (8% fee)\n"
+        "`-auction <coin_id> <start_price> [hours]` — List coin (8% fee + 5% sink)\n"
         "`-bid <auction_id>` — Bid on an auction\n"
         "`-myauctions` — Your active listings\n"
         "`-cancelauction <id>` — Cancel your auction\n"
@@ -1287,14 +1500,14 @@ async def help(ctx):
         "`-bank` — View bank treasury\n"
         "`-stats` — Your detailed stats\n"
     ), inline=False)
-    e.add_field(name="📈 Market Prices", value=(
+    e.add_field(name="📈 Market & Economy", value=(
         "`-prices` — Current market price multipliers\n"
-        "`-prices material` — Material price table\n"
-        "`-prices float` — Float price table\n"
-        "`-prices status` — Status price table\n"
-        "`-coinprice <coin_id>` — Live market price + RAP of a coin\n"
+        "`-prices material/float/status` — Detailed price tables\n"
+        "`-coinprice <coin_id>` — Live market price + RAP\n"
+        "`-economy` — Live economy overview (supply, events, inflation)\n"
+        "`-marketevents` — Active boom/bust events\n"
     ), inline=False)
-    e.set_footer(text="Credits are the ONLY currency • Earn from messages, daily, work, gamble, trading & selling coins")
+    e.set_footer(text="Coins sell at LIVE market price • Economy grows with supply & demand, booms, busts & inflation")
     await ctx.send(embed=e)
 
 @bot.command(aliases=['bal', 'wallet'])
@@ -1438,7 +1651,6 @@ async def work(ctx):
     new_rank_name, new_rank_salary, new_rank_emoji, new_rank_idx = get_job_rank(new_work_count)
     ranked_up = new_rank_idx > rank_idx
 
-    cd_str = "30min"
     e = discord.Embed(title="💼 Work Complete!", color=0x57F287)
     e.description = f"{rank_emoji} **{job_title}** {ctx.author.display_name} {action} and earned **{earned:,} credits**!"
     e.add_field(name="📊 Job",          value=f"{rank_name} (Job #{new_work_count})", inline=True)
@@ -1450,9 +1662,9 @@ async def work(ctx):
     if next_rank:
         next_name, next_min, next_salary, next_emoji = next_rank
         jobs_needed = next_min - new_work_count
-        e.set_footer(text=f"Next rank: {next_emoji} {next_name} in {jobs_needed} job(s) • Salary: {next_salary:,}/job • CD: {cd_str}")
+        e.set_footer(text=f"Next rank: {next_emoji} {next_name} in {jobs_needed} job(s) • Salary: {next_salary:,}/job • CD: 30min")
     else:
-        e.set_footer(text=f"MAX RANK ACHIEVED: {rank_emoji} {rank_name} • CD: {cd_str}")
+        e.set_footer(text=f"MAX RANK ACHIEVED: {rank_emoji} {rank_name} • CD: 30min")
 
     if ranked_up:
         new_title = JOB_TITLES.get(new_rank_name, new_rank_name)
@@ -1784,11 +1996,11 @@ async def cooldown(ctx):
     next_pay = int(rank_salary * within_rank_mult * prestige_multiplier(u.get('prestige') or 0))
 
     e = discord.Embed(title=f"⏱️ {ctx.author.display_name}'s Cooldowns", color=0x5865F2)
-    e.add_field(name="📅 Daily",          value=daily_status,                              inline=True)
-    e.add_field(name="💼 Work",           value=work_status,                               inline=True)
-    e.add_field(name="🦹 Rob",            value=rob_status,                                inline=True)
-    e.add_field(name="🎰 Gamble/Slots",   value="✅ No CD",                               inline=True)
-    e.add_field(name="📈 Market Prices",  value=market_status,                             inline=True)
+    e.add_field(name="📅 Daily",          value=daily_status,  inline=True)
+    e.add_field(name="💼 Work",           value=work_status,   inline=True)
+    e.add_field(name="🦹 Rob",            value=rob_status,    inline=True)
+    e.add_field(name="🎰 Gamble/Slots",   value="✅ No CD",    inline=True)
+    e.add_field(name="📈 Market Prices",  value=market_status, inline=True)
     e.add_field(name=f"{rank_emoji} Next Work Pay", value=f"~{next_pay:,} credits ({rank_name})", inline=True)
     e.set_footer(text="Work cooldown: 30 minutes")
     await ctx.send(embed=e)
@@ -1985,9 +2197,21 @@ async def prices(ctx, category: str = "all"):
             current = _market_prices["materials"].get(mat, 0)
             mid = (lo + hi) / 2
             arrow = "📈" if current > mid else "📉"
-            lines.append(f"{arrow} **{mat}**: `{current:.4f}×` *(range: {lo}–{hi}×)*")
+            sd = get_supply_demand_mult(mat)
+            ev = get_event_mult(mat)
+            tags = []
+            if ev > 1.0:
+                tags.append(f"🚀BOOM ×{ev}")
+            elif ev < 1.0:
+                tags.append(f"💥BUST ×{ev}")
+            if sd < 0.95:
+                tags.append("📦oversupply")
+            elif sd > 1.05:
+                tags.append("🔥scarce")
+            tag_str = " " + " ".join(tags) if tags else ""
+            lines.append(f"{arrow} **{mat}**: `{current:.4f}×` *(range: {lo}–{hi}×)*{tag_str}")
         e.description += "\n".join(lines)
-        e.set_footer(text="Prices update every 20 minutes • Use -coinprice <id> for a specific coin")
+        e.set_footer(text="Supply/demand & boom/bust events affect prices • -economy for full overview")
         await ctx.send(embed=e)
 
     elif category in ("float", "floats", "flt"):
@@ -2000,7 +2224,6 @@ async def prices(ctx, category: str = "all"):
             arrow = "📈" if current > mid else "📉"
             lines.append(f"{arrow} **{flt}**: `{current:.4f}×` *(range: {lo}–{hi}×)*")
         e.description += "\n".join(lines)
-        e.set_footer(text="Prices update every 20 minutes • Use -coinprice <id> for a specific coin")
         await ctx.send(embed=e)
 
     elif category in ("status", "statuses", "sta", "condition"):
@@ -2026,7 +2249,9 @@ async def prices(ctx, category: str = "all"):
             current = _market_prices["materials"].get(mat, 0)
             mid = (lo + hi) / 2
             arrow = "📈" if current > mid else "📉"
-            mat_lines.append(f"{arrow} **{mat}**: `{current:.3f}×`")
+            ev = get_event_mult(mat)
+            tag = " 🚀" if ev > 1.0 else (" 💥" if ev < 1.0 else "")
+            mat_lines.append(f"{arrow} **{mat}**: `{current:.3f}×`{tag}")
         e.add_field(name="🪨 Materials", value="\n".join(mat_lines), inline=True)
 
         flt_lines = []
@@ -2045,7 +2270,7 @@ async def prices(ctx, category: str = "all"):
             sta_lines.append(f"{arrow} **{sta}**: `{current:.3f}×`")
         e.add_field(name="🏷️ Statuses", value="\n".join(sta_lines), inline=True)
 
-        e.set_footer(text="Use -prices material / float / status for details • -coinprice <id> for a coin")
+        e.set_footer(text="Use -prices material / float / status for details • 🚀 = boom • 💥 = bust • -economy for full overview")
         await ctx.send(embed=e)
 
 @bot.command()
@@ -2075,6 +2300,8 @@ async def coinprice(ctx, coin_id: int):
     mat_live = _market_prices["materials"].get(c['material'], c['mat_mult'])
     flt_live = _market_prices["floats"].get(c['float'], c['flt_mult'])
     sta_live = get_status_market_mult(c)
+    ev_mult  = get_event_mult(c['material'])
+    sd_mult  = get_supply_demand_mult(c['material'])
 
     tier = tier_emoji(market_val)
     name = coin_name(c)
@@ -2087,16 +2314,25 @@ async def coinprice(ctx, coin_id: int):
     e.add_field(name="📦 Base Value",    value=f"${base_val:.4f}",         inline=True)
     e.add_field(name="📈 Market Value",  value=f"**${market_val:.4f}**",   inline=True)
     e.add_field(name=f"{arrow} Change",  value=f"{'+' if diff >= 0 else ''}{diff:.4f} ({diff_pct:+.1f}%)", inline=True)
-    e.add_field(name="🪨 Mat Price",     value=f"`{mat_live:.4f}×` (base: {c['mat_mult']}×)", inline=True)
-    e.add_field(name="🌊 Float Price",   value=f"`{flt_live:.4f}×` (base: {c['flt_mult']}×)", inline=True)
+    e.add_field(name="🪨 Mat Price",     value=f"`{mat_live:.4f}×`", inline=True)
+    e.add_field(name="🌊 Float Price",   value=f"`{flt_live:.4f}×`", inline=True)
     e.add_field(name="🏷️ Status Price",  value=f"`{sta_live:.4f}×` ({c['status']})", inline=True)
 
+    econ_lines = []
+    if ev_mult != 1.0:
+        ev = _market_events.get(c['material'])
+        ev_type = ev['type'].upper() if ev else "EVENT"
+        econ_lines.append(f"{'🚀' if ev_mult > 1.0 else '💥'} **{ev_type}**: ×{ev_mult}")
+    if abs(sd_mult - 1.0) > 0.01:
+        direction = "oversupply 📦" if sd_mult < 1.0 else "scarce 🔥"
+        econ_lines.append(f"Supply/Demand ({direction}): ×{sd_mult:.4f}")
+    if econ_lines:
+        e.add_field(name="🌐 Economy Factors", value="\n".join(econ_lines), inline=False)
+
     if rap is not None:
-        rap_diff = rap - base_val
-        rap_arrow = "📈" if rap_diff >= 0 else "📉"
-        e.add_field(name="💹 RAP (Avg Trade Price)", value=f"**{rap:,.2f} credits** {rap_arrow}", inline=True)
+        e.add_field(name="💹 RAP (Avg Trade Price)", value=f"**{rap:,.2f} credits**", inline=True)
     else:
-        e.add_field(name="💹 RAP (Avg Trade Price)", value="No trades yet (raw coin)", inline=True)
+        e.add_field(name="💹 RAP", value="No trades yet", inline=True)
 
     if trade_history:
         history_lines = []
@@ -2109,8 +2345,6 @@ async def coinprice(ctx, coin_id: int):
                 f"<t:{int(ts.timestamp())}:R>"
             )
         e.add_field(name="🔄 Recent Trades", value="\n".join(history_lines), inline=False)
-    else:
-        e.add_field(name="🔄 Trade History", value="This coin has never been traded (raw from crate)", inline=False)
 
     if _market_prices["last_updated"]:
         now_dt = datetime.now(timezone.utc)
@@ -2118,16 +2352,167 @@ async def coinprice(ctx, coin_id: int):
         diff_t = next_update - now_dt
         secs = int(diff_t.total_seconds())
         m, s = divmod(max(0, secs), 60)
-        e.set_footer(text=f"Prices refresh in {m}m {s}s • RAP = avg of last 10 trades")
+        e.set_footer(text=f"Prices refresh in {m}m {s}s • Sell price = live market value")
+    await ctx.send(embed=e)
+
+# ─── Economy Overview Command ─────────────────────────────────────────────────
+@bot.command()
+async def economy(ctx):
+    """Shows the live state of the economy: supply pressure, events, inflation, sinks."""
+    conn = db()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT COUNT(*) as c FROM users")
+        total_users = cur.fetchone()['c'] or 0
+        cur.execute("SELECT COUNT(*) as c FROM coins")
+        total_coins = cur.fetchone()['c'] or 0
+        cur.execute("SELECT COALESCE(SUM(value),0) as v FROM coins")
+        total_coin_value = float(cur.fetchone()['v'] or 0)
+        cur.execute("SELECT COALESCE(SUM(credits),0) as c FROM users")
+        total_wallet_credits = int(cur.fetchone()['c'] or 0)
+        cur.execute("SELECT COALESCE(SUM(balance),0) as b FROM user_bank")
+        total_bank_credits = int(cur.fetchone()['b'] or 0)
+        cur.execute("SELECT total FROM bank WHERE id=1")
+        treasury = int(cur.fetchone()['total'] or 0)
+        cur.execute("SELECT COALESCE(SUM(amount),0) as s FROM bank_log WHERE amount < 0")
+        total_sunk = abs(int(cur.fetchone()['s'] or 0))
+        cur.execute("SELECT material, total_sold FROM material_sales_log ORDER BY total_sold DESC LIMIT 5")
+        top_sold = cur.fetchall()
+    except Exception as ex:
+        print(f"economy error: {ex}")
+        await ctx.send("❌ Could not load economy data.")
+        return
+    finally:
+        release(conn)
+
+    decay_supply_counters()
+    crate_cost = get_dynamic_crate_cost()
+    total_credits_in_system = total_wallet_credits + total_bank_credits + treasury
+
+    e = discord.Embed(title="🌐 CoinVault Economy Overview", color=0x57F287)
+
+    e.add_field(
+        name="💹 Economy Scale",
+        value=(
+            f"Users: **{total_users:,}**\n"
+            f"Coins in circulation: **{total_coins:,}**\n"
+            f"Total coin portfolio value: **${total_coin_value:,.2f}**\n"
+            f"Credits in system: **{total_credits_in_system:,}**"
+        ),
+        inline=False
+    )
+
+    e.add_field(
+        name="💸 Credit Distribution",
+        value=(
+            f"Wallets: **{total_wallet_credits:,}**\n"
+            f"Virtual banks: **{total_bank_credits:,}**\n"
+            f"Treasury: **{treasury:,}**"
+        ),
+        inline=True
+    )
+
+    e.add_field(
+        name="🕳️ Economy Sinks (burned)",
+        value=(
+            f"Total credits removed: **{total_sunk:,}**\n"
+            f"Sinks prevent hyperinflation by\n"
+            f"permanently removing credits on\n"
+            f"marketplace sales and trades."
+        ),
+        inline=True
+    )
+
+    crate_inflation_pct = round((crate_cost / CRATE_COST - 1) * 100, 1)
+    e.add_field(
+        name="📦 Inflation",
+        value=(
+            f"Base crate cost: **{CRATE_COST} cr**\n"
+            f"Current crate cost: **{crate_cost} cr** (+{crate_inflation_pct}%)\n"
+            f"Cap: **{MAX_CRATE_COST} cr**\n"
+            f"*(Rises with coin supply)*"
+        ),
+        inline=False
+    )
+
+    # Supply pressure
+    decay_supply_counters()
+    supply_lines = []
+    for mat, supply in sorted(_supply_counters.items(), key=lambda x: -x[1])[:8]:
+        sd = get_supply_demand_mult(mat)
+        if sd < 0.98:
+            tag = f"📦 oversupply (×{sd:.3f})"
+        elif sd > 1.02:
+            tag = f"🔥 scarce (×{sd:.3f})"
+        else:
+            tag = f"⚖️ balanced"
+        supply_lines.append(f"**{mat}**: {tag}")
+    if supply_lines:
+        e.add_field(name="⚖️ Supply Pressure (top materials)", value="\n".join(supply_lines), inline=False)
+
+    # Active events
+    now = datetime.now(timezone.utc)
+    active_events = [(m, ev) for m, ev in _market_events.items() if now < ev['expires']]
+    if active_events:
+        ev_lines = []
+        for mat, ev in active_events:
+            remaining = ev['expires'] - now
+            mins = int(remaining.total_seconds() // 60)
+            icon = "🚀" if ev['type'] == "boom" else "💥"
+            ev_lines.append(f"{icon} **{mat}** {ev['type'].upper()} ×{ev['mult']} — {mins}m remaining")
+        e.add_field(name="⚡ Active Market Events", value="\n".join(ev_lines), inline=False)
+    else:
+        e.add_field(name="⚡ Market Events", value="No active events right now.", inline=False)
+
+    if top_sold:
+        sold_lines = [f"**{r['material']}**: {r['total_sold']:,} sold" for r in top_sold]
+        e.add_field(name="🏆 Most Sold Materials (all-time)", value="\n".join(sold_lines), inline=False)
+
+    e.set_footer(text="Supply/demand updates every sale • Boom/bust events trigger randomly every 20min • -marketevents for event details")
+    await ctx.send(embed=e)
+
+@bot.command()
+async def marketevents(ctx):
+    """Shows all active boom/bust market events."""
+    now = datetime.now(timezone.utc)
+    active = [(m, ev) for m, ev in _market_events.items() if now < ev['expires']]
+
+    if not active:
+        await ctx.send("📊 No active market events right now. Check back after the next price update!")
+        return
+
+    e = discord.Embed(title="⚡ Active Market Events", color=0xFFD700)
+    for mat, ev in active:
+        remaining = ev['expires'] - now
+        mins = int(remaining.total_seconds() // 60)
+        secs = int(remaining.total_seconds() % 60)
+        icon = "🚀" if ev['type'] == "boom" else "💥"
+        current_price = _market_prices["materials"].get(mat, "?")
+        lo, hi = MATERIAL_PRICE_RANGES[mat]
+        e.add_field(
+            name=f"{icon} {mat} — {ev['type'].upper()}",
+            value=(
+                f"Multiplier: **×{ev['mult']}**\n"
+                f"Current price: **{current_price:.4f}×**\n"
+                f"Normal range: {lo}–{hi}×\n"
+                f"Expires in: **{mins}m {secs}s**"
+            ),
+            inline=True
+        )
+    e.set_footer(text="Boom = sell now for max profit • Bust = hold or buy cheap coins")
     await ctx.send(embed=e)
 
 @bot.command()
 async def shop(ctx):
+    crate_cost = get_dynamic_crate_cost()
     e = discord.Embed(title="🛒 CoinVault Shop", color=0xEB459E)
-    e.description = "Spend your credits here!\n"
-    for item, data in SHOP_ITEMS.items():
-        e.add_field(name=f"`-buy {item}` — {data['cost']:,} credits", value=data['desc'], inline=False)
-    e.set_footer(text="Use 'all' to buy as many as possible: -buy crate all • Crate fee: 10% to bank")
+    e.description = f"Spend your credits here!\n*Crate cost adjusts with economy (current: **{crate_cost} cr**)*\n"
+    e.add_field(name=f"`-buy crate` — {crate_cost:,} credits",      value="Open a coin crate (10% to bank)", inline=False)
+    e.add_field(name=f"`-buy crate_x3` — {crate_cost*3 - int(crate_cost*3*0.10):,} credits", value="Open 3 crates at once (10% discount)", inline=False)
+    e.add_field(name=f"`-buy crate_x5` — {crate_cost*5 - int(crate_cost*5*0.16):,} credits", value="Open 5 crates at once (16% discount)", inline=False)
+    e.add_field(name="`-buy polish <coin_id>` — 150 credits",       value="Upgrade a coin's Status by one tier", inline=False)
+    e.add_field(name="`-buy rename <coin_id> <name>` — 200 credits", value="Rename one of your coins (cosmetic only)", inline=False)
+    e.set_footer(text="Crate cost inflates as more coins enter circulation • Use 'all' to buy as many as possible")
     await ctx.send(embed=e)
 
 @bot.command()
@@ -2141,10 +2526,12 @@ async def buy(ctx, item: str = None, *args):
     item = item.lower()
 
     if item in ("crate", "crate_x3", "crate_x5"):
+        # Dynamic pricing
+        base_unit = get_dynamic_crate_cost()
         count_map = {"crate": 1, "crate_x3": 3, "crate_x5": 5}
-        cost_map  = {"crate": 100, "crate_x3": 270, "crate_x5": 420}
+        disc_map  = {"crate": 1.0, "crate_x3": 0.90, "crate_x5": 0.84}
         n_per     = count_map[item]
-        unit_cost = cost_map[item]
+        unit_cost = int(base_unit * n_per * disc_map[item])
 
         u = get_user(uid)
         if not u:
@@ -2208,6 +2595,8 @@ async def buy(ctx, item: str = None, *args):
             tier = tier_emoji(coin['value'])
             rarity = coin_rarity_score(coin)
             rlabel = rarity_label(rarity)
+            # Show live market value on crate open
+            market_val = get_market_price(coin)
             e = discord.Embed(title=f"📦 Crate Opened! {tier}", color=0xFFD700)
             e.add_field(name="🪙 Coin",
                         value=f"**{coin['variant']} {coin['material']} Coin** `#{serial_str}`",
@@ -2222,39 +2611,44 @@ async def buy(ctx, item: str = None, *args):
             e.add_field(name="💰 Value", value=(
                 f"Base: **${coin['base_value']:.2f}**\n"
                 f"Total ×: **{coin['total_mult']:.4f}**\n"
-                f"**Final: ${coin['value']:.4f}**"
+                f"**Stored: ${coin['value']:.4f}**\n"
+                f"**📈 Market: ${market_val:.4f}**"
             ), inline=True)
             e.add_field(name="✨ Rarity", value=f"**{rlabel}** (score: {rarity:.2f})", inline=False)
-            e.set_footer(text=f"Coin ID: #{coin['id']} • Credits left: {credits_left:,} • Bank received {bank_cut} credits (10% fee)")
+            e.set_footer(text=f"Coin ID: #{coin['id']} • Credits left: {credits_left:,} • Bank fee: {bank_cut} cr")
             await ctx.send(embed=e)
         else:
             e = discord.Embed(title=f"📦 {total_crates} Crates Opened!", color=0xFFD700)
             lines = []
             total_val = 0.0
+            total_market_val = 0.0
             total_rarity = 0.0
-            best_coin = max(opened, key=lambda c: c['value'])
+            best_coin = max(opened, key=lambda c: get_market_price(c))
             for c in opened:
                 tier = tier_emoji(c['value'])
                 rarity = coin_rarity_score(c)
                 total_rarity += rarity
                 total_val += c['value']
+                mval = get_market_price(c)
+                total_market_val += mval
                 lines.append(
                     f"{tier} `#{c['id']}` **{c['variant']} {c['material']}** "
-                    f"#{str(c['serial']).zfill(4)} — **${c['value']:.4f}** | {rarity_label(rarity)}"
+                    f"#{str(c['serial']).zfill(4)} — Base: **${c['value']:.4f}** | Mkt: **${mval:.4f}** | {rarity_label(rarity)}"
                 )
             e.description = "\n".join(lines)
             best_rarity = coin_rarity_score(best_coin)
             e.add_field(
                 name="📊 Batch Summary",
                 value=(
-                    f"Total Value: **${total_val:.4f}**\n"
+                    f"Total Base Value: **${total_val:.4f}**\n"
+                    f"Total Market Value: **${total_market_val:.4f}**\n"
                     f"Avg Rarity Score: **{total_rarity/len(opened):.2f}**\n"
                     f"Best Coin: `#{best_coin['id']}` **{best_coin['variant']} {best_coin['material']}** — "
-                    f"${best_coin['value']:.4f} ({rarity_label(best_rarity)})"
+                    f"Mkt: ${get_market_price(best_coin):.4f} ({rarity_label(best_rarity)})"
                 ),
                 inline=False
             )
-            e.set_footer(text=f"Credits left: {credits_left:,} • Bank received {bank_cut} credits (10% fee)")
+            e.set_footer(text=f"Credits left: {credits_left:,} • Bank fee: {bank_cut} cr")
             await ctx.send(embed=e)
         return
 
@@ -2317,7 +2711,7 @@ async def buy(ctx, item: str = None, *args):
         e = discord.Embed(title="✨ Coin Polished!", color=0x57F287)
         e.description = (
             f"Coin `#{coin_id}` upgraded: **{cur_status}** → **{new_status}**\n"
-            f"New value: **${new_value:.4f}**"
+            f"New base value: **${new_value:.4f}**"
         )
         await ctx.send(embed=e)
         return
@@ -2440,15 +2834,18 @@ async def inventory(ctx, *args):
     for c in coins:
         serial_str = str(c['serial']).zfill(4)
         name = c.get('custom_name') or f"{c['variant']} {c['material']} Coin"
-        tier = tier_emoji(c['value'])
+        mkt = get_market_price(c)
+        tier = tier_emoji(mkt)
         rap = get_coin_rap(c['id'])
         rap_str = f" | RAP: {rap:,.0f}cr" if rap else " | Raw"
+        ev = get_event_mult(c['material'])
+        ev_tag = " 🚀" if ev > 1.0 else (" 💥" if ev < 1.0 else "")
         lines.append(
             f"{tier} `#{c['id']}` **{name}** #{serial_str}\n"
-            f"  {c['status']} | {c['float']} | **${c['value']:.4f}**{rap_str}"
+            f"  {c['status']} | {c['float']} | Base: **${c['value']:.4f}** | 📈 Mkt: **${mkt:.4f}**{ev_tag}{rap_str}"
         )
     e.description = f"Page **{page}/{pages}** | Total: **{total}** coins\n\n" + "\n\n".join(lines)
-    e.set_footer(text=f"-coin <id> for details • -inventory {page+1} for next page")
+    e.set_footer(text=f"-coin <id> for details • -inventory {page+1} for next page • Mkt = live market sell price")
     await ctx.send(embed=e)
 
 @bot.command()
@@ -2472,13 +2869,15 @@ async def coin(ctx, coin_id: int):
         return
 
     serial_str   = str(c['serial']).zfill(4)
-    tier         = tier_emoji(c['value'])
-    display_name = c.get('custom_name') or f"{c['variant']} {c['material']} Coin"
     market_val   = get_market_price(c)
+    tier         = tier_emoji(market_val)
+    display_name = c.get('custom_name') or f"{c['variant']} {c['material']} Coin"
     rap          = get_coin_rap(coin_id)
     trade_hist   = get_coin_trade_history(coin_id)
     rarity       = coin_rarity_score(c)
     rlabel       = rarity_label(rarity)
+    ev_mult      = get_event_mult(c['material'])
+    sd_mult      = get_supply_demand_mult(c['material'])
 
     e = discord.Embed(title=f"{tier} Coin #{coin_id} — {display_name}", color=0xFFD700)
     e.add_field(name="Owner",    value=c['username'],   inline=True)
@@ -2493,15 +2892,24 @@ async def coin(ctx, coin_id: int):
         f"Serial #{serial_str}: (×{c['ser_mult']})"
     ), inline=True)
     e.add_field(name="💰 Valuation", value=(
-        f"Base: **${c['base_value']:.2f}**\n"
-        f"Stored ×: **{c['total_mult']:.4f}**\n"
-        f"**Base Value: ${c['value']:.4f}**\n"
-        f"**📈 Market: ${market_val:.4f}**"
+        f"Base stored: **${c['value']:.4f}**\n"
+        f"**📈 Market: ${market_val:.4f}**\n"
+        f"*Sell value = market price*"
     ), inline=True)
+
+    econ_notes = []
+    if ev_mult != 1.0:
+        ev = _market_events.get(c['material'])
+        econ_notes.append(f"{'🚀 BOOM' if ev_mult > 1.0 else '💥 BUST'} ×{ev_mult}")
+    if abs(sd_mult - 1.0) > 0.01:
+        econ_notes.append(f"{'📦 Oversupply' if sd_mult < 1.0 else '🔥 Scarce'} ×{sd_mult:.3f}")
+    if econ_notes:
+        e.add_field(name="🌐 Market Conditions", value="\n".join(econ_notes), inline=True)
+
     e.add_field(name="✨ Rarity", value=f"**{rlabel}** (score: {rarity:.2f})", inline=True)
 
     if rap is not None:
-        e.add_field(name="💹 RAP", value=f"**{rap:,.2f} credits** (avg of trades)", inline=True)
+        e.add_field(name="💹 RAP", value=f"**{rap:,.2f} credits**", inline=True)
     else:
         e.add_field(name="💹 RAP", value="**Raw** (never traded)", inline=True)
 
@@ -2545,12 +2953,20 @@ async def sell(ctx, coin_id: str):
             await ctx.send(f"❌ Coin #{cid} is in an active auction. Cancel it first.")
             return
 
-        credits_earned = coin_value_to_credits(c['value'])
+        # ── Sell at LIVE MARKET price ──────────────────────────────────────
+        market_val     = get_market_price(c)
+        credits_earned = coin_value_to_credits(market_val)
+
         cur.execute("DELETE FROM coins WHERE id = %s", (cid,))
         cur.execute("UPDATE users SET credits = credits + %s WHERE user_id = %s", (credits_earned, uid))
         cur.execute("INSERT INTO credit_log (user_id, amount, reason) VALUES (%s,%s,'sell_coin')", (uid, credits_earned))
         sync_coin_count(uid, cur)
         conn.commit()
+
+        # Track supply pressure
+        record_material_sale(c['material'])
+        log_material_sale_db(c['material'])
+
     except Exception as ex:
         conn.rollback()
         print(f"sell error: {ex}")
@@ -2560,10 +2976,14 @@ async def sell(ctx, coin_id: str):
         release(conn)
 
     name = c.get('custom_name') or f"{c['variant']} {c['material']} Coin"
+    base_val = c['value']
+    ev_mult = get_event_mult(c['material'])
+    ev_tag = " 🚀 (BOOM active!)" if ev_mult > 1.0 else (" 💥 (BUST active)" if ev_mult < 1.0 else "")
+
     e = discord.Embed(title="💸 Coin Sold!", color=0x57F287)
     e.description = (
         f"Sold **{name}** `#{str(c['serial']).zfill(4)}`\n"
-        f"Value: **${c['value']:.4f}** → **{credits_earned:,} credits**"
+        f"Base value: **${base_val:.4f}** → Market: **${market_val:.4f}** → **{credits_earned:,} credits**{ev_tag}"
     )
     await ctx.send(embed=e)
 
@@ -2585,7 +3005,8 @@ async def sellall(ctx):
             await ctx.send("🎒 No sellable coins (coins in active auctions are excluded).")
             return
 
-        total_credits = sum(coin_value_to_credits(c['value']) for c in coins)
+        # ── Sell each coin at its LIVE MARKET price ────────────────────────
+        total_credits = sum(coin_value_to_credits(get_market_price(c)) for c in coins)
         ids = [c['id'] for c in coins]
 
         cur.execute("DELETE FROM coins WHERE id = ANY(%s)", (ids,))
@@ -2593,6 +3014,12 @@ async def sellall(ctx):
         cur.execute("INSERT INTO credit_log (user_id, amount, reason) VALUES (%s,%s,'sellall')", (uid, total_credits))
         sync_coin_count(uid, cur)
         conn.commit()
+
+        # Track supply for each material sold
+        for c in coins:
+            record_material_sale(c['material'])
+            log_material_sale_db(c['material'])
+
     except Exception as ex:
         conn.rollback()
         print(f"sellall error: {ex}")
@@ -2602,7 +3029,10 @@ async def sellall(ctx):
         release(conn)
 
     e = discord.Embed(title="💸 Sold All Coins!", color=0x57F287)
-    e.description = f"Sold **{len(coins)}** coin(s) for **{total_credits:,} credits** total."
+    e.description = (
+        f"Sold **{len(coins)}** coin(s) at live market prices for **{total_credits:,} credits** total.\n"
+        f"*Note: selling large volumes may increase supply pressure and lower future prices for those materials.*"
+    )
     await ctx.send(embed=e)
 
 @bot.command()
@@ -2682,8 +3112,9 @@ async def trade(ctx, member: discord.Member, *, args: str = ""):
         lines.append(f"Coins: `{', '.join('#'+str(i) for i in coin_ids)}`")
     if credits_offer > 0:
         tax = int(round(credits_offer * TRADE_TAX_PCT))
-        net = credits_offer - tax
-        lines.append(f"Credits: **{credits_offer:,}** (receiver gets **{net:,}** after {int(TRADE_TAX_PCT*100)}% tax)")
+        sink = int(round(credits_offer * ECONOMY_SINK_SELL_PCT))
+        net = credits_offer - tax - sink
+        lines.append(f"Credits: **{credits_offer:,}** (receiver gets **{net:,}** after {int(TRADE_TAX_PCT*100)}% tax + {int(ECONOMY_SINK_SELL_PCT*100)}% sink)")
     e.add_field(name="📤 Offer", value="\n".join(lines) or "None", inline=False)
     e.set_footer(text="Expires in 2 minutes")
 
@@ -2763,11 +3194,13 @@ async def auction(ctx, coin_id: int, start_price: int, hours: float = 24.0):
     finally:
         release(conn)
 
+    market_val = get_market_price(c)
     e = discord.Embed(title="🏪 Auction Listed!", color=0x57F287)
     e.description = coin_display(c)
-    e.add_field(name="Starting Price", value=f"**{start_price:,} credits**", inline=True)
-    e.add_field(name="Ends At",        value=f"<t:{int(ends_at.timestamp())}:R>", inline=True)
-    e.add_field(name="Fee",            value=f"{int(MARKET_FEE_PCT*100)}% on final sale", inline=True)
+    e.add_field(name="Starting Price",  value=f"**{start_price:,} credits**",                inline=True)
+    e.add_field(name="📈 Market Value", value=f"**${market_val:.4f}**",                       inline=True)
+    e.add_field(name="Ends At",         value=f"<t:{int(ends_at.timestamp())}:R>",             inline=True)
+    e.add_field(name="Fee",             value=f"{int(MARKET_FEE_PCT*100)}% fee + {int(ECONOMY_SINK_SELL_PCT*100)}% sink on final sale", inline=True)
     e.set_footer(text=f"Auction ID: #{auction_id}")
     await ctx.send(embed=e)
 
@@ -2818,15 +3251,23 @@ async def market(ctx, page: int = 1):
     pages = max(1, math.ceil(total / per_page))
     e = discord.Embed(title=f"🏪 Coin Marketplace — Page {page}/{pages}", color=0xEB459E)
 
+    # Active events hint
+    now = datetime.now(timezone.utc)
+    active_events = [(m, ev) for m, ev in _market_events.items() if now < ev['expires']]
+    event_hint = ""
+    if active_events:
+        ev_strs = [f"{'🚀' if ev['type']=='boom' else '💥'}{mat}" for mat, ev in active_events]
+        event_hint = f" | Events: {', '.join(ev_strs)}"
+
     if _market_prices["last_updated"]:
         now_dt = datetime.now(timezone.utc)
         next_update = _market_prices["last_updated"] + timedelta(minutes=20)
         diff = next_update - now_dt
         secs = int(diff.total_seconds())
-        m, s = divmod(max(0, secs), 60)
-        e.description = f"**{total}** active listing(s) | 📈 Prices refresh in **{m}m {s}s**\n"
+        m_mins, s = divmod(max(0, secs), 60)
+        e.description = f"**{total}** active listing(s) | 📈 Prices refresh in **{m_mins}m {s}s**{event_hint}\n"
     else:
-        e.description = f"**{total}** active listing(s)\n"
+        e.description = f"**{total}** active listing(s){event_hint}\n"
 
     for a in rows:
         serial_str = str(a['serial']).zfill(4)
@@ -2846,11 +3287,13 @@ async def market(ctx, page: int = 1):
         rap_str = f"RAP: **{rap:,.0f} cr**" if rap else "RAP: Raw"
 
         sta_live = get_status_market_mult(a)
+        ev_mult  = get_event_mult(a['material'])
+        ev_tag   = " 🚀BOOM" if ev_mult > 1.0 else (" 💥BUST" if ev_mult < 1.0 else "")
 
         e.add_field(
-            name=f"{tier} Auction #{a['id']} — {name} #{serial_str}",
+            name=f"{tier} Auction #{a['id']} — {name} #{serial_str}{ev_tag}",
             value=(
-                f"Cond: **{a['cond']}** (🏷️ `{sta_live:.3f}×`) | Float: **{a['float']}**\n"
+                f"Cond: **{a['cond']}** | Float: **{a['float']}**\n"
                 f"Base: **${base_val:.4f}** | {price_arrow} Market: **${market_val:.4f}** ({diff_pct:+.1f}%) | {rap_str}\n"
                 f"Start: **{a['start_price']:,}** | Top Bid: **{top_bid}**\n"
                 f"Seller: {a['seller_name']} | Ends: <t:{int(ends_ts.timestamp())}:R>"
@@ -2858,7 +3301,7 @@ async def market(ctx, page: int = 1):
             inline=False
         )
 
-    e.set_footer(text="Use -bid <auction_id> to place a bid • -prices status to see status market data")
+    e.set_footer(text="Use -bid <auction_id> to place a bid • -economy for market health • -marketevents for active events")
     await ctx.send(embed=e)
 
 @bot.command()
@@ -2908,8 +3351,10 @@ async def myauctions(ctx):
         ends_ts = a['ends_at']
         if ends_ts.tzinfo is None:
             ends_ts = ends_ts.replace(tzinfo=timezone.utc)
+        ev_mult = get_event_mult(a['material'])
+        ev_tag  = " 🚀" if ev_mult > 1.0 else (" 💥" if ev_mult < 1.0 else "")
         e.add_field(
-            name=f"Auction #{a['id']} — {name} #{serial_str}",
+            name=f"Auction #{a['id']} — {name} #{serial_str}{ev_tag}",
             value=(
                 f"Start: {a['start_price']:,} | Top Bid: {top_bid}\n"
                 f"Ends: <t:{int(ends_ts.timestamp())}:R>"
@@ -3095,9 +3540,13 @@ async def bank(ctx):
         cur.execute("SELECT * FROM daily_log ORDER BY paid_date DESC LIMIT 1")
         last = cur.fetchone()
         cur.execute(
-            "SELECT COALESCE(SUM(amount),0) as t FROM bank_log WHERE logged_at > NOW() - INTERVAL '24 hours'"
+            "SELECT COALESCE(SUM(amount),0) as t FROM bank_log WHERE logged_at > NOW() - INTERVAL '24 hours' AND amount > 0"
         )
         day_income = cur.fetchone()['t']
+        cur.execute(
+            "SELECT ABS(COALESCE(SUM(amount),0)) as s FROM bank_log WHERE logged_at > NOW() - INTERVAL '24 hours' AND amount < 0"
+        )
+        day_sunk = cur.fetchone()['s']
     finally:
         release(conn)
 
@@ -3106,13 +3555,14 @@ async def bank(ctx):
     e.add_field(name="👥 Users",           value=str(n),                         inline=True)
     e.add_field(name="📤 Projected Share", value=f"**{share:,} credits/user**",  inline=True)
     e.add_field(name="📈 Inflow (24h)",    value=f"{day_income:,} credits",       inline=True)
+    e.add_field(name="🕳️ Sunk (24h)",     value=f"{day_sunk:,} credits burned",  inline=True)
     if last:
         e.add_field(
             name="📅 Last Payout",
             value=f"{last['paid_date']} — {last['amount']:,}/user",
             inline=True
         )
-    e.set_footer(text="Funded by: crate fees (10%) • trade taxes • gambling • rob fines • prestige")
+    e.set_footer(text="Funded by: crate fees • trade taxes • gambling • rob fines • prestige • Sink: 5% burned on sales/trades")
     await ctx.send(embed=e)
 
 @bot.command()
@@ -3154,7 +3604,6 @@ async def stats(ctx):
         except Exception as te:
             conn.rollback()
             print(f"stats trades query error: {te}")
-            trades_done = 0
 
         cur.execute(
             "SELECT COALESCE(SUM(amount),0) as t FROM credit_log WHERE user_id=%s AND amount > 0",
@@ -3262,6 +3711,29 @@ async def rmcredits(ctx, member: discord.Member, amount: int):
     e.add_field(name="➖ Removed",     value=f"**{actual:,} credits**",               inline=True)
     e.add_field(name="💳 New Balance", value=f"**{u_after['credits']:,} credits**",   inline=True)
     await ctx.send(embed=e)
+
+@bot.command()
+async def setannouncechannel(ctx):
+    """Admin: Set current channel as the market event announcement channel."""
+    if ctx.author.id != ADMIN_ID:
+        await ctx.send("❌ No permission.")
+        return
+    global _announce_channel_id
+    _announce_channel_id = ctx.channel.id
+    await ctx.send(f"✅ Market event announcements will now go to **#{ctx.channel.name}**.")
+
+@bot.command()
+async def forcemarketupdate(ctx):
+    """Admin: Manually trigger a market price update."""
+    if ctx.author.id != ADMIN_ID:
+        await ctx.send("❌ No permission.")
+        return
+    event = generate_market_prices()
+    if event:
+        ev_type, mat, mult = event
+        await ctx.send(f"✅ Market updated! Event triggered: **{ev_type.upper()}** on **{mat}** ×{mult}")
+    else:
+        await ctx.send("✅ Market prices updated. No event triggered this cycle.")
 
 # ─── Run ──────────────────────────────────────────────────────────────────────
 bot.run(TOKEN)
