@@ -376,7 +376,6 @@ def tier_emoji(value: float):
     if value >= 1:   return "⚪"
     return "🟤"
 
-# ── FIXED: sell value is now ×1 (not ×100) ───────────────────────────────────
 def coin_value_to_credits(value: float) -> int:
     return max(1, int(value))
 
@@ -3266,5 +3265,3 @@ async def rmcredits(ctx, member: discord.Member, amount: int):
 
 # ─── Run ──────────────────────────────────────────────────────────────────────
 bot.run(TOKEN)
-ENDOFFILE
-echo "Done"
