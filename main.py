@@ -51,23 +51,23 @@ def release(conn):
 
 # ─── Game Constants ────────────────────────────────────────────────────────────
 CRATE_COST         = 100
-CRATE_FEE_PCT      = 0.10          # increased to 10%
+CRATE_FEE_PCT      = 0.10
 TRADE_TAX_PCT      = 0.05
 MARKET_FEE_PCT     = 0.08
 CREDITS_PER_MSG    = 1
 MSG_COOLDOWN_S     = 30
 DAILY_CREDITS      = 50
 DAILY_STREAK_BONUS = 5
-WORK_COOLDOWN_H    = 4
-WORK_BASE          = 20            # base work payout
-WORK_MULTIPLIER    = 1.1           # each successful work multiplies earnings
+WORK_COOLDOWN_H    = 2              # ← reduced from 4h to 2h
+WORK_BASE          = 20
+WORK_MULTIPLIER    = 1.1
 ROB_COOLDOWN_H     = 6
 ROB_SUCCESS_PCT    = 0.40
 ROB_MAX_STEAL_PCT  = 0.20
 ROB_FINE_PCT       = 0.15
 GAMBLE_MIN         = 10
 PRESTIGE_COST      = 5000
-BANK_INTEREST_PCT  = 0.05         # 5% per 10 minutes (1.05x)
+BANK_INTEREST_PCT  = 0.05
 BANK_INTEREST_MINS = 10
 
 SHOP_ITEMS = {
@@ -77,6 +77,59 @@ SHOP_ITEMS = {
     "crate_x3": {"cost": 270, "desc": "Open 3 crates at once (10% discount)"},
     "crate_x5": {"cost": 420, "desc": "Open 5 crates at once (16% discount)"},
 }
+
+# ─── Job Rank System ──────────────────────────────────────────────────────────
+# Each rank: (name, min_work_count, base_salary, emoji)
+JOB_RANKS = [
+    ("Intern",          0,    20,   "🟤"),
+    ("Junior Worker",   5,    35,   "⚪"),
+    ("Worker",          15,   55,   "🟡"),
+    ("Senior Worker",   30,   80,   "🔵"),
+    ("Specialist",      55,   120,  "🟢"),
+    ("Expert",          90,   175,  "🟠"),
+    ("Lead",            140,  250,  "🔴"),
+    ("Manager",         200,  350,  "💜"),
+    ("Director",        300,  500,  "💎"),
+    ("Executive",       450,  750,  "👑"),
+    ("Vault Master",    650,  1200, "🌟"),
+    ("Coin Legend",     900,  2000, "🌌"),
+]
+
+# Job-specific titles per rank (flavor text)
+JOB_TITLES = {
+    "Intern":         "Coin Sorting Intern",
+    "Junior Worker":  "Mint Floor Assistant",
+    "Worker":         "Vault Clerk",
+    "Senior Worker":  "Coin Authenticator",
+    "Specialist":     "Market Analyst",
+    "Expert":         "Senior Appraiser",
+    "Lead":           "Lead Vault Technician",
+    "Manager":        "Treasury Manager",
+    "Director":       "Director of Acquisitions",
+    "Executive":      "Chief Coin Officer",
+    "Vault Master":   "Vault Master",
+    "Coin Legend":    "Legendary Coin Baron",
+}
+
+def get_job_rank(work_count: int) -> tuple:
+    """Return (rank_name, salary, emoji, rank_index) for current work_count."""
+    current = JOB_RANKS[0]
+    idx = 0
+    for i, (name, min_wc, salary, emoji) in enumerate(JOB_RANKS):
+        if work_count >= min_wc:
+            current = (name, min_wc, salary, emoji)
+            idx = i
+        else:
+            break
+    return current[0], current[2], current[3], idx
+
+def get_next_job_rank(work_count: int):
+    """Return next rank info or None if at max."""
+    _, _, _, idx = get_job_rank(work_count)
+    if idx + 1 < len(JOB_RANKS):
+        nxt = JOB_RANKS[idx + 1]
+        return nxt[0], nxt[1], nxt[2], nxt[3]  # name, min_wc, salary, emoji
+    return None
 
 # ─── Coin Attribute Tables ────────────────────────────────────────────────────
 MATERIALS = [
@@ -146,6 +199,11 @@ WORK_ACTIONS = [
     "tested the coin press machine",
     "cleaned the display cases",
     "audited the bank ledgers",
+    "negotiated a bulk coin deal",
+    "inspected a rare coin collection",
+    "managed the vault security systems",
+    "oversaw the quarterly coin audit",
+    "closed a major acquisition deal",
 ]
 
 # ─── Market Price Fluctuation ─────────────────────────────────────────────────
@@ -345,7 +403,6 @@ def init_db():
         )
     """)
 
-    # ─── Virtual Bank Account table ────────────────────────────────────────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_bank (
             user_id       BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
@@ -354,7 +411,6 @@ def init_db():
         )
     """)
 
-    # ─── Coin RAP (Recent Average Price) tracking ──────────────────────────────
     cur.execute("""
         CREATE TABLE IF NOT EXISTS coin_trades (
             id          SERIAL PRIMARY KEY,
@@ -390,7 +446,6 @@ def init_db():
         print(f"Backup restore notice: {e}")
         conn.rollback()
 
-    # ─── Migrate existing users table columns ─────────────────────────────────
     existing_user_cols = set()
     try:
         cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='users'")
@@ -420,7 +475,6 @@ def init_db():
                 conn.rollback()
                 print(f"User migration {col}: {e}")
 
-    # ─── Fix trades table — ensure correct column names ────────────────────────
     cur.execute("""
         SELECT EXISTS (
             SELECT FROM information_schema.tables
@@ -430,13 +484,11 @@ def init_db():
     trades_exists = cur.fetchone()['exists']
 
     if trades_exists:
-        # Check if old schema uses wrong column names and fix
         cur.execute("""
             SELECT column_name FROM information_schema.columns
             WHERE table_name = 'trades'
         """)
         trade_cols = {row['column_name'] for row in cur.fetchall()}
-        # Rename legacy columns if present
         if 'from_user' in trade_cols and 'initiator_id' not in trade_cols:
             try:
                 cur.execute("ALTER TABLE trades RENAME COLUMN from_user TO initiator_id")
@@ -538,7 +590,6 @@ def ensure_user(user_id: int, username: str):
             VALUES (%s, %s, 0, 0, 0, 0, 0, 0, 0, 0, FALSE)
             ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username
         """, (user_id, username))
-        # Ensure bank account exists
         cur.execute("""
             INSERT INTO user_bank (user_id, balance, last_interest)
             VALUES (%s, 0, NOW())
@@ -624,7 +675,6 @@ def get_portfolio_value(uid: int) -> float:
         release(conn)
 
 def get_user_bank(user_id: int) -> dict:
-    """Get user's virtual bank account, applying interest first."""
     conn = db()
     cur = conn.cursor()
     try:
@@ -645,7 +695,6 @@ def get_user_bank(user_id: int) -> dict:
         release(conn)
 
 def apply_bank_interest(user_id: int) -> int:
-    """Apply interest to user's bank balance. Returns interest earned."""
     conn = db()
     cur = conn.cursor()
     try:
@@ -681,8 +730,7 @@ def apply_bank_interest(user_id: int) -> int:
     finally:
         release(conn)
 
-def get_coin_rap(coin_id: int) -> float | None:
-    """Calculate Recent Average Price for a coin based on trade history."""
+def get_coin_rap(coin_id: int):
     conn = db()
     cur = conn.cursor()
     try:
@@ -703,12 +751,11 @@ def get_coin_rap(coin_id: int) -> float | None:
         release(conn)
 
 def get_coin_trade_history(coin_id: int) -> list:
-    """Get recent trade history for a coin."""
     conn = db()
     cur = conn.cursor()
     try:
         cur.execute("""
-            SELECT ct.*, 
+            SELECT ct.*,
                    us.username as seller_name,
                    ub.username as buyer_name
             FROM coin_trades ct
@@ -778,7 +825,6 @@ async def auction_checker():
                 cur.execute("UPDATE users SET credits = credits + %s WHERE user_id = %s", (seller_net, seller_id))
                 cur.execute("UPDATE bank SET total = total + %s WHERE id = 1", (fee,))
                 cur.execute("INSERT INTO bank_log (source, amount) VALUES (%s,%s)", (f"auction_fee:{a['id']}", fee))
-                # Record trade for RAP
                 cur.execute("""
                     INSERT INTO coin_trades (coin_id, seller_id, buyer_id, price)
                     VALUES (%s, %s, %s, %s)
@@ -920,7 +966,6 @@ class TradeView(discord.ui.View):
 
             if coin_ids:
                 cur.execute("UPDATE coins SET owner_id = %s WHERE id = ANY(%s)", (trade['receiver_id'], coin_ids))
-                # Record coin trades for RAP
                 for cid in coin_ids:
                     cur.execute("""
                         INSERT INTO coin_trades (coin_id, seller_id, buyer_id, price)
@@ -1119,12 +1164,17 @@ async def help(ctx):
     e.add_field(name="💰 Economy (Credits)", value=(
         "`-balance` — Your credits & stats\n"
         "`-daily` — Claim daily credits (streak bonuses!)\n"
-        "`-work` — Work for credits (4h cooldown, pay grows with experience!)\n"
+        "`-work` — Work for credits (2h cooldown, pay grows with experience!)\n"
         "`-rob @user` — Attempt to rob someone (6h cooldown)\n"
         "`-gamble <amount>` — Coinflip bet\n"
         "`-slots <amount>` — Spin the slot machine\n"
         "`-prestige` — Spend 5,000 credits to prestige (+10% all earnings)\n"
         "`-cd` / `-cooldown` — Check your command cooldowns\n"
+    ), inline=False)
+    e.add_field(name="💼 Job & Career", value=(
+        "`-work` — Work your job (2h cooldown)\n"
+        "`-jobrank` — View your job rank, title & career progress\n"
+        "`-jobladder` — See all job ranks and their salaries\n"
     ), inline=False)
     e.add_field(name="🏦 Virtual Bank", value=(
         "`-vbank` — View your virtual bank account (earns 1.05× every 10 min!)\n"
@@ -1141,7 +1191,7 @@ async def help(ctx):
     ), inline=False)
     e.add_field(name="🎒 Inventory", value=(
         "`-inventory [page]` / `-inv` — View your coins\n"
-        "`-inventory @user [page]` — View another user's coins (if they allow it)\n"
+        "`-inventory @user [page]` — View another user's coins (if public)\n"
         "`-coin <id>` — Detailed coin view with RAP\n"
         "`-sell <coin_id>` — Sell coin for credits\n"
         "`-sellall` — Sell all coins (get credits)\n"
@@ -1188,14 +1238,16 @@ async def balance(ctx):
     prestige_val = u.get('prestige') or 0
     pmult = prestige_multiplier(prestige_val)
     vbank = get_user_bank(uid)
+    work_count = u.get('work_count') or 0
+    rank_name, rank_salary, rank_emoji, _ = get_job_rank(work_count)
 
     e = discord.Embed(title=f"💳 {ctx.author.display_name}'s Balance", color=0x57F287)
-    e.add_field(name="🎟️ Credits",        value=f"**{u['credits']:,}**",                       inline=True)
-    e.add_field(name="🏦 Bank Balance",    value=f"**{vbank['balance']:,}** credits",             inline=True)
-    e.add_field(name="🪙 Coins Owned",     value=f"**{u['total_coins']}**",                       inline=True)
-    e.add_field(name="📈 Portfolio Value", value=f"**${portfolio:.4f}**",                         inline=True)
-    e.add_field(name="⭐ Prestige",        value=f"**{prestige_val}** (×{pmult:.1f} earnings)",    inline=True)
-    e.add_field(name="🔥 Daily Streak",    value=f"**{u.get('daily_streak', 0)}** days",           inline=True)
+    e.add_field(name="🎟️ Credits",        value=f"**{u['credits']:,}**",                        inline=True)
+    e.add_field(name="🏦 Bank Balance",    value=f"**{vbank['balance']:,}** credits",              inline=True)
+    e.add_field(name="🪙 Coins Owned",     value=f"**{u['total_coins']}**",                        inline=True)
+    e.add_field(name="📈 Portfolio Value", value=f"**${portfolio:.4f}**",                          inline=True)
+    e.add_field(name="⭐ Prestige",        value=f"**{prestige_val}** (×{pmult:.1f} earnings)",     inline=True)
+    e.add_field(name=f"{rank_emoji} Job Rank", value=f"**{rank_name}**",                           inline=True)
     await ctx.send(embed=e)
 
 @bot.command()
@@ -1272,10 +1324,18 @@ async def work(ctx):
         await ctx.send(f"⏳ You're tired! Work again in **{h}h {m}m**.")
         return
 
-    # ─── Progressive pay system ───────────────────────────────────────────────
     work_count = u.get('work_count') or 0
-    base_pay = int(WORK_BASE * (WORK_MULTIPLIER ** work_count))
-    # Cap at a reasonable max so it doesn't explode
+
+    # ─── Job rank-based salary system ────────────────────────────────────────
+    rank_name, rank_salary, rank_emoji, rank_idx = get_job_rank(work_count)
+    job_title = JOB_TITLES.get(rank_name, rank_name)
+
+    # Salary grows within a rank based on jobs done since last promotion
+    prev_rank_min = JOB_RANKS[rank_idx][1]
+    jobs_in_rank = work_count - prev_rank_min
+    # Small 2% growth per job within the rank, capped
+    within_rank_mult = min(1.0 + (jobs_in_rank * 0.02), 1.5)
+    base_pay = int(rank_salary * within_rank_mult)
     base_pay = min(base_pay, 5000)
 
     prestige_val = u.get('prestige') or 0
@@ -1300,16 +1360,108 @@ async def work(ctx):
     finally:
         release(conn)
 
-    e = discord.Embed(title="💼 Work Complete!", color=0x57F287)
-    e.description = f"{ctx.author.display_name} {action} and earned **{earned:,} credits**!"
-    e.add_field(name="📊 Work Experience", value=f"Job #{new_work_count}", inline=True)
-    e.add_field(name="💵 Base Pay",        value=f"{base_pay:,} credits", inline=True)
-    if prestige_val > 0:
-        e.add_field(name="⭐ Prestige Bonus", value=f"×{prestige_multiplier(prestige_val):.1f}", inline=True)
+    # Check if rank-up happened
+    new_rank_name, new_rank_salary, new_rank_emoji, new_rank_idx = get_job_rank(new_work_count)
+    ranked_up = new_rank_idx > rank_idx
 
-    # Show next pay preview
-    next_pay = min(int(WORK_BASE * (WORK_MULTIPLIER ** new_work_count)), 5000)
-    e.set_footer(text=f"Next work in {WORK_COOLDOWN_H}h • Next paycheck: ~{next_pay:,} credits (1.1× growth)")
+    e = discord.Embed(title="💼 Work Complete!", color=0x57F287)
+    e.description = f"{rank_emoji} **{job_title}** {ctx.author.display_name} {action} and earned **{earned:,} credits**!"
+    e.add_field(name="📊 Job",          value=f"{rank_name} (Job #{new_work_count})", inline=True)
+    e.add_field(name="💵 Pay",          value=f"{earned:,} credits",                  inline=True)
+    if prestige_val > 0:
+        e.add_field(name="⭐ Prestige", value=f"×{prestige_multiplier(prestige_val):.1f}", inline=True)
+
+    # Show next rank progress
+    next_rank = get_next_job_rank(new_work_count)
+    if next_rank:
+        next_name, next_min, next_salary, next_emoji = next_rank
+        jobs_needed = next_min - new_work_count
+        e.set_footer(text=f"Next rank: {next_emoji} {next_name} in {jobs_needed} job(s) • Salary: {next_salary:,}/job • CD: {WORK_COOLDOWN_H}h")
+    else:
+        e.set_footer(text=f"MAX RANK ACHIEVED: {rank_emoji} {rank_name} • CD: {WORK_COOLDOWN_H}h")
+
+    if ranked_up:
+        new_title = JOB_TITLES.get(new_rank_name, new_rank_name)
+        await ctx.send(embed=e)
+        rank_e = discord.Embed(
+            title=f"🎉 PROMOTION! {new_rank_emoji} {new_rank_name}",
+            description=(
+                f"Congratulations **{ctx.author.display_name}**!\n"
+                f"You've been promoted to **{new_title}**!\n"
+                f"New base salary: **{new_rank_salary:,} credits/job**"
+            ),
+            color=0xFFD700
+        )
+        await ctx.send(embed=rank_e)
+    else:
+        await ctx.send(embed=e)
+
+@bot.command()
+async def jobrank(ctx, member: discord.Member = None):
+    """View your job rank and career progress."""
+    target = member or ctx.author
+    uid = target.id
+    ensure_user(uid, str(target))
+    u = get_user(uid)
+    if not u:
+        await ctx.send("❌ Could not load profile. Try again.")
+        return
+
+    work_count = u.get('work_count') or 0
+    rank_name, rank_salary, rank_emoji, rank_idx = get_job_rank(work_count)
+    job_title = JOB_TITLES.get(rank_name, rank_name)
+    next_rank = get_next_job_rank(work_count)
+
+    prev_rank_min = JOB_RANKS[rank_idx][1]
+    jobs_in_rank = work_count - prev_rank_min
+    within_rank_mult = min(1.0 + (jobs_in_rank * 0.02), 1.5)
+    current_salary = int(rank_salary * within_rank_mult)
+
+    e = discord.Embed(
+        title=f"{rank_emoji} {target.display_name}'s Career",
+        color=0x5865F2
+    )
+    e.add_field(name="🏷️ Job Title",     value=f"**{job_title}**",                inline=True)
+    e.add_field(name="📊 Rank",           value=f"**{rank_name}** (Tier {rank_idx + 1}/{len(JOB_RANKS)})", inline=True)
+    e.add_field(name="💼 Jobs Worked",    value=f"**{work_count}** total",          inline=True)
+    e.add_field(name="💵 Current Salary", value=f"**{current_salary:,}** credits/job", inline=True)
+    e.add_field(name="📈 In-Rank Growth", value=f"+2% per job (×{within_rank_mult:.2f} now)", inline=True)
+
+    if next_rank:
+        next_name, next_min, next_salary, next_emoji = next_rank
+        jobs_needed = next_min - work_count
+        # Progress bar
+        rank_total_jobs = next_min - prev_rank_min
+        rank_done_jobs = work_count - prev_rank_min
+        bar_filled = int((rank_done_jobs / rank_total_jobs) * 10)
+        bar = "█" * bar_filled + "░" * (10 - bar_filled)
+        e.add_field(
+            name=f"⬆️ Next Promotion: {next_emoji} {next_name}",
+            value=f"`{bar}` {rank_done_jobs}/{rank_total_jobs} jobs\n{jobs_needed} job(s) to go! Salary: **{next_salary:,}**",
+            inline=False
+        )
+    else:
+        e.add_field(name="🏆 Status", value="**MAX RANK ACHIEVED** — You are a Coin Legend!", inline=False)
+
+    e.set_footer(text="Use -jobladder to see all ranks • Use -work to earn and progress")
+    await ctx.send(embed=e)
+
+@bot.command()
+async def jobladder(ctx):
+    """View all job ranks and their salaries."""
+    e = discord.Embed(title="💼 CoinVault Job Ladder", color=0xFFD700)
+    e.description = "Work your way up from Intern to Coin Legend!\n\n"
+    lines = []
+    for i, (name, min_wc, salary, emoji) in enumerate(JOB_RANKS):
+        title = JOB_TITLES.get(name, name)
+        if i + 1 < len(JOB_RANKS):
+            next_min = JOB_RANKS[i + 1][1]
+            range_str = f"Jobs {min_wc}–{next_min - 1}"
+        else:
+            range_str = f"Jobs {min_wc}+"
+        lines.append(f"{emoji} **{name}** — *{title}*\n  └ {range_str} | Base: **{salary:,} cr/job**")
+    e.description += "\n".join(lines)
+    e.set_footer(text="Salary grows +2% per job within a rank (up to 1.5×) • Prestige multiplier also applies")
     await ctx.send(embed=e)
 
 @bot.command()
@@ -1503,7 +1655,6 @@ async def prestige(ctx):
     e.set_footer(text=f"Cost: {PRESTIGE_COST:,} credits • Half went to the bank treasury")
     await ctx.send(embed=e)
 
-# ─── Cooldown Command ──────────────────────────────────────────────────────────
 @bot.command(aliases=['cd'])
 async def cooldown(ctx):
     uid = ctx.author.id
@@ -1558,25 +1709,28 @@ async def cooldown(ctx):
         market_status = "🔄 Unknown"
 
     work_count = u.get('work_count') or 0
-    next_pay = min(int(WORK_BASE * (WORK_MULTIPLIER ** work_count)), 5000)
+    rank_name, rank_salary, rank_emoji, rank_idx = get_job_rank(work_count)
+    prev_rank_min = JOB_RANKS[rank_idx][1]
+    jobs_in_rank = work_count - prev_rank_min
+    within_rank_mult = min(1.0 + (jobs_in_rank * 0.02), 1.5)
+    next_pay = int(rank_salary * within_rank_mult * prestige_multiplier(u.get('prestige') or 0))
 
     e = discord.Embed(
         title=f"⏱️ {ctx.author.display_name}'s Cooldowns",
         color=0x5865F2
     )
-    e.add_field(name="📅 Daily",          value=daily_status,             inline=True)
-    e.add_field(name="💼 Work",           value=work_status,              inline=True)
-    e.add_field(name="🦹 Rob",            value=rob_status,               inline=True)
-    e.add_field(name="🎰 Gamble/Slots",   value="✅ No CD",              inline=True)
-    e.add_field(name="📈 Market Prices",  value=market_status,            inline=True)
-    e.add_field(name="💵 Next Work Pay",  value=f"~{next_pay:,} credits", inline=True)
+    e.add_field(name="📅 Daily",          value=daily_status,                              inline=True)
+    e.add_field(name="💼 Work",           value=work_status,                               inline=True)
+    e.add_field(name="🦹 Rob",            value=rob_status,                                inline=True)
+    e.add_field(name="🎰 Gamble/Slots",   value="✅ No CD",                               inline=True)
+    e.add_field(name="📈 Market Prices",  value=market_status,                             inline=True)
+    e.add_field(name=f"{rank_emoji} Next Work Pay", value=f"~{next_pay:,} credits ({rank_name})", inline=True)
     e.set_footer(text="Use -work, -daily, -rob to use these commands")
     await ctx.send(embed=e)
 
 # ─── Virtual Bank Commands ─────────────────────────────────────────────────────
 @bot.command(aliases=['vb', 'mybank'])
 async def vbank(ctx):
-    """View your virtual bank account with interest info."""
     uid = ctx.author.id
     ensure_user(uid, str(ctx.author))
     interest = apply_bank_interest(uid)
@@ -1596,18 +1750,17 @@ async def vbank(ctx):
     m, s = divmod(secs, 60)
 
     e = discord.Embed(title=f"🏦 {ctx.author.display_name}'s Virtual Bank", color=0x57F287)
-    e.add_field(name="🏦 Bank Balance",    value=f"**{vb['balance']:,} credits**",      inline=True)
-    e.add_field(name="💳 Wallet",          value=f"**{u['credits']:,} credits**",        inline=True)
-    e.add_field(name="📈 Interest Rate",   value=f"**+5%** every 10 minutes",             inline=True)
-    e.add_field(name="⏰ Next Interest",   value=f"In **{m}m {s}s**",                    inline=True)
+    e.add_field(name="🏦 Bank Balance",    value=f"**{vb['balance']:,} credits**",       inline=True)
+    e.add_field(name="💳 Wallet",          value=f"**{u['credits']:,} credits**",         inline=True)
+    e.add_field(name="📈 Interest Rate",   value=f"**+5%** every 10 minutes",              inline=True)
+    e.add_field(name="⏰ Next Interest",   value=f"In **{m}m {s}s**",                     inline=True)
     if interest > 0:
-        e.add_field(name="✅ Interest Earned", value=f"+**{interest:,} credits**",        inline=True)
+        e.add_field(name="✅ Interest Earned", value=f"+**{interest:,} credits**",         inline=True)
     e.set_footer(text="Use -deposit <amount> and -withdraw <amount> to manage your bank")
     await ctx.send(embed=e)
 
 @bot.command()
 async def deposit(ctx, amount: str):
-    """Deposit credits into your virtual bank account."""
     uid = ctx.author.id
     ensure_user(uid, str(ctx.author))
     u = get_user(uid)
@@ -1631,7 +1784,6 @@ async def deposit(ctx, amount: str):
         await ctx.send(f"❌ Not enough credits. You have **{u['credits']:,}**.")
         return
 
-    # Apply interest before depositing
     apply_bank_interest(uid)
 
     conn = db()
@@ -1655,18 +1807,16 @@ async def deposit(ctx, amount: str):
 
     vb = get_user_bank(uid)
     e = discord.Embed(title="🏦 Deposit Successful!", color=0x57F287)
-    e.add_field(name="💰 Deposited",    value=f"**{amt:,} credits**",         inline=True)
+    e.add_field(name="💰 Deposited",    value=f"**{amt:,} credits**",          inline=True)
     e.add_field(name="🏦 New Balance",  value=f"**{vb['balance']:,} credits**", inline=True)
     e.set_footer(text="Your balance grows 1.05× every 10 minutes!")
     await ctx.send(embed=e)
 
 @bot.command()
 async def withdraw(ctx, amount: str):
-    """Withdraw credits from your virtual bank account."""
     uid = ctx.author.id
     ensure_user(uid, str(ctx.author))
 
-    # Apply interest first
     apply_bank_interest(uid)
     vb = get_user_bank(uid)
 
@@ -1701,24 +1851,24 @@ async def withdraw(ctx, amount: str):
         release(conn)
 
     u = get_user(uid)
+    remaining = vb['balance'] - amt
     e = discord.Embed(title="🏦 Withdrawal Successful!", color=0x57F287)
-    e.add_field(name="💰 Withdrawn",  value=f"**{amt:,} credits**",              inline=True)
-    e.add_field(name="💳 Wallet",     value=f"**{u['credits']:,} credits**",      inline=True)
-    e.add_field(name="🏦 Remaining",  value=f"**{vb['balance'] - amt:,} credits**", inline=True)
+    e.add_field(name="💰 Withdrawn",  value=f"**{amt:,} credits**",         inline=True)
+    e.add_field(name="💳 Wallet",     value=f"**{u['credits']:,} credits**", inline=True)
+    e.add_field(name="🏦 Remaining",  value=f"**{remaining:,} credits**",    inline=True)
     await ctx.send(embed=e)
 
-# ─── Privacy Toggle ────────────────────────────────────────────────────────────
 @bot.command()
 async def privacy(ctx, setting: str = None):
-    """Toggle inventory/wallet visibility to other users."""
     uid = ctx.author.id
     ensure_user(uid, str(ctx.author))
 
     if setting is None or setting.lower() not in ('on', 'off'):
         u = get_user(uid)
         current = u.get('inventory_public', False)
+        status_str = 'public (others can see)' if current else 'private'
         await ctx.send(
-            f"🔒 Privacy is currently **{'public (others can see)' if current else 'private'}**.\n"
+            f"🔒 Privacy is currently **{status_str}**.\n"
             f"Use `-privacy on` to allow others to view your inventory/wallet, or `-privacy off` to hide it."
         )
         return
@@ -1813,7 +1963,6 @@ async def prices(ctx, category: str = "all"):
 
 @bot.command()
 async def coinprice(ctx, coin_id: int):
-    """Check the live market price and RAP of a specific coin."""
     conn = db()
     cur = conn.cursor()
     try:
@@ -1843,7 +1992,6 @@ async def coinprice(ctx, coin_id: int):
     name = coin_name(c)
     serial_str = str(c['serial']).zfill(4)
 
-    # RAP calculation
     rap = get_coin_rap(coin_id)
     trade_history = get_coin_trade_history(coin_id)
 
@@ -1854,7 +2002,6 @@ async def coinprice(ctx, coin_id: int):
     e.add_field(name="🪨 Mat Price",     value=f"`{mat_live:.4f}×` (base: {c['mat_mult']}×)", inline=True)
     e.add_field(name="🌊 Float Price",   value=f"`{flt_live:.4f}×` (base: {c['flt_mult']}×)", inline=True)
 
-    # RAP field
     if rap is not None:
         rap_diff = rap - base_val
         rap_arrow = "📈" if rap_diff >= 0 else "📉"
@@ -1862,7 +2009,6 @@ async def coinprice(ctx, coin_id: int):
     else:
         e.add_field(name="💹 RAP (Avg Trade Price)", value="No trades yet (raw coin)", inline=True)
 
-    # Trade history
     if trade_history:
         history_lines = []
         for t in trade_history:
@@ -2107,10 +2253,8 @@ async def inventory(ctx, *args):
     target_member = None
     page = 1
 
-    # Parse arguments: could be (@member) or (page) or (@member page)
     for arg in args:
         if arg.startswith('<@') and arg.endswith('>'):
-            # It's a mention
             mid_str = arg.strip('<@!>').strip('>')
             try:
                 mid = int(mid_str)
@@ -2128,15 +2272,13 @@ async def inventory(ctx, *args):
             except ValueError:
                 pass
 
-    # Check if viewing another user
     if target_member and target_member.id != uid:
-        # Check privacy
         tu = get_user(target_member.id)
         if not tu:
-            await ctx.send(f"❌ User not found.")
+            await ctx.send("❌ User not found.")
             return
         if not tu.get('inventory_public', False):
-            await ctx.send(f"🔒 **{target_member.display_name}**'s inventory is private. They need to use `-privacy on` to allow viewing.")
+            await ctx.send(f"🔒 **{target_member.display_name}'s** inventory is private.")
             return
         view_uid = target_member.id
         view_name = target_member.display_name
@@ -2165,10 +2307,12 @@ async def inventory(ctx, *args):
         release(conn)
 
     if not coins:
+        # ── SYNTAX FIX: no backslash inside f-string ─────────────────────────
+        owner_str = "Your" if view_uid == uid else (view_name + "'s")
         if page > 1:
             await ctx.send(f"❌ No coins on page {page}.")
         else:
-            await ctx.send(f"🎒 {'Your' if view_uid == uid else view_name + \"'s\"} inventory is empty!")
+            await ctx.send(f"🎒 {owner_str} inventory is empty!")
         return
 
     pages = max(1, math.ceil(total / per_page))
@@ -2178,7 +2322,6 @@ async def inventory(ctx, *args):
         serial_str = str(c['serial']).zfill(4)
         name = c.get('custom_name') or f"{c['variant']} {c['material']} Coin"
         tier = tier_emoji(c['value'])
-        # Check if it has trade history
         rap = get_coin_rap(c['id'])
         rap_str = f" | RAP: {rap:,.0f}cr" if rap else " | Raw"
         lines.append(
@@ -2487,7 +2630,6 @@ async def auction(ctx, coin_id: int, start_price: int, hours: float = 24.0):
     finally:
         release(conn)
 
-    name = c.get('custom_name') or f"{c['variant']} {c['material']} Coin"
     e = discord.Embed(title="🏪 Auction Listed!", color=0x57F287)
     e.description = coin_display(c)
     e.add_field(name="Starting Price", value=f"**{start_price:,} credits**", inline=True)
@@ -2566,7 +2708,6 @@ async def market(ctx, page: int = 1):
         diff_pct = ((market_val - base_val) / base_val * 100) if base_val > 0 else 0
         price_arrow = "📈" if diff_pct >= 0 else "📉"
 
-        # RAP
         rap = get_coin_rap(a['coin_id'])
         rap_str = f"RAP: **{rap:,.0f} cr**" if rap else "RAP: Raw"
 
@@ -2681,11 +2822,10 @@ async def profile(ctx, member: discord.Member = None):
     uid = target.id
     ensure_user(uid, str(target))
 
-    # Check privacy if viewing another user
     if member and member.id != ctx.author.id:
         tu = get_user(uid)
         if not tu or not tu.get('inventory_public', False):
-            await ctx.send(f"🔒 **{target.display_name}**'s profile is private.")
+            await ctx.send(f"🔒 **{target.display_name}'s** profile is private.")
             return
 
     conn = db()
@@ -2715,23 +2855,26 @@ async def profile(ctx, member: discord.Member = None):
         await ctx.send("❌ User not found.")
         return
 
-    # Apply bank interest and get balance
     apply_bank_interest(uid)
     vb = get_user_bank(uid)
 
     prestige_val = u.get('prestige') or 0
     pmult = prestige_multiplier(prestige_val)
+    work_count = u.get('work_count') or 0
+    rank_name, rank_salary, rank_emoji, _ = get_job_rank(work_count)
+    job_title = JOB_TITLES.get(rank_name, rank_name)
+
     e = discord.Embed(title=f"👤 {target.display_name}'s Profile", color=0x5865F2)
     e.set_thumbnail(url=target.display_avatar.url)
-    e.add_field(name="🎟️ Credits",       value=f"{u['credits']:,}",             inline=True)
-    e.add_field(name="🏦 Bank",           value=f"{vb['balance']:,}",             inline=True)
-    e.add_field(name="🪙 Coins",          value=str(u['total_coins']),            inline=True)
-    e.add_field(name="⭐ Prestige",       value=f"{prestige_val} (×{pmult:.1f})", inline=True)
-    e.add_field(name="📈 Portfolio",      value=f"${total_val:.4f}",              inline=True)
-    e.add_field(name="🏆 Best Coin",      value=f"${best['value']:.4f}" if best else "None", inline=True)
-    e.add_field(name="🛒 Sales / Trades", value=f"{sales} / {trades_done}",       inline=True)
-    e.add_field(name="🔥 Daily Streak",   value=f"{u.get('daily_streak', 0)} days", inline=True)
-    e.add_field(name="💼 Work Count",     value=f"{u.get('work_count', 0)} jobs",   inline=True)
+    e.add_field(name="🎟️ Credits",          value=f"{u['credits']:,}",              inline=True)
+    e.add_field(name="🏦 Bank",              value=f"{vb['balance']:,}",              inline=True)
+    e.add_field(name="🪙 Coins",             value=str(u['total_coins']),             inline=True)
+    e.add_field(name="⭐ Prestige",          value=f"{prestige_val} (×{pmult:.1f})",  inline=True)
+    e.add_field(name="📈 Portfolio",         value=f"${total_val:.4f}",               inline=True)
+    e.add_field(name="🏆 Best Coin",         value=f"${best['value']:.4f}" if best else "None", inline=True)
+    e.add_field(name=f"{rank_emoji} Job",    value=f"**{job_title}**",                inline=True)
+    e.add_field(name="💼 Jobs Worked",       value=f"{work_count}",                   inline=True)
+    e.add_field(name="🛒 Sales / Trades",    value=f"{sales} / {trades_done}",        inline=True)
     joined = u.get('joined_at')
     privacy_status = "🔓 Public" if u.get('inventory_public', False) else "🔒 Private"
     e.set_footer(text=f"Member since {joined.strftime('%Y-%m-%d') if joined else 'Unknown'} • Profile: {privacy_status}")
@@ -2743,11 +2886,11 @@ async def leaderboard(ctx):
     cur = conn.cursor()
     try:
         cur.execute("""
-            SELECT u.username, u.credits, u.total_coins, u.prestige,
+            SELECT u.username, u.credits, u.total_coins, u.prestige, u.work_count,
                    COALESCE(SUM(c.value), 0) as portfolio
             FROM users u
             LEFT JOIN coins c ON c.owner_id = u.user_id
-            GROUP BY u.user_id, u.username, u.credits, u.total_coins, u.prestige
+            GROUP BY u.user_id, u.username, u.credits, u.total_coins, u.prestige, u.work_count
             ORDER BY portfolio DESC
             LIMIT 10
         """)
@@ -2763,10 +2906,15 @@ async def leaderboard(ctx):
     e = discord.Embed(title="🏆 CoinVault — Top Collectors (by Portfolio)", color=0xFFD700)
     for i, r in enumerate(rows):
         prestige_val = r.get('prestige') or 0
-        star = f"⭐×{prestige_val}" if prestige_val else ""
+        work_count = r.get('work_count') or 0
+        rank_name, _, rank_emoji, _ = get_job_rank(work_count)
+        star = f" ⭐×{prestige_val}" if prestige_val else ""
         e.add_field(
-            name=f"{medals[i]} {r['username']} {star}",
-            value=f"Portfolio: **${float(r['portfolio']):.4f}** | Credits: **{r['credits']:,}** | Coins: **{r['total_coins']}**",
+            name=f"{medals[i]} {r['username']}{star}",
+            value=(
+                f"Portfolio: **${float(r['portfolio']):.4f}** | Credits: **{r['credits']:,}** | "
+                f"Coins: **{r['total_coins']}** | {rank_emoji} {rank_name}"
+            ),
             inline=False
         )
     if not rows:
@@ -2778,7 +2926,7 @@ async def richlist(ctx):
     conn = db()
     cur = conn.cursor()
     try:
-        cur.execute("SELECT username, credits, prestige FROM users ORDER BY credits DESC LIMIT 10")
+        cur.execute("SELECT username, credits, prestige, work_count FROM users ORDER BY credits DESC LIMIT 10")
         rows = cur.fetchall()
     finally:
         release(conn)
@@ -2787,10 +2935,12 @@ async def richlist(ctx):
     e = discord.Embed(title="💰 CoinVault — Credit Rich List", color=0x57F287)
     for i, r in enumerate(rows):
         prestige_val = r.get('prestige') or 0
+        work_count = r.get('work_count') or 0
+        rank_name, _, rank_emoji, _ = get_job_rank(work_count)
         star = f" ⭐×{prestige_val}" if prestige_val else ""
         e.add_field(
             name=f"{medals[i]} {r['username']}{star}",
-            value=f"**{r['credits']:,} credits**",
+            value=f"**{r['credits']:,} credits** | {rank_emoji} {rank_name}",
             inline=False
         )
     if not rows:
@@ -2857,7 +3007,6 @@ async def stats(ctx):
         )
         cs = cur.fetchone()
 
-        # ── FIXED: safe trades query using correct column names ────────────────
         try:
             cur.execute(
                 "SELECT COUNT(*) as c FROM trades WHERE (initiator_id=%s OR receiver_id=%s) AND status='completed'",
@@ -2887,25 +3036,40 @@ async def stats(ctx):
     finally:
         release(conn)
 
-    # Apply interest and get bank balance
     apply_bank_interest(uid)
     vb = get_user_bank(uid)
 
     prestige_val = safe_u.get('prestige') or 0
     pmult = prestige_multiplier(prestige_val)
     work_count = safe_u.get('work_count') or 0
-    next_pay = min(int(WORK_BASE * (WORK_MULTIPLIER ** work_count)), 5000)
+    rank_name, rank_salary, rank_emoji, rank_idx = get_job_rank(work_count)
+    job_title = JOB_TITLES.get(rank_name, rank_name)
+    prev_rank_min = JOB_RANKS[rank_idx][1]
+    jobs_in_rank = work_count - prev_rank_min
+    within_rank_mult = min(1.0 + (jobs_in_rank * 0.02), 1.5)
+    next_pay = int(rank_salary * within_rank_mult * pmult)
+
+    next_rank = get_next_job_rank(work_count)
+    if next_rank:
+        next_name, next_min, next_salary, next_emoji = next_rank
+        jobs_to_next = next_min - work_count
+        rank_progress = f"{rank_name} → {next_emoji} {next_name} in {jobs_to_next} job(s)"
+    else:
+        rank_progress = f"MAX RANK: {rank_name}"
 
     e = discord.Embed(title=f"📊 Stats — {ctx.author.display_name}", color=0x5865F2)
-    e.add_field(name="🎟️ Credits",        value=f"{safe_u['credits']:,}",             inline=True)
-    e.add_field(name="🏦 Bank Balance",    value=f"{vb['balance']:,}",                  inline=True)
-    e.add_field(name="💹 Total Earned",    value=f"{int(total_earned):,} credits",       inline=True)
-    e.add_field(name="⭐ Prestige",        value=f"{prestige_val} (×{pmult:.1f})",       inline=True)
-    e.add_field(name="🪙 Coins Owned",     value=str(int(cs['c']) if cs else 0),         inline=True)
+    e.add_field(name="🎟️ Credits",        value=f"{safe_u['credits']:,}",              inline=True)
+    e.add_field(name="🏦 Bank Balance",    value=f"{vb['balance']:,}",                   inline=True)
+    e.add_field(name="💹 Total Earned",    value=f"{int(total_earned):,} credits",        inline=True)
+    e.add_field(name="⭐ Prestige",        value=f"{prestige_val} (×{pmult:.1f})",        inline=True)
+    e.add_field(name="🪙 Coins Owned",     value=str(int(cs['c']) if cs else 0),          inline=True)
     e.add_field(name="📈 Portfolio Value", value=f"${float(cs['s']):.4f}" if cs else "$0.0000", inline=True)
-    e.add_field(name="🤝 Trades Done",     value=str(trades_done),                       inline=True)
+    e.add_field(name=f"{rank_emoji} Job Title", value=f"**{job_title}**",                inline=True)
+    e.add_field(name="💼 Work Count",      value=f"{work_count} jobs",                   inline=True)
+    e.add_field(name="💵 Next Pay",        value=f"~{next_pay:,} credits",               inline=True)
+    e.add_field(name="📊 Career Progress", value=rank_progress,                           inline=False)
+    e.add_field(name="🤝 Trades Done",     value=str(trades_done),                        inline=True)
     e.add_field(name="🔥 Daily Streak",    value=f"{safe_u.get('daily_streak', 0)} days", inline=True)
-    e.add_field(name="💼 Work Count",      value=f"{work_count} jobs (next: ~{next_pay:,} cr)", inline=True)
     if top_mats:
         e.add_field(
             name="🏅 Top Materials",
