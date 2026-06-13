@@ -146,6 +146,64 @@ WORK_ACTIONS = [
     "audited the bank ledgers",
 ]
 
+# ─── Market Price Fluctuation ─────────────────────────────────────────────────
+# Ranges (min_mult, max_mult) for random market prices, updated every 20 mins
+MATERIAL_PRICE_RANGES = {
+    "Plastic":  (0.4,   0.9),
+    "Wood":     (0.6,   0.9),
+    "Stone":    (0.8,   1.5),
+    "Bronze":   (1.0,   2.0),
+    "Copper":   (1.1,   2.3),
+    "Iron":     (1.3,   2.8),
+    "Steel":    (1.5,   3.0),
+    "Gold":     (2.5,   5.0),
+    "Aluminum": (1.5,   4.0),
+    "Carbon":   (1.5,   3.0),
+    "Tungsten": (2.0,   5.0),
+    "Obsidian": (2.3,   6.0),
+    "Topaz":    (2.1,   5.5),
+    "Diamond":  (5.0,  10.0),
+    "Amethyst": (10.0, 30.0),
+    "Plasma":   (100.0,250.0),
+}
+
+FLOAT_PRICE_RANGES = {
+    "Bad":      (0.3,  1.0),
+    "Good":     (0.7,  1.3),
+    "Great":    (1.6,  2.4),
+    "Amazing":  (2.5,  3.5),
+    "Heavenly": (10.0, 30.0),
+    "Godlike":  (25.0, 60.0),
+}
+
+# Current live market prices (updated every 20 mins)
+_market_prices = {
+    "materials": {},
+    "floats": {},
+    "last_updated": None,
+}
+
+def generate_market_prices():
+    """Generate new random market prices within defined ranges."""
+    mat = {}
+    for name, (lo, hi) in MATERIAL_PRICE_RANGES.items():
+        mat[name] = round(random.uniform(lo, hi), 4)
+    flt = {}
+    for name, (lo, hi) in FLOAT_PRICE_RANGES.items():
+        flt[name] = round(random.uniform(lo, hi), 4)
+    _market_prices["materials"] = mat
+    _market_prices["floats"] = flt
+    _market_prices["last_updated"] = datetime.now(timezone.utc)
+    print(f"✅ Market prices updated at {_market_prices['last_updated'].strftime('%H:%M UTC')}")
+
+def get_market_price(coin_row) -> float:
+    """Calculate a coin's current market value using live price multipliers."""
+    mat_mult = _market_prices["materials"].get(coin_row["material"], coin_row["mat_mult"])
+    flt_mult = _market_prices["floats"].get(coin_row["float"], coin_row["flt_mult"])
+    # Keep variant, status, serial mults from the coin itself
+    total = mat_mult * coin_row["var_mult"] * coin_row["sta_mult"] * flt_mult * coin_row["ser_mult"]
+    return round(coin_row["base_value"] * total, 4)
+
 def weighted_choice(table):
     weights = [1.0 / d for _, _, d in table]
     total = sum(weights)
@@ -222,7 +280,6 @@ def init_db():
     conn = db()
     cur = conn.cursor()
     
-    # First, check if coins table exists and has id column
     cur.execute("""
         SELECT EXISTS (
             SELECT FROM information_schema.tables 
@@ -232,7 +289,6 @@ def init_db():
     coins_exists = cur.fetchone()['exists']
     
     if coins_exists:
-        # Check if id column exists
         cur.execute("""
             SELECT EXISTS (
                 SELECT FROM information_schema.columns 
@@ -243,11 +299,8 @@ def init_db():
         
         if not id_exists:
             print("⚠️ coins table missing 'id' column! Adding it now...")
-            # Drop and recreate coins table - this will preserve data by backing it up
             try:
-                # Backup existing data
                 cur.execute("CREATE TABLE IF NOT EXISTS coins_backup AS SELECT * FROM coins")
-                # Drop old table
                 cur.execute("DROP TABLE coins CASCADE")
                 conn.commit()
                 print("✅ Dropped old coins table, creating new one...")
@@ -255,7 +308,6 @@ def init_db():
                 print(f"Table drop error: {e}")
                 conn.rollback()
     
-    # Create tables with full schema
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id       BIGINT PRIMARY KEY,
@@ -294,20 +346,17 @@ def init_db():
         )
     """)
     
-    # Restore backup data if exists
     try:
         cur.execute("SELECT COUNT(*) as c FROM coins_backup")
         backup_count = cur.fetchone()['c']
         if backup_count > 0:
             print(f"🔄 Restoring {backup_count} coins from backup...")
-            # Get column list from new table
             cur.execute("""
                 SELECT column_name FROM information_schema.columns 
                 WHERE table_name = 'coins' ORDER BY ordinal_position
             """)
             new_cols = [row['column_name'] for row in cur.fetchall()]
             col_list = ', '.join(new_cols)
-            
             cur.execute(f"""
                 INSERT INTO coins ({col_list})
                 SELECT {col_list} FROM coins_backup 
@@ -315,15 +364,12 @@ def init_db():
             """)
             conn.commit()
             print("✅ Backup data restored!")
-            
-            # Drop backup table
             cur.execute("DROP TABLE IF EXISTS coins_backup")
             conn.commit()
     except Exception as e:
         print(f"Backup restore notice: {e}")
         conn.rollback()
     
-    # Check and add missing columns to users table
     existing_user_cols = set()
     try:
         cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='users'")
@@ -351,7 +397,6 @@ def init_db():
                 conn.rollback()
                 print(f"User migration {col}: {e}")
     
-    # Create other tables
     cur.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id            SERIAL PRIMARY KEY,
@@ -410,7 +455,6 @@ def init_db():
     
     conn.commit()
     
-    # Verify the id column exists
     cur.execute("""
         SELECT EXISTS (
             SELECT FROM information_schema.columns 
@@ -451,7 +495,6 @@ def get_user(user_id: int):
         cur.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
         row = cur.fetchone()
         if row:
-            # Ensure all expected fields exist
             defaults = {
                 'credits': 0, 'last_msg_ts': 0, 'last_work_ts': 0, 'last_rob_ts': 0,
                 'prestige': 0, 'total_coins': 0, 'daily_streak': 0
@@ -542,6 +585,10 @@ async def on_message(message):
     await bot.process_commands(message)
 
 # ─── Background Tasks ─────────────────────────────────────────────────────────
+@tasks.loop(minutes=20)
+async def update_market_prices():
+    generate_market_prices()
+
 @tasks.loop(minutes=5)
 async def auction_checker():
     conn = db()
@@ -864,10 +911,13 @@ class CoinflipView(discord.ui.View):
 @bot.event
 async def on_ready():
     init_db()
+    generate_market_prices()  # Initialize prices on startup
     if not auction_checker.is_running():
         auction_checker.start()
     if not daily_bank_distribution.is_running():
         daily_bank_distribution.start()
+    if not update_market_prices.is_running():
+        update_market_prices.start()
     print(f"✅ CoinVault logged in as {bot.user}")
 
 @bot.event
@@ -897,6 +947,7 @@ async def help(ctx):
         "`-gamble <amount>` — Coinflip bet\n"
         "`-slots <amount>` — Spin the slot machine\n"
         "`-prestige` — Spend 5,000 credits to prestige (+10% all earnings)\n"
+        "`-cd` / `-cooldown` — Check your command cooldowns\n"
     ), inline=False)
     e.add_field(name="🛒 Shop", value=(
         "`-shop` — Browse the credit shop\n"
@@ -930,6 +981,12 @@ async def help(ctx):
         "`-richlist` — Top by credits held\n"
         "`-bank` — View bank treasury\n"
         "`-stats` — Your detailed stats\n"
+    ), inline=False)
+    e.add_field(name="📈 Market Prices", value=(
+        "`-prices` — Current market price multipliers\n"
+        "`-prices material` — Material price table\n"
+        "`-prices float` — Float price table\n"
+        "`-coinprice <coin_id>` — Live market price of a coin\n"
     ), inline=False)
     e.set_footer(text="Credits are the ONLY currency • Earn from messages, daily, work, gamble, trading & selling coins")
     await ctx.send(embed=e)
@@ -1247,6 +1304,196 @@ async def prestige(ctx):
     e.set_footer(text=f"Cost: {PRESTIGE_COST:,} credits • Half went to the bank treasury")
     await ctx.send(embed=e)
 
+# ─── Cooldown Command ──────────────────────────────────────────────────────────
+@bot.command(aliases=['cd'])
+async def cooldown(ctx):
+    uid = ctx.author.id
+    ensure_user(uid, str(ctx.author))
+    u = get_user(uid)
+    if not u:
+        await ctx.send("❌ Could not load your profile. Try again.")
+        return
+
+    now_ts = int(time.time())
+    now_dt = datetime.now(timezone.utc)
+
+    def fmt_remaining(last_ts, cooldown_h):
+        elapsed = now_ts - (last_ts or 0)
+        remaining = int(cooldown_h * 3600) - elapsed
+        if remaining <= 0:
+            return "✅ Ready!"
+        h, rem = divmod(remaining, 3600)
+        m = rem // 60
+        s = rem % 60
+        if h > 0:
+            return f"⏳ {h}h {m}m"
+        elif m > 0:
+            return f"⏳ {m}m {s}s"
+        else:
+            return f"⏳ {s}s"
+
+    # Work cooldown
+    work_status = fmt_remaining(u.get('last_work_ts') or 0, WORK_COOLDOWN_H)
+
+    # Rob cooldown
+    rob_status = fmt_remaining(u.get('last_rob_ts') or 0, ROB_COOLDOWN_H)
+
+    # Daily cooldown
+    last_daily = u.get('last_daily')
+    today = now_dt.date()
+    if not last_daily or last_daily < today:
+        daily_status = "✅ Ready!"
+    else:
+        tomorrow = datetime.combine(today + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+        diff = tomorrow - now_dt
+        h, rem = divmod(int(diff.total_seconds()), 3600)
+        m = rem // 60
+        daily_status = f"⏳ {h}h {m}m"
+
+    # Market price refresh
+    if _market_prices["last_updated"]:
+        next_update = _market_prices["last_updated"] + timedelta(minutes=20)
+        diff = next_update - now_dt
+        secs = int(diff.total_seconds())
+        if secs <= 0:
+            market_status = "🔄 Updating soon..."
+        else:
+            m, s = divmod(secs, 60)
+            market_status = f"🔄 {m}m {s}s"
+    else:
+        market_status = "🔄 Unknown"
+
+    e = discord.Embed(
+        title=f"⏱️ {ctx.author.display_name}'s Cooldowns",
+        color=0x5865F2
+    )
+    e.add_field(name="📅 Daily",         value=daily_status,  inline=True)
+    e.add_field(name="💼 Work",          value=work_status,   inline=True)
+    e.add_field(name="🦹 Rob",           value=rob_status,    inline=True)
+    e.add_field(name="🎰 Gamble/Slots",  value="✅ No CD",    inline=True)
+    e.add_field(name="📈 Market Prices", value=market_status, inline=True)
+    e.set_footer(text="Use -work, -daily, -rob to use these commands")
+    await ctx.send(embed=e)
+
+# ─── Market Prices Commands ───────────────────────────────────────────────────
+@bot.command()
+async def prices(ctx, category: str = "all"):
+    category = category.lower()
+
+    if _market_prices["last_updated"]:
+        now_dt = datetime.now(timezone.utc)
+        next_update = _market_prices["last_updated"] + timedelta(minutes=20)
+        diff = next_update - now_dt
+        secs = int(diff.total_seconds())
+        if secs > 0:
+            m, s = divmod(secs, 60)
+            next_str = f"Next update in **{m}m {s}s**"
+        else:
+            next_str = "Updating soon..."
+        last_str = _market_prices["last_updated"].strftime("%H:%M UTC")
+    else:
+        next_str = "Unknown"
+        last_str = "Not yet set"
+
+    if category in ("material", "materials", "mat"):
+        e = discord.Embed(title="📊 Live Material Market Prices", color=0xFFD700)
+        e.description = f"Updated: **{last_str}** • {next_str}\n\n"
+        lines = []
+        for mat, (lo, hi) in MATERIAL_PRICE_RANGES.items():
+            current = _market_prices["materials"].get(mat, 0)
+            # Trend arrow
+            mid = (lo + hi) / 2
+            arrow = "📈" if current > mid else "📉"
+            lines.append(f"{arrow} **{mat}**: `{current:.4f}×` *(range: {lo}–{hi}×)*")
+        e.description += "\n".join(lines)
+        e.set_footer(text="Prices update every 20 minutes • Use -coinprice <id> for a specific coin")
+        await ctx.send(embed=e)
+
+    elif category in ("float", "floats", "flt"):
+        e = discord.Embed(title="📊 Live Float Market Prices", color=0x5865F2)
+        e.description = f"Updated: **{last_str}** • {next_str}\n\n"
+        lines = []
+        for flt, (lo, hi) in FLOAT_PRICE_RANGES.items():
+            current = _market_prices["floats"].get(flt, 0)
+            mid = (lo + hi) / 2
+            arrow = "📈" if current > mid else "📉"
+            lines.append(f"{arrow} **{flt}**: `{current:.4f}×` *(range: {lo}–{hi}×)*")
+        e.description += "\n".join(lines)
+        e.set_footer(text="Prices update every 20 minutes • Use -coinprice <id> for a specific coin")
+        await ctx.send(embed=e)
+
+    else:
+        # Show summary of both
+        e = discord.Embed(title="📈 Live Market Prices", color=0xEB459E)
+        e.description = f"Last updated: **{last_str}** • {next_str}"
+
+        mat_lines = []
+        for mat, (lo, hi) in MATERIAL_PRICE_RANGES.items():
+            current = _market_prices["materials"].get(mat, 0)
+            mid = (lo + hi) / 2
+            arrow = "📈" if current > mid else "📉"
+            mat_lines.append(f"{arrow} **{mat}**: `{current:.3f}×`")
+        e.add_field(name="🪨 Materials", value="\n".join(mat_lines), inline=True)
+
+        flt_lines = []
+        for flt, (lo, hi) in FLOAT_PRICE_RANGES.items():
+            current = _market_prices["floats"].get(flt, 0)
+            mid = (lo + hi) / 2
+            arrow = "📈" if current > mid else "📉"
+            flt_lines.append(f"{arrow} **{flt}**: `{current:.3f}×`")
+        e.add_field(name="🌊 Floats", value="\n".join(flt_lines), inline=True)
+
+        e.set_footer(text="Use -prices material or -prices float for details • -coinprice <id> for a coin")
+        await ctx.send(embed=e)
+
+@bot.command()
+async def coinprice(ctx, coin_id: int):
+    """Check the live market price of a specific coin."""
+    conn = db()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT * FROM coins WHERE id = %s", (coin_id,))
+        c = cur.fetchone()
+    except Exception as ex:
+        print(f"coinprice error: {ex}")
+        await ctx.send("❌ An error occurred. Try again.")
+        return
+    finally:
+        release(conn)
+
+    if not c:
+        await ctx.send(f"❌ Coin #{coin_id} not found.")
+        return
+
+    market_val = get_market_price(c)
+    base_val = c['value']
+    diff = market_val - base_val
+    diff_pct = (diff / base_val * 100) if base_val > 0 else 0
+    arrow = "📈" if diff >= 0 else "📉"
+
+    mat_live = _market_prices["materials"].get(c['material'], c['mat_mult'])
+    flt_live = _market_prices["floats"].get(c['float'], c['flt_mult'])
+
+    tier = tier_emoji(market_val)
+    name = coin_name(c)
+    serial_str = str(c['serial']).zfill(4)
+
+    e = discord.Embed(title=f"{tier} Live Price — {name} #{serial_str}", color=0xFFD700)
+    e.add_field(name="📦 Base Value",    value=f"${base_val:.4f}",    inline=True)
+    e.add_field(name="📈 Market Value",  value=f"**${market_val:.4f}**", inline=True)
+    e.add_field(name=f"{arrow} Change",  value=f"{'+' if diff >= 0 else ''}{diff:.4f} ({diff_pct:+.1f}%)", inline=True)
+    e.add_field(name="🪨 Mat Price",     value=f"`{mat_live:.4f}×` (base: {c['mat_mult']}×)", inline=True)
+    e.add_field(name="🌊 Float Price",   value=f"`{flt_live:.4f}×` (base: {c['flt_mult']}×)", inline=True)
+
+    if _market_prices["last_updated"]:
+        now_dt = datetime.now(timezone.utc)
+        next_update = _market_prices["last_updated"] + timedelta(minutes=20)
+        diff_t = next_update - now_dt
+        secs = int(diff_t.total_seconds())
+        m, s = divmod(max(0, secs), 60)
+        e.set_footer(text=f"Prices refresh in {m}m {s}s • Market value ≠ sell value (sell uses base)")
+    await ctx.send(embed=e)
+
 @bot.command()
 async def shop(ctx):
     e = discord.Embed(title="🛒 CoinVault Shop", color=0xEB459E)
@@ -1266,7 +1513,6 @@ async def buy(ctx, item: str = None, *args):
     ensure_user(uid, str(ctx.author))
     item = item.lower()
 
-    # ── Crates ──
     if item in ("crate", "crate_x3", "crate_x5"):
         count_map = {"crate": 1, "crate_x3": 3, "crate_x5": 5}
         cost_map  = {"crate": 100, "crate_x3": 270, "crate_x5": 420}
@@ -1292,7 +1538,6 @@ async def buy(ctx, item: str = None, *args):
             opened = []
             for _ in range(n):
                 coin = generate_coin()
-                # Insert without RETURNING, then fetch the id separately
                 cur.execute("""
                     INSERT INTO coins (owner_id, material, variant, status, float, serial,
                                        base_value, mat_mult, var_mult, sta_mult, flt_mult,
@@ -1302,8 +1547,6 @@ async def buy(ctx, item: str = None, *args):
                       coin['serial'], coin['base_value'], coin['mat_mult'], coin['var_mult'],
                       coin['sta_mult'], coin['flt_mult'], coin['ser_mult'], coin['total_mult'],
                       coin['value']))
-                
-                # Get the last inserted id
                 cur.execute("SELECT lastval() as id")
                 coin['id'] = cur.fetchone()['id']
                 opened.append(coin)
@@ -1356,7 +1599,6 @@ async def buy(ctx, item: str = None, *args):
             await ctx.send(embed=e)
         return
 
-    # ── Polish ──
     if item == "polish":
         if not args:
             await ctx.send("❌ Usage: `-buy polish <coin_id>`")
@@ -1421,7 +1663,6 @@ async def buy(ctx, item: str = None, *args):
         await ctx.send(embed=e)
         return
 
-    # ── Rename ──
     if item == "rename":
         if len(args) < 2:
             await ctx.send("❌ Usage: `-buy rename <coin_id> <new name>`")
@@ -1534,6 +1775,7 @@ async def coin(ctx, coin_id: int):
     serial_str = str(c['serial']).zfill(4)
     tier = tier_emoji(c['value'])
     display_name = c.get('custom_name') or f"{c['variant']} {c['material']} Coin"
+    market_val = get_market_price(c)
 
     e = discord.Embed(title=f"{tier} Coin #{coin_id} — {display_name}", color=0xFFD700)
     e.add_field(name="Owner",    value=c['username'],   inline=True)
@@ -1549,8 +1791,9 @@ async def coin(ctx, coin_id: int):
     ), inline=True)
     e.add_field(name="💰 Valuation", value=(
         f"Base: **${c['base_value']:.2f}**\n"
-        f"Combined ×: **{c['total_mult']:.4f}**\n"
-        f"**Value: ${c['value']:.4f}**"
+        f"Stored ×: **{c['total_mult']:.4f}**\n"
+        f"**Base Value: ${c['value']:.4f}**\n"
+        f"**📈 Market: ${market_val:.4f}**"
     ), inline=True)
     await ctx.send(embed=e)
 
@@ -1810,14 +2053,16 @@ async def market(ctx, page: int = 1):
         cur.execute("SELECT COUNT(*) as c FROM auctions WHERE status = 'active'")
         total_row = cur.fetchone()
         total = total_row['c'] if total_row else 0
-        
+
         if total == 0:
             await ctx.send("🏪 No active auctions. List yours with `-auction <coin_id> <price>`.")
             return
-            
+
         cur.execute("""
             SELECT a.*, c.material, c.variant, c.status as cond, c.float, c.serial,
-                   c.value as coin_val, c.custom_name, u.username as seller_name
+                   c.base_value, c.mat_mult, c.var_mult, c.sta_mult, c.flt_mult,
+                   c.ser_mult, c.total_mult, c.value as coin_val, c.custom_name,
+                   u.username as seller_name
             FROM auctions a
             JOIN coins c ON c.id = a.coin_id
             JOIN users u ON u.user_id = a.seller_id
@@ -1842,27 +2087,44 @@ async def market(ctx, page: int = 1):
 
     pages = max(1, math.ceil(total / per_page))
     e = discord.Embed(title=f"🏪 Coin Marketplace — Page {page}/{pages}", color=0xEB459E)
-    e.description = f"**{total}** active listing(s)\n"
+
+    if _market_prices["last_updated"]:
+        now_dt = datetime.now(timezone.utc)
+        next_update = _market_prices["last_updated"] + timedelta(minutes=20)
+        diff = next_update - now_dt
+        secs = int(diff.total_seconds())
+        m, s = divmod(max(0, secs), 60)
+        e.description = f"**{total}** active listing(s) | 📈 Prices refresh in **{m}m {s}s**\n"
+    else:
+        e.description = f"**{total}** active listing(s)\n"
 
     for a in rows:
         serial_str = str(a['serial']).zfill(4)
-        tier = tier_emoji(a['coin_val'])
+        # Calculate live market price
+        market_val = get_market_price(a)
+        tier = tier_emoji(market_val)
         top_bid = f"{a['current_bid']:,} credits" if a['current_bid'] else "No bids"
         name = a.get('custom_name') or f"{a['variant']} {a['material']} Coin"
         ends_ts = a['ends_at']
         if ends_ts.tzinfo is None:
             ends_ts = ends_ts.replace(tzinfo=timezone.utc)
+
+        base_val = a['coin_val']
+        diff_pct = ((market_val - base_val) / base_val * 100) if base_val > 0 else 0
+        price_arrow = "📈" if diff_pct >= 0 else "📉"
+
         e.add_field(
             name=f"{tier} Auction #{a['id']} — {name} #{serial_str}",
             value=(
-                f"Cond: **{a['cond']}** | Float: **{a['float']}** | Coin Value: **${a['coin_val']:.4f}**\n"
+                f"Cond: **{a['cond']}** | Float: **{a['float']}**\n"
+                f"Base: **${base_val:.4f}** | {price_arrow} Market: **${market_val:.4f}** ({diff_pct:+.1f}%)\n"
                 f"Start: **{a['start_price']:,}** | Top Bid: **{top_bid}**\n"
                 f"Seller: {a['seller_name']} | Ends: <t:{int(ends_ts.timestamp())}:R>"
             ),
             inline=False
         )
 
-    e.set_footer(text="Use -bid <auction_id> to place a bid")
+    e.set_footer(text="Use -bid <auction_id> to place a bid • -prices to see full market data")
     await ctx.send(embed=e)
 
 @bot.command()
@@ -2106,26 +2368,42 @@ async def stats(ctx):
     try:
         cur.execute("SELECT * FROM users WHERE user_id = %s", (uid,))
         u = cur.fetchone()
+
+        if not u:
+            await ctx.send("❌ User not found.")
+            return
+
+        # Apply safe defaults for any missing fields
+        safe_u = dict(u)
+        for key, default in [('credits', 0), ('prestige', 0), ('total_coins', 0),
+                              ('daily_streak', 0), ('last_work_ts', 0), ('last_rob_ts', 0)]:
+            if safe_u.get(key) is None:
+                safe_u[key] = default
+
         cur.execute(
             "SELECT COUNT(*) as c, COALESCE(SUM(value),0) as s FROM coins WHERE owner_id = %s",
             (uid,)
         )
         cs = cur.fetchone()
+
         cur.execute(
             "SELECT COUNT(*) as c FROM trades WHERE (initiator_id=%s OR receiver_id=%s) AND status='completed'",
             (uid, uid)
         )
         trades_done = cur.fetchone()['c']
+
         cur.execute(
             "SELECT COALESCE(SUM(amount),0) as t FROM credit_log WHERE user_id=%s AND amount > 0",
             (uid,)
         )
         total_earned = cur.fetchone()['t']
+
         cur.execute(
             "SELECT material, COUNT(*) as c FROM coins WHERE owner_id=%s GROUP BY material ORDER BY c DESC LIMIT 3",
             (uid,)
         )
         top_mats = cur.fetchall()
+
     except Exception as ex:
         print(f"stats error: {ex}")
         await ctx.send("❌ An error occurred loading stats.")
@@ -2133,20 +2411,16 @@ async def stats(ctx):
     finally:
         release(conn)
 
-    if not u:
-        await ctx.send("❌ User not found.")
-        return
-
-    prestige_val = u.get('prestige') or 0
+    prestige_val = safe_u.get('prestige') or 0
     pmult = prestige_multiplier(prestige_val)
     e = discord.Embed(title=f"📊 Stats — {ctx.author.display_name}", color=0x5865F2)
-    e.add_field(name="🎟️ Credits",        value=f"{u['credits']:,}",          inline=True)
-    e.add_field(name="💹 Total Earned",    value=f"{total_earned:,} credits",   inline=True)
+    e.add_field(name="🎟️ Credits",        value=f"{safe_u['credits']:,}",        inline=True)
+    e.add_field(name="💹 Total Earned",    value=f"{int(total_earned):,} credits", inline=True)
     e.add_field(name="⭐ Prestige",        value=f"{prestige_val} (×{pmult:.1f})", inline=True)
-    e.add_field(name="🪙 Coins Owned",     value=str(cs['c'] or 0),             inline=True)
-    e.add_field(name="📈 Portfolio Value", value=f"${float(cs['s']):.4f}",       inline=True)
-    e.add_field(name="🤝 Trades Done",     value=str(trades_done),              inline=True)
-    e.add_field(name="🔥 Daily Streak",    value=f"{u.get('daily_streak', 0)} days", inline=True)
+    e.add_field(name="🪙 Coins Owned",     value=str(int(cs['c']) if cs else 0),   inline=True)
+    e.add_field(name="📈 Portfolio Value", value=f"${float(cs['s']):.4f}" if cs else "$0.0000", inline=True)
+    e.add_field(name="🤝 Trades Done",     value=str(trades_done),                inline=True)
+    e.add_field(name="🔥 Daily Streak",    value=f"{safe_u.get('daily_streak', 0)} days", inline=True)
     if top_mats:
         e.add_field(
             name="🏅 Top Materials",
