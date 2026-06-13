@@ -58,7 +58,7 @@ CREDITS_PER_MSG    = 1
 MSG_COOLDOWN_S     = 30
 DAILY_CREDITS      = 50
 DAILY_STREAK_BONUS = 5
-WORK_COOLDOWN_H    = 2              # ← reduced from 4h to 2h
+WORK_COOLDOWN_H    = 0.5
 WORK_BASE          = 20
 WORK_MULTIPLIER    = 1.1
 ROB_COOLDOWN_H     = 6
@@ -78,8 +78,10 @@ SHOP_ITEMS = {
     "crate_x5": {"cost": 420, "desc": "Open 5 crates at once (16% discount)"},
 }
 
+# ─── Admin ─────────────────────────────────────────────────────────────────────
+ADMIN_ID = 920309927375933490
+
 # ─── Job Rank System ──────────────────────────────────────────────────────────
-# Each rank: (name, min_work_count, base_salary, emoji)
 JOB_RANKS = [
     ("Intern",          0,    20,   "🟤"),
     ("Junior Worker",   5,    35,   "⚪"),
@@ -95,7 +97,6 @@ JOB_RANKS = [
     ("Coin Legend",     900,  2000, "🌌"),
 ]
 
-# Job-specific titles per rank (flavor text)
 JOB_TITLES = {
     "Intern":         "Coin Sorting Intern",
     "Junior Worker":  "Mint Floor Assistant",
@@ -112,7 +113,6 @@ JOB_TITLES = {
 }
 
 def get_job_rank(work_count: int) -> tuple:
-    """Return (rank_name, salary, emoji, rank_index) for current work_count."""
     current = JOB_RANKS[0]
     idx = 0
     for i, (name, min_wc, salary, emoji) in enumerate(JOB_RANKS):
@@ -124,11 +124,10 @@ def get_job_rank(work_count: int) -> tuple:
     return current[0], current[2], current[3], idx
 
 def get_next_job_rank(work_count: int):
-    """Return next rank info or None if at max."""
     _, _, _, idx = get_job_rank(work_count)
     if idx + 1 < len(JOB_RANKS):
         nxt = JOB_RANKS[idx + 1]
-        return nxt[0], nxt[1], nxt[2], nxt[3]  # name, min_wc, salary, emoji
+        return nxt[0], nxt[1], nxt[2], nxt[3]
     return None
 
 # ─── Coin Attribute Tables ────────────────────────────────────────────────────
@@ -235,9 +234,26 @@ FLOAT_PRICE_RANGES = {
     "Godlike":  (25.0, 60.0),
 }
 
+STATUS_PRICE_RANGES = {
+    "Broken":   (0.4,  0.6),
+    "Crushed":  (0.5,  0.7),
+    "Oxidized": (0.5,  1.0),
+    "Scratched":(0.7,  1.2),
+    "Old":      (0.8,  2.0),
+    "Like New": (0.8,  1.2),
+    "Normal":   (1.0,  2.0),
+    "New":      (1.25, 3.0),
+    "Sleek":    (1.5,  4.0),
+    "Shiny":    (1.75, 5.0),
+    "Modern":   (2.0,  6.0),
+    "Elegant":  (2.5,  8.0),
+    "Stunning": (2.75, 10.0),
+}
+
 _market_prices = {
     "materials": {},
     "floats": {},
+    "statuses": {},
     "last_updated": None,
 }
 
@@ -248,15 +264,33 @@ def generate_market_prices():
     flt = {}
     for name, (lo, hi) in FLOAT_PRICE_RANGES.items():
         flt[name] = round(random.uniform(lo, hi), 4)
+    sta = {}
+    for name, (lo, hi) in STATUS_PRICE_RANGES.items():
+        sta[name] = round(random.uniform(lo, hi), 4)
     _market_prices["materials"] = mat
-    _market_prices["floats"] = flt
+    _market_prices["floats"]    = flt
+    _market_prices["statuses"]  = sta
     _market_prices["last_updated"] = datetime.now(timezone.utc)
     print(f"✅ Market prices updated at {_market_prices['last_updated'].strftime('%H:%M UTC')}")
+
+def get_status_market_mult(coin_row) -> float:
+    status = coin_row.get("status", "Normal")
+    base_mult = _market_prices["statuses"].get(status, 1.0)
+    if status == "Old":
+        obtained = coin_row.get("obtained_at")
+        if obtained:
+            if obtained.tzinfo is None:
+                obtained = obtained.replace(tzinfo=timezone.utc)
+            age_days = (datetime.now(timezone.utc) - obtained).days
+            if age_days >= 30:
+                base_mult = round(random.uniform(2.0, 30.0), 4)
+    return base_mult
 
 def get_market_price(coin_row) -> float:
     mat_mult = _market_prices["materials"].get(coin_row["material"], coin_row["mat_mult"])
     flt_mult = _market_prices["floats"].get(coin_row["float"], coin_row["flt_mult"])
-    total = mat_mult * coin_row["var_mult"] * coin_row["sta_mult"] * flt_mult * coin_row["ser_mult"]
+    sta_mult = get_status_market_mult(coin_row)
+    total = mat_mult * coin_row["var_mult"] * sta_mult * flt_mult * coin_row["ser_mult"]
     return round(coin_row["base_value"] * total, 4)
 
 def weighted_choice(table):
@@ -301,6 +335,24 @@ def generate_coin():
         "total_mult": round(total_mult, 4), "value": final_value,
     }
 
+def coin_rarity_score(coin: dict) -> float:
+    return round(
+        coin.get("mat_mult", 1) +
+        coin.get("var_mult", 1) +
+        coin.get("sta_mult", 1) +
+        coin.get("flt_mult", 1) +
+        coin.get("ser_mult", 1),
+        4
+    )
+
+def rarity_label(score: float) -> str:
+    if score >= 150: return "🌌 Mythic"
+    if score >= 50:  return "👑 Legendary"
+    if score >= 20:  return "💎 Epic"
+    if score >= 10:  return "🔥 Rare"
+    if score >= 5:   return "⭐ Uncommon"
+    return "⚪ Common"
+
 def coin_name(coin_row):
     return coin_row.get('custom_name') or f"{coin_row['variant']} {coin_row['material']} Coin"
 
@@ -324,8 +376,9 @@ def tier_emoji(value: float):
     if value >= 1:   return "⚪"
     return "🟤"
 
+# ── FIXED: sell value is now ×1 (not ×100) ───────────────────────────────────
 def coin_value_to_credits(value: float) -> int:
-    return max(1, int(value * 100))
+    return max(1, int(value))
 
 def prestige_multiplier(prestige: int) -> float:
     return 1.0 + (prestige * 0.1)
@@ -517,6 +570,25 @@ def init_db():
             created_at    TIMESTAMP DEFAULT NOW()
         )
     """)
+
+    try:
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'trades'
+        """)
+        trade_cols_now = {row['column_name'] for row in cur.fetchall()}
+        if 'initiator_id' not in trade_cols_now:
+            cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS initiator_id BIGINT")
+            conn.commit()
+            print("✅ Added missing trades.initiator_id column")
+        if 'receiver_id' not in trade_cols_now:
+            cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS receiver_id BIGINT")
+            conn.commit()
+            print("✅ Added missing trades.receiver_id column")
+    except Exception as e:
+        conn.rollback()
+        print(f"trades column check: {e}")
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS auctions (
             id           SERIAL PRIMARY KEY,
@@ -1164,7 +1236,7 @@ async def help(ctx):
     e.add_field(name="💰 Economy (Credits)", value=(
         "`-balance` — Your credits & stats\n"
         "`-daily` — Claim daily credits (streak bonuses!)\n"
-        "`-work` — Work for credits (2h cooldown, pay grows with experience!)\n"
+        "`-work` — Work for credits (30min cooldown, pay grows with experience!)\n"
         "`-rob @user` — Attempt to rob someone (6h cooldown)\n"
         "`-gamble <amount>` — Coinflip bet\n"
         "`-slots <amount>` — Spin the slot machine\n"
@@ -1172,20 +1244,20 @@ async def help(ctx):
         "`-cd` / `-cooldown` — Check your command cooldowns\n"
     ), inline=False)
     e.add_field(name="💼 Job & Career", value=(
-        "`-work` — Work your job (2h cooldown)\n"
+        "`-work` — Work your job (30min cooldown)\n"
         "`-jobrank` — View your job rank, title & career progress\n"
         "`-jobladder` — See all job ranks and their salaries\n"
     ), inline=False)
     e.add_field(name="🏦 Virtual Bank", value=(
         "`-vbank` — View your virtual bank account (earns 1.05× every 10 min!)\n"
-        "`-deposit <amount>` — Move credits to virtual bank\n"
-        "`-withdraw <amount>` — Move credits out of virtual bank\n"
+        "`-deposit <amount|all>` — Move credits to virtual bank\n"
+        "`-withdraw <amount|all>` — Move credits out of virtual bank\n"
     ), inline=False)
     e.add_field(name="🛒 Shop", value=(
         "`-shop` — Browse the credit shop\n"
-        "`-buy crate` — 100 credits → open a crate (10% to bank)\n"
-        "`-buy crate_x3` — 270 credits → 3 crates\n"
-        "`-buy crate_x5` — 420 credits → 5 crates\n"
+        "`-buy crate [all]` — 100 credits → open a crate (10% to bank)\n"
+        "`-buy crate_x3 [all]` — 270 credits → 3 crates\n"
+        "`-buy crate_x5 [all]` — 420 credits → 5 crates\n"
         "`-buy polish <coin_id>` — 150 credits → upgrade coin status\n"
         "`-buy rename <coin_id> <name>` — 200 credits → rename coin\n"
     ), inline=False)
@@ -1193,7 +1265,7 @@ async def help(ctx):
         "`-inventory [page]` / `-inv` — View your coins\n"
         "`-inventory @user [page]` — View another user's coins (if public)\n"
         "`-coin <id>` — Detailed coin view with RAP\n"
-        "`-sell <coin_id>` — Sell coin for credits\n"
+        "`-sell <coin_id|all>` — Sell coin(s) for credits\n"
         "`-sellall` — Sell all coins (get credits)\n"
         "`-privacy on/off` — Toggle if others can see your inventory/wallet\n"
     ), inline=False)
@@ -1220,6 +1292,7 @@ async def help(ctx):
         "`-prices` — Current market price multipliers\n"
         "`-prices material` — Material price table\n"
         "`-prices float` — Float price table\n"
+        "`-prices status` — Status price table\n"
         "`-coinprice <coin_id>` — Live market price + RAP of a coin\n"
     ), inline=False)
     e.set_footer(text="Credits are the ONLY currency • Earn from messages, daily, work, gamble, trading & selling coins")
@@ -1314,26 +1387,29 @@ async def work(ctx):
         return
 
     now_ts = int(time.time())
-    cooldown_s = WORK_COOLDOWN_H * 3600
+    cooldown_s = int(WORK_COOLDOWN_H * 3600)
     elapsed = now_ts - (u.get('last_work_ts') or 0)
 
     if elapsed < cooldown_s:
         remaining = cooldown_s - elapsed
         h, rem = divmod(remaining, 3600)
         m = rem // 60
-        await ctx.send(f"⏳ You're tired! Work again in **{h}h {m}m**.")
+        s = rem % 60
+        if h > 0:
+            time_str = f"**{h}h {m}m**"
+        elif m > 0:
+            time_str = f"**{m}m {s}s**"
+        else:
+            time_str = f"**{s}s**"
+        await ctx.send(f"⏳ You're tired! Work again in {time_str}.")
         return
 
     work_count = u.get('work_count') or 0
-
-    # ─── Job rank-based salary system ────────────────────────────────────────
     rank_name, rank_salary, rank_emoji, rank_idx = get_job_rank(work_count)
     job_title = JOB_TITLES.get(rank_name, rank_name)
 
-    # Salary grows within a rank based on jobs done since last promotion
     prev_rank_min = JOB_RANKS[rank_idx][1]
     jobs_in_rank = work_count - prev_rank_min
-    # Small 2% growth per job within the rank, capped
     within_rank_mult = min(1.0 + (jobs_in_rank * 0.02), 1.5)
     base_pay = int(rank_salary * within_rank_mult)
     base_pay = min(base_pay, 5000)
@@ -1360,10 +1436,10 @@ async def work(ctx):
     finally:
         release(conn)
 
-    # Check if rank-up happened
     new_rank_name, new_rank_salary, new_rank_emoji, new_rank_idx = get_job_rank(new_work_count)
     ranked_up = new_rank_idx > rank_idx
 
+    cd_str = "30min"
     e = discord.Embed(title="💼 Work Complete!", color=0x57F287)
     e.description = f"{rank_emoji} **{job_title}** {ctx.author.display_name} {action} and earned **{earned:,} credits**!"
     e.add_field(name="📊 Job",          value=f"{rank_name} (Job #{new_work_count})", inline=True)
@@ -1371,14 +1447,13 @@ async def work(ctx):
     if prestige_val > 0:
         e.add_field(name="⭐ Prestige", value=f"×{prestige_multiplier(prestige_val):.1f}", inline=True)
 
-    # Show next rank progress
     next_rank = get_next_job_rank(new_work_count)
     if next_rank:
         next_name, next_min, next_salary, next_emoji = next_rank
         jobs_needed = next_min - new_work_count
-        e.set_footer(text=f"Next rank: {next_emoji} {next_name} in {jobs_needed} job(s) • Salary: {next_salary:,}/job • CD: {WORK_COOLDOWN_H}h")
+        e.set_footer(text=f"Next rank: {next_emoji} {next_name} in {jobs_needed} job(s) • Salary: {next_salary:,}/job • CD: {cd_str}")
     else:
-        e.set_footer(text=f"MAX RANK ACHIEVED: {rank_emoji} {rank_name} • CD: {WORK_COOLDOWN_H}h")
+        e.set_footer(text=f"MAX RANK ACHIEVED: {rank_emoji} {rank_name} • CD: {cd_str}")
 
     if ranked_up:
         new_title = JOB_TITLES.get(new_rank_name, new_rank_name)
@@ -1398,7 +1473,6 @@ async def work(ctx):
 
 @bot.command()
 async def jobrank(ctx, member: discord.Member = None):
-    """View your job rank and career progress."""
     target = member or ctx.author
     uid = target.id
     ensure_user(uid, str(target))
@@ -1417,10 +1491,7 @@ async def jobrank(ctx, member: discord.Member = None):
     within_rank_mult = min(1.0 + (jobs_in_rank * 0.02), 1.5)
     current_salary = int(rank_salary * within_rank_mult)
 
-    e = discord.Embed(
-        title=f"{rank_emoji} {target.display_name}'s Career",
-        color=0x5865F2
-    )
+    e = discord.Embed(title=f"{rank_emoji} {target.display_name}'s Career", color=0x5865F2)
     e.add_field(name="🏷️ Job Title",     value=f"**{job_title}**",                inline=True)
     e.add_field(name="📊 Rank",           value=f"**{rank_name}** (Tier {rank_idx + 1}/{len(JOB_RANKS)})", inline=True)
     e.add_field(name="💼 Jobs Worked",    value=f"**{work_count}** total",          inline=True)
@@ -1430,7 +1501,6 @@ async def jobrank(ctx, member: discord.Member = None):
     if next_rank:
         next_name, next_min, next_salary, next_emoji = next_rank
         jobs_needed = next_min - work_count
-        # Progress bar
         rank_total_jobs = next_min - prev_rank_min
         rank_done_jobs = work_count - prev_rank_min
         bar_filled = int((rank_done_jobs / rank_total_jobs) * 10)
@@ -1448,7 +1518,6 @@ async def jobrank(ctx, member: discord.Member = None):
 
 @bot.command()
 async def jobladder(ctx):
-    """View all job ranks and their salaries."""
     e = discord.Embed(title="💼 CoinVault Job Ladder", color=0xFFD700)
     e.description = "Work your way up from Intern to Coin Legend!\n\n"
     lines = []
@@ -1715,20 +1784,17 @@ async def cooldown(ctx):
     within_rank_mult = min(1.0 + (jobs_in_rank * 0.02), 1.5)
     next_pay = int(rank_salary * within_rank_mult * prestige_multiplier(u.get('prestige') or 0))
 
-    e = discord.Embed(
-        title=f"⏱️ {ctx.author.display_name}'s Cooldowns",
-        color=0x5865F2
-    )
+    e = discord.Embed(title=f"⏱️ {ctx.author.display_name}'s Cooldowns", color=0x5865F2)
     e.add_field(name="📅 Daily",          value=daily_status,                              inline=True)
     e.add_field(name="💼 Work",           value=work_status,                               inline=True)
     e.add_field(name="🦹 Rob",            value=rob_status,                                inline=True)
     e.add_field(name="🎰 Gamble/Slots",   value="✅ No CD",                               inline=True)
     e.add_field(name="📈 Market Prices",  value=market_status,                             inline=True)
     e.add_field(name=f"{rank_emoji} Next Work Pay", value=f"~{next_pay:,} credits ({rank_name})", inline=True)
-    e.set_footer(text="Use -work, -daily, -rob to use these commands")
+    e.set_footer(text="Work cooldown: 30 minutes")
     await ctx.send(embed=e)
 
-# ─── Virtual Bank Commands ─────────────────────────────────────────────────────
+# ─── Virtual Bank Commands ────────────────────────────────────────────────────
 @bot.command(aliases=['vb', 'mybank'])
 async def vbank(ctx):
     uid = ctx.author.id
@@ -1756,7 +1822,7 @@ async def vbank(ctx):
     e.add_field(name="⏰ Next Interest",   value=f"In **{m}m {s}s**",                     inline=True)
     if interest > 0:
         e.add_field(name="✅ Interest Earned", value=f"+**{interest:,} credits**",         inline=True)
-    e.set_footer(text="Use -deposit <amount> and -withdraw <amount> to manage your bank")
+    e.set_footer(text="Use -deposit <amount|all> and -withdraw <amount|all> to manage your bank")
     await ctx.send(embed=e)
 
 @bot.command()
@@ -1938,6 +2004,20 @@ async def prices(ctx, category: str = "all"):
         e.set_footer(text="Prices update every 20 minutes • Use -coinprice <id> for a specific coin")
         await ctx.send(embed=e)
 
+    elif category in ("status", "statuses", "sta", "condition"):
+        e = discord.Embed(title="📊 Live Status Market Prices", color=0xEB459E)
+        e.description = f"Updated: **{last_str}** • {next_str}\n\n"
+        lines = []
+        for sta, (lo, hi) in STATUS_PRICE_RANGES.items():
+            current = _market_prices["statuses"].get(sta, 1.0)
+            mid = (lo + hi) / 2
+            arrow = "📈" if current > mid else "📉"
+            note = " *(30d bonus: 2×–30×)*" if sta == "Old" else ""
+            lines.append(f"{arrow} **{sta}**: `{current:.4f}×` *(range: {lo}–{hi}×)*{note}")
+        e.description += "\n".join(lines)
+        e.set_footer(text="'Old' coins 30+ days old get a special 2×–30× bonus multiplier!")
+        await ctx.send(embed=e)
+
     else:
         e = discord.Embed(title="📈 Live Market Prices", color=0xEB459E)
         e.description = f"Last updated: **{last_str}** • {next_str}"
@@ -1958,7 +2038,15 @@ async def prices(ctx, category: str = "all"):
             flt_lines.append(f"{arrow} **{flt}**: `{current:.3f}×`")
         e.add_field(name="🌊 Floats", value="\n".join(flt_lines), inline=True)
 
-        e.set_footer(text="Use -prices material or -prices float for details • -coinprice <id> for a coin")
+        sta_lines = []
+        for sta, (lo, hi) in STATUS_PRICE_RANGES.items():
+            current = _market_prices["statuses"].get(sta, 1.0)
+            mid = (lo + hi) / 2
+            arrow = "📈" if current > mid else "📉"
+            sta_lines.append(f"{arrow} **{sta}**: `{current:.3f}×`")
+        e.add_field(name="🏷️ Statuses", value="\n".join(sta_lines), inline=True)
+
+        e.set_footer(text="Use -prices material / float / status for details • -coinprice <id> for a coin")
         await ctx.send(embed=e)
 
 @bot.command()
@@ -1987,6 +2075,7 @@ async def coinprice(ctx, coin_id: int):
 
     mat_live = _market_prices["materials"].get(c['material'], c['mat_mult'])
     flt_live = _market_prices["floats"].get(c['float'], c['flt_mult'])
+    sta_live = get_status_market_mult(c)
 
     tier = tier_emoji(market_val)
     name = coin_name(c)
@@ -2001,6 +2090,7 @@ async def coinprice(ctx, coin_id: int):
     e.add_field(name=f"{arrow} Change",  value=f"{'+' if diff >= 0 else ''}{diff:.4f} ({diff_pct:+.1f}%)", inline=True)
     e.add_field(name="🪨 Mat Price",     value=f"`{mat_live:.4f}×` (base: {c['mat_mult']}×)", inline=True)
     e.add_field(name="🌊 Float Price",   value=f"`{flt_live:.4f}×` (base: {c['flt_mult']}×)", inline=True)
+    e.add_field(name="🏷️ Status Price",  value=f"`{sta_live:.4f}×` ({c['status']})", inline=True)
 
     if rap is not None:
         rap_diff = rap - base_val
@@ -2038,7 +2128,7 @@ async def shop(ctx):
     e.description = "Spend your credits here!\n"
     for item, data in SHOP_ITEMS.items():
         e.add_field(name=f"`-buy {item}` — {data['cost']:,} credits", value=data['desc'], inline=False)
-    e.set_footer(text="Credits are earned by chatting, daily, work, gambling, and selling coins • Crate fee: 10% to bank")
+    e.set_footer(text="Use 'all' to buy as many as possible: -buy crate all • Crate fee: 10% to bank")
     await ctx.send(embed=e)
 
 @bot.command()
@@ -2054,27 +2144,39 @@ async def buy(ctx, item: str = None, *args):
     if item in ("crate", "crate_x3", "crate_x5"):
         count_map = {"crate": 1, "crate_x3": 3, "crate_x5": 5}
         cost_map  = {"crate": 100, "crate_x3": 270, "crate_x5": 420}
-        n    = count_map[item]
-        cost = cost_map[item]
+        n_per     = count_map[item]
+        unit_cost = cost_map[item]
 
         u = get_user(uid)
         if not u:
             await ctx.send("❌ Could not load your profile. Try again.")
             return
-        if u['credits'] < cost:
-            await ctx.send(f"❌ Need **{cost:,} credits**. You have **{u['credits']:,}**.")
+
+        repeat = 1
+        if args and args[0].lower() == 'all':
+            repeat = max(1, u['credits'] // unit_cost)
+            if repeat == 0:
+                await ctx.send(f"❌ Need at least **{unit_cost:,} credits**. You have **{u['credits']:,}**.")
+                return
+            repeat = min(repeat, 25)
+
+        total_cost = unit_cost * repeat
+        total_crates = n_per * repeat
+
+        if u['credits'] < total_cost:
+            await ctx.send(f"❌ Need **{total_cost:,} credits**. You have **{u['credits']:,}**.")
             return
 
-        bank_cut = max(1, int(cost * CRATE_FEE_PCT))
+        bank_cut = max(1, int(total_cost * CRATE_FEE_PCT))
         conn = db()
         cur = conn.cursor()
         try:
-            cur.execute("UPDATE users SET credits = credits - %s WHERE user_id = %s", (cost, uid))
+            cur.execute("UPDATE users SET credits = credits - %s WHERE user_id = %s", (total_cost, uid))
             cur.execute("UPDATE bank SET total = total + %s WHERE id=1", (bank_cut,))
             cur.execute("INSERT INTO bank_log (source,amount) VALUES ('crate_fee',%s)", (bank_cut,))
 
             opened = []
-            for _ in range(n):
+            for _ in range(total_crates):
                 coin = generate_coin()
                 cur.execute("""
                     INSERT INTO coins (owner_id, material, variant, status, float, serial,
@@ -2099,11 +2201,14 @@ async def buy(ctx, item: str = None, *args):
         finally:
             release(conn)
 
-        credits_left = u['credits'] - cost
-        if n == 1:
+        credits_left = u['credits'] - total_cost
+
+        if total_crates == 1:
             coin = opened[0]
             serial_str = str(coin['serial']).zfill(4)
             tier = tier_emoji(coin['value'])
+            rarity = coin_rarity_score(coin)
+            rlabel = rarity_label(rarity)
             e = discord.Embed(title=f"📦 Crate Opened! {tier}", color=0xFFD700)
             e.add_field(name="🪙 Coin",
                         value=f"**{coin['variant']} {coin['material']} Coin** `#{serial_str}`",
@@ -2120,20 +2225,37 @@ async def buy(ctx, item: str = None, *args):
                 f"Total ×: **{coin['total_mult']:.4f}**\n"
                 f"**Final: ${coin['value']:.4f}**"
             ), inline=True)
+            e.add_field(name="✨ Rarity", value=f"**{rlabel}** (score: {rarity:.2f})", inline=False)
             e.set_footer(text=f"Coin ID: #{coin['id']} • Credits left: {credits_left:,} • Bank received {bank_cut} credits (10% fee)")
             await ctx.send(embed=e)
         else:
-            e = discord.Embed(title=f"📦 {n} Crates Opened!", color=0xFFD700)
+            e = discord.Embed(title=f"📦 {total_crates} Crates Opened!", color=0xFFD700)
             lines = []
+            total_val = 0.0
+            total_rarity = 0.0
+            best_coin = max(opened, key=lambda c: c['value'])
             for c in opened:
                 tier = tier_emoji(c['value'])
+                rarity = coin_rarity_score(c)
+                total_rarity += rarity
+                total_val += c['value']
                 lines.append(
                     f"{tier} `#{c['id']}` **{c['variant']} {c['material']}** "
-                    f"#{str(c['serial']).zfill(4)} — **${c['value']:.4f}**"
+                    f"#{str(c['serial']).zfill(4)} — **${c['value']:.4f}** | {rarity_label(rarity)}"
                 )
             e.description = "\n".join(lines)
-            total_val = sum(c['value'] for c in opened)
-            e.set_footer(text=f"Total value: ${total_val:.4f} • Credits left: {credits_left:,} • Bank received {bank_cut} credits (10% fee)")
+            best_rarity = coin_rarity_score(best_coin)
+            e.add_field(
+                name="📊 Batch Summary",
+                value=(
+                    f"Total Value: **${total_val:.4f}**\n"
+                    f"Avg Rarity Score: **{total_rarity/len(opened):.2f}**\n"
+                    f"Best Coin: `#{best_coin['id']}` **{best_coin['variant']} {best_coin['material']}** — "
+                    f"${best_coin['value']:.4f} ({rarity_label(best_rarity)})"
+                ),
+                inline=False
+            )
+            e.set_footer(text=f"Credits left: {credits_left:,} • Bank received {bank_cut} credits (10% fee)")
             await ctx.send(embed=e)
         return
 
@@ -2246,7 +2368,6 @@ async def buy(ctx, item: str = None, *args):
 
 @bot.command(aliases=['inv'])
 async def inventory(ctx, *args):
-    """View inventory. Usage: -inv [page] or -inv @user [page]"""
     uid = ctx.author.id
     ensure_user(uid, str(ctx.author))
 
@@ -2307,7 +2428,6 @@ async def inventory(ctx, *args):
         release(conn)
 
     if not coins:
-        # ── SYNTAX FIX: no backslash inside f-string ─────────────────────────
         owner_str = "Your" if view_uid == uid else (view_name + "'s")
         if page > 1:
             await ctx.send(f"❌ No coins on page {page}.")
@@ -2358,6 +2478,8 @@ async def coin(ctx, coin_id: int):
     market_val   = get_market_price(c)
     rap          = get_coin_rap(coin_id)
     trade_hist   = get_coin_trade_history(coin_id)
+    rarity       = coin_rarity_score(c)
+    rlabel       = rarity_label(rarity)
 
     e = discord.Embed(title=f"{tier} Coin #{coin_id} — {display_name}", color=0xFFD700)
     e.add_field(name="Owner",    value=c['username'],   inline=True)
@@ -2377,6 +2499,7 @@ async def coin(ctx, coin_id: int):
         f"**Base Value: ${c['value']:.4f}**\n"
         f"**📈 Market: ${market_val:.4f}**"
     ), inline=True)
+    e.add_field(name="✨ Rarity", value=f"**{rlabel}** (score: {rarity:.2f})", inline=True)
 
     if rap is not None:
         e.add_field(name="💹 RAP", value=f"**{rap:,.2f} credits** (avg of trades)", inline=True)
@@ -2395,25 +2518,36 @@ async def coin(ctx, coin_id: int):
     await ctx.send(embed=e)
 
 @bot.command()
-async def sell(ctx, coin_id: int):
+async def sell(ctx, coin_id: str):
     uid = ctx.author.id
     ensure_user(uid, str(ctx.author))
+
+    if coin_id.lower() == 'all':
+        await sellall(ctx)
+        return
+
+    try:
+        cid = int(coin_id)
+    except ValueError:
+        await ctx.send("❌ Usage: `-sell <coin_id>` or `-sell all`")
+        return
+
     conn = db()
     cur = conn.cursor()
     try:
-        cur.execute("SELECT * FROM coins WHERE id = %s AND owner_id = %s", (coin_id, uid))
+        cur.execute("SELECT * FROM coins WHERE id = %s AND owner_id = %s", (cid, uid))
         c = cur.fetchone()
         if not c:
-            await ctx.send(f"❌ Coin #{coin_id} not found in your inventory.")
+            await ctx.send(f"❌ Coin #{cid} not found in your inventory.")
             return
 
-        cur.execute("SELECT id FROM auctions WHERE coin_id = %s AND status = 'active'", (coin_id,))
+        cur.execute("SELECT id FROM auctions WHERE coin_id = %s AND status = 'active'", (cid,))
         if cur.fetchone():
-            await ctx.send(f"❌ Coin #{coin_id} is in an active auction. Cancel it first.")
+            await ctx.send(f"❌ Coin #{cid} is in an active auction. Cancel it first.")
             return
 
         credits_earned = coin_value_to_credits(c['value'])
-        cur.execute("DELETE FROM coins WHERE id = %s", (coin_id,))
+        cur.execute("DELETE FROM coins WHERE id = %s", (cid,))
         cur.execute("UPDATE users SET credits = credits + %s WHERE user_id = %s", (credits_earned, uid))
         cur.execute("INSERT INTO credit_log (user_id, amount, reason) VALUES (%s,%s,'sell_coin')", (uid, credits_earned))
         sync_coin_count(uid, cur)
@@ -2658,6 +2792,7 @@ async def market(ctx, page: int = 1):
             SELECT a.*, c.material, c.variant, c.status as cond, c.float, c.serial,
                    c.base_value, c.mat_mult, c.var_mult, c.sta_mult, c.flt_mult,
                    c.ser_mult, c.total_mult, c.value as coin_val, c.custom_name,
+                   c.obtained_at,
                    u.username as seller_name
             FROM auctions a
             JOIN coins c ON c.id = a.coin_id
@@ -2711,10 +2846,12 @@ async def market(ctx, page: int = 1):
         rap = get_coin_rap(a['coin_id'])
         rap_str = f"RAP: **{rap:,.0f} cr**" if rap else "RAP: Raw"
 
+        sta_live = get_status_market_mult(a)
+
         e.add_field(
             name=f"{tier} Auction #{a['id']} — {name} #{serial_str}",
             value=(
-                f"Cond: **{a['cond']}** | Float: **{a['float']}**\n"
+                f"Cond: **{a['cond']}** (🏷️ `{sta_live:.3f}×`) | Float: **{a['float']}**\n"
                 f"Base: **${base_val:.4f}** | {price_arrow} Market: **${market_val:.4f}** ({diff_pct:+.1f}%) | {rap_str}\n"
                 f"Start: **{a['start_price']:,}** | Top Bid: **{top_bid}**\n"
                 f"Seller: {a['seller_name']} | Ends: <t:{int(ends_ts.timestamp())}:R>"
@@ -2722,7 +2859,7 @@ async def market(ctx, page: int = 1):
             inline=False
         )
 
-    e.set_footer(text="Use -bid <auction_id> to place a bid • -prices to see full market data")
+    e.set_footer(text="Use -bid <auction_id> to place a bid • -prices status to see status market data")
     await ctx.send(embed=e)
 
 @bot.command()
@@ -3007,13 +3144,16 @@ async def stats(ctx):
         )
         cs = cur.fetchone()
 
+        trades_done = 0
         try:
             cur.execute(
                 "SELECT COUNT(*) as c FROM trades WHERE (initiator_id=%s OR receiver_id=%s) AND status='completed'",
                 (uid, uid)
             )
-            trades_done = cur.fetchone()['c']
+            row = cur.fetchone()
+            trades_done = row['c'] if row else 0
         except Exception as te:
+            conn.rollback()
             print(f"stats trades query error: {te}")
             trades_done = 0
 
@@ -3031,6 +3171,7 @@ async def stats(ctx):
 
     except Exception as ex:
         print(f"stats error: {ex}")
+        conn.rollback()
         await ctx.send("❌ An error occurred loading stats.")
         return
     finally:
@@ -3078,5 +3219,52 @@ async def stats(ctx):
         )
     await ctx.send(embed=e)
 
+# ─── Admin Commands ───────────────────────────────────────────────────────────
+
+@bot.command(aliases=['removecredits', 'deduct'])
+async def rmcredits(ctx, member: discord.Member, amount: int):
+    if ctx.author.id != ADMIN_ID:
+        await ctx.send("❌ You don't have permission to use this command.")
+        return
+    if amount <= 0:
+        await ctx.send("❌ Amount must be positive.")
+        return
+
+    ensure_user(member.id, str(member))
+    u = get_user(member.id)
+    if not u:
+        await ctx.send("❌ User not found.")
+        return
+
+    actual = min(amount, u['credits'])
+    conn = db()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "UPDATE users SET credits = GREATEST(0, credits - %s) WHERE user_id = %s",
+            (amount, member.id)
+        )
+        cur.execute(
+            "INSERT INTO credit_log (user_id, amount, reason) VALUES (%s, %s, 'admin_deduct')",
+            (member.id, -actual)
+        )
+        conn.commit()
+    except Exception as ex:
+        conn.rollback()
+        print(f"rmcredits error: {ex}")
+        await ctx.send("❌ An error occurred. Try again.")
+        return
+    finally:
+        release(conn)
+
+    u_after = get_user(member.id)
+    e = discord.Embed(title="🛠️ Admin: Credits Removed", color=discord.Color.orange())
+    e.add_field(name="👤 User",        value=str(member),                            inline=True)
+    e.add_field(name="➖ Removed",     value=f"**{actual:,} credits**",               inline=True)
+    e.add_field(name="💳 New Balance", value=f"**{u_after['credits']:,} credits**",   inline=True)
+    await ctx.send(embed=e)
+
 # ─── Run ──────────────────────────────────────────────────────────────────────
 bot.run(TOKEN)
+ENDOFFILE
+echo "Done"
