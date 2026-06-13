@@ -51,7 +51,7 @@ def release(conn):
 
 # ─── Game Constants ────────────────────────────────────────────────────────────
 CRATE_COST         = 100
-CRATE_FEE_PCT      = 0.05
+CRATE_FEE_PCT      = 0.10          # increased to 10%
 TRADE_TAX_PCT      = 0.05
 MARKET_FEE_PCT     = 0.08
 CREDITS_PER_MSG    = 1
@@ -59,14 +59,16 @@ MSG_COOLDOWN_S     = 30
 DAILY_CREDITS      = 50
 DAILY_STREAK_BONUS = 5
 WORK_COOLDOWN_H    = 4
-WORK_MIN           = 10
-WORK_MAX           = 40
+WORK_BASE          = 20            # base work payout
+WORK_MULTIPLIER    = 1.1           # each successful work multiplies earnings
 ROB_COOLDOWN_H     = 6
 ROB_SUCCESS_PCT    = 0.40
 ROB_MAX_STEAL_PCT  = 0.20
 ROB_FINE_PCT       = 0.15
 GAMBLE_MIN         = 10
 PRESTIGE_COST      = 5000
+BANK_INTEREST_PCT  = 0.05         # 5% per 10 minutes (1.05x)
+BANK_INTEREST_MINS = 10
 
 SHOP_ITEMS = {
     "rename":   {"cost": 200, "desc": "Rename one of your coins (cosmetic only)"},
@@ -147,7 +149,6 @@ WORK_ACTIONS = [
 ]
 
 # ─── Market Price Fluctuation ─────────────────────────────────────────────────
-# Ranges (min_mult, max_mult) for random market prices, updated every 20 mins
 MATERIAL_PRICE_RANGES = {
     "Plastic":  (0.4,   0.9),
     "Wood":     (0.6,   0.9),
@@ -176,7 +177,6 @@ FLOAT_PRICE_RANGES = {
     "Godlike":  (25.0, 60.0),
 }
 
-# Current live market prices (updated every 20 mins)
 _market_prices = {
     "materials": {},
     "floats": {},
@@ -184,7 +184,6 @@ _market_prices = {
 }
 
 def generate_market_prices():
-    """Generate new random market prices within defined ranges."""
     mat = {}
     for name, (lo, hi) in MATERIAL_PRICE_RANGES.items():
         mat[name] = round(random.uniform(lo, hi), 4)
@@ -197,10 +196,8 @@ def generate_market_prices():
     print(f"✅ Market prices updated at {_market_prices['last_updated'].strftime('%H:%M UTC')}")
 
 def get_market_price(coin_row) -> float:
-    """Calculate a coin's current market value using live price multipliers."""
     mat_mult = _market_prices["materials"].get(coin_row["material"], coin_row["mat_mult"])
     flt_mult = _market_prices["floats"].get(coin_row["float"], coin_row["flt_mult"])
-    # Keep variant, status, serial mults from the coin itself
     total = mat_mult * coin_row["var_mult"] * coin_row["sta_mult"] * flt_mult * coin_row["ser_mult"]
     return round(coin_row["base_value"] * total, 4)
 
@@ -279,24 +276,24 @@ def prestige_multiplier(prestige: int) -> float:
 def init_db():
     conn = db()
     cur = conn.cursor()
-    
+
     cur.execute("""
         SELECT EXISTS (
-            SELECT FROM information_schema.tables 
+            SELECT FROM information_schema.tables
             WHERE table_name = 'coins'
         )
     """)
     coins_exists = cur.fetchone()['exists']
-    
+
     if coins_exists:
         cur.execute("""
             SELECT EXISTS (
-                SELECT FROM information_schema.columns 
+                SELECT FROM information_schema.columns
                 WHERE table_name = 'coins' AND column_name = 'id'
             )
         """)
         id_exists = cur.fetchone()['exists']
-        
+
         if not id_exists:
             print("⚠️ coins table missing 'id' column! Adding it now...")
             try:
@@ -307,7 +304,7 @@ def init_db():
             except Exception as e:
                 print(f"Table drop error: {e}")
                 conn.rollback()
-    
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id       BIGINT PRIMARY KEY,
@@ -320,10 +317,12 @@ def init_db():
             last_rob_ts   BIGINT DEFAULT 0,
             prestige      INT DEFAULT 0,
             total_coins   INT DEFAULT 0,
+            work_count    INT DEFAULT 0,
+            inventory_public BOOLEAN DEFAULT FALSE,
             joined_at     TIMESTAMP DEFAULT NOW()
         )
     """)
-    
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS coins (
             id          SERIAL PRIMARY KEY,
@@ -345,21 +344,42 @@ def init_db():
             obtained_at TIMESTAMP DEFAULT NOW()
         )
     """)
-    
+
+    # ─── Virtual Bank Account table ────────────────────────────────────────────
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_bank (
+            user_id       BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+            balance       BIGINT DEFAULT 0,
+            last_interest TIMESTAMP DEFAULT NOW()
+        )
+    """)
+
+    # ─── Coin RAP (Recent Average Price) tracking ──────────────────────────────
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS coin_trades (
+            id          SERIAL PRIMARY KEY,
+            coin_id     INT,
+            seller_id   BIGINT,
+            buyer_id    BIGINT,
+            price       INT NOT NULL,
+            traded_at   TIMESTAMP DEFAULT NOW()
+        )
+    """)
+
     try:
         cur.execute("SELECT COUNT(*) as c FROM coins_backup")
         backup_count = cur.fetchone()['c']
         if backup_count > 0:
             print(f"🔄 Restoring {backup_count} coins from backup...")
             cur.execute("""
-                SELECT column_name FROM information_schema.columns 
+                SELECT column_name FROM information_schema.columns
                 WHERE table_name = 'coins' ORDER BY ordinal_position
             """)
             new_cols = [row['column_name'] for row in cur.fetchall()]
             col_list = ', '.join(new_cols)
             cur.execute(f"""
                 INSERT INTO coins ({col_list})
-                SELECT {col_list} FROM coins_backup 
+                SELECT {col_list} FROM coins_backup
                 WHERE owner_id IN (SELECT user_id FROM users)
             """)
             conn.commit()
@@ -369,14 +389,15 @@ def init_db():
     except Exception as e:
         print(f"Backup restore notice: {e}")
         conn.rollback()
-    
+
+    # ─── Migrate existing users table columns ─────────────────────────────────
     existing_user_cols = set()
     try:
         cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='users'")
         existing_user_cols = {row['column_name'] for row in cur.fetchall()}
     except:
         pass
-    
+
     user_columns = [
         ("last_msg_ts", "BIGINT DEFAULT 0"),
         ("last_work_ts", "BIGINT DEFAULT 0"),
@@ -386,8 +407,10 @@ def init_db():
         ("daily_streak", "INT DEFAULT 0"),
         ("joined_at", "TIMESTAMP DEFAULT NOW()"),
         ("credits", "INT DEFAULT 0"),
+        ("work_count", "INT DEFAULT 0"),
+        ("inventory_public", "BOOLEAN DEFAULT FALSE"),
     ]
-    
+
     for col, col_def in user_columns:
         if col not in existing_user_cols:
             try:
@@ -396,7 +419,41 @@ def init_db():
             except Exception as e:
                 conn.rollback()
                 print(f"User migration {col}: {e}")
-    
+
+    # ─── Fix trades table — ensure correct column names ────────────────────────
+    cur.execute("""
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables
+            WHERE table_name = 'trades'
+        )
+    """)
+    trades_exists = cur.fetchone()['exists']
+
+    if trades_exists:
+        # Check if old schema uses wrong column names and fix
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_name = 'trades'
+        """)
+        trade_cols = {row['column_name'] for row in cur.fetchall()}
+        # Rename legacy columns if present
+        if 'from_user' in trade_cols and 'initiator_id' not in trade_cols:
+            try:
+                cur.execute("ALTER TABLE trades RENAME COLUMN from_user TO initiator_id")
+                conn.commit()
+                print("✅ Renamed trades.from_user → initiator_id")
+            except Exception as e:
+                conn.rollback()
+                print(f"Trade migration: {e}")
+        if 'to_user' in trade_cols and 'receiver_id' not in trade_cols:
+            try:
+                cur.execute("ALTER TABLE trades RENAME COLUMN to_user TO receiver_id")
+                conn.commit()
+                print("✅ Renamed trades.to_user → receiver_id")
+            except Exception as e:
+                conn.rollback()
+                print(f"Trade migration: {e}")
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id            SERIAL PRIMARY KEY,
@@ -452,12 +509,12 @@ def init_db():
             logged_at TIMESTAMP DEFAULT NOW()
         )
     """)
-    
+
     conn.commit()
-    
+
     cur.execute("""
         SELECT EXISTS (
-            SELECT FROM information_schema.columns 
+            SELECT FROM information_schema.columns
             WHERE table_name = 'coins' AND column_name = 'id'
         )
     """)
@@ -466,7 +523,7 @@ def init_db():
         print("✅ coins.id column verified!")
     else:
         print("❌ CRITICAL: coins.id column still missing!")
-    
+
     release(conn)
     print("✅ Database initialized!")
 
@@ -477,10 +534,16 @@ def ensure_user(user_id: int, username: str):
     try:
         cur.execute("""
             INSERT INTO users (user_id, username, credits, last_msg_ts, daily_streak,
-                               last_work_ts, last_rob_ts, prestige, total_coins)
-            VALUES (%s, %s, 0, 0, 0, 0, 0, 0, 0)
+                               last_work_ts, last_rob_ts, prestige, total_coins, work_count, inventory_public)
+            VALUES (%s, %s, 0, 0, 0, 0, 0, 0, 0, 0, FALSE)
             ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username
         """, (user_id, username))
+        # Ensure bank account exists
+        cur.execute("""
+            INSERT INTO user_bank (user_id, balance, last_interest)
+            VALUES (%s, 0, NOW())
+            ON CONFLICT (user_id) DO NOTHING
+        """, (user_id,))
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -497,7 +560,8 @@ def get_user(user_id: int):
         if row:
             defaults = {
                 'credits': 0, 'last_msg_ts': 0, 'last_work_ts': 0, 'last_rob_ts': 0,
-                'prestige': 0, 'total_coins': 0, 'daily_streak': 0
+                'prestige': 0, 'total_coins': 0, 'daily_streak': 0, 'work_count': 0,
+                'inventory_public': False,
             }
             for key, val in defaults.items():
                 if key not in row or row[key] is None:
@@ -559,6 +623,108 @@ def get_portfolio_value(uid: int) -> float:
     finally:
         release(conn)
 
+def get_user_bank(user_id: int) -> dict:
+    """Get user's virtual bank account, applying interest first."""
+    conn = db()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT * FROM user_bank WHERE user_id = %s", (user_id,))
+        row = cur.fetchone()
+        if not row:
+            cur.execute("""
+                INSERT INTO user_bank (user_id, balance, last_interest)
+                VALUES (%s, 0, NOW()) ON CONFLICT DO NOTHING
+            """, (user_id,))
+            conn.commit()
+            return {"balance": 0, "last_interest": datetime.now(timezone.utc)}
+        return dict(row)
+    except Exception as e:
+        print(f"get_user_bank error: {e}")
+        return {"balance": 0, "last_interest": datetime.now(timezone.utc)}
+    finally:
+        release(conn)
+
+def apply_bank_interest(user_id: int) -> int:
+    """Apply interest to user's bank balance. Returns interest earned."""
+    conn = db()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT * FROM user_bank WHERE user_id = %s", (user_id,))
+        row = cur.fetchone()
+        if not row or row['balance'] <= 0:
+            return 0
+
+        now = datetime.now(timezone.utc)
+        last = row['last_interest']
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+
+        elapsed_mins = (now - last).total_seconds() / 60
+        periods = int(elapsed_mins // BANK_INTEREST_MINS)
+
+        if periods <= 0:
+            return 0
+
+        old_balance = row['balance']
+        new_balance = int(old_balance * (1 + BANK_INTEREST_PCT) ** periods)
+        interest = new_balance - old_balance
+
+        cur.execute("""
+            UPDATE user_bank SET balance = %s, last_interest = %s WHERE user_id = %s
+        """, (new_balance, now, user_id))
+        conn.commit()
+        return interest
+    except Exception as e:
+        conn.rollback()
+        print(f"apply_bank_interest error: {e}")
+        return 0
+    finally:
+        release(conn)
+
+def get_coin_rap(coin_id: int) -> float | None:
+    """Calculate Recent Average Price for a coin based on trade history."""
+    conn = db()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT AVG(price) as rap FROM coin_trades
+            WHERE coin_id = %s
+            ORDER BY traded_at DESC
+            LIMIT 10
+        """, (coin_id,))
+        row = cur.fetchone()
+        if row and row['rap'] is not None:
+            return round(float(row['rap']), 2)
+        return None
+    except Exception as e:
+        print(f"get_coin_rap error: {e}")
+        return None
+    finally:
+        release(conn)
+
+def get_coin_trade_history(coin_id: int) -> list:
+    """Get recent trade history for a coin."""
+    conn = db()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT ct.*, 
+                   us.username as seller_name,
+                   ub.username as buyer_name
+            FROM coin_trades ct
+            LEFT JOIN users us ON us.user_id = ct.seller_id
+            LEFT JOIN users ub ON ub.user_id = ct.buyer_id
+            WHERE ct.coin_id = %s
+            ORDER BY ct.traded_at DESC
+            LIMIT 5
+        """, (coin_id,))
+        return cur.fetchall()
+    except Exception as e:
+        print(f"get_coin_trade_history error: {e}")
+        return []
+    finally:
+        release(conn)
+
 # ─── Spam Prevention ──────────────────────────────────────────────────────────
 MSG_COOLDOWNS = {}
 
@@ -612,6 +778,11 @@ async def auction_checker():
                 cur.execute("UPDATE users SET credits = credits + %s WHERE user_id = %s", (seller_net, seller_id))
                 cur.execute("UPDATE bank SET total = total + %s WHERE id = 1", (fee,))
                 cur.execute("INSERT INTO bank_log (source, amount) VALUES (%s,%s)", (f"auction_fee:{a['id']}", fee))
+                # Record trade for RAP
+                cur.execute("""
+                    INSERT INTO coin_trades (coin_id, seller_id, buyer_id, price)
+                    VALUES (%s, %s, %s, %s)
+                """, (coin_id, seller_id, winner_id, sale_price))
                 sync_coin_count(winner_id, cur)
                 sync_coin_count(seller_id, cur)
                 cur.execute("UPDATE auctions SET status = 'sold' WHERE id = %s", (a['id'],))
@@ -749,6 +920,12 @@ class TradeView(discord.ui.View):
 
             if coin_ids:
                 cur.execute("UPDATE coins SET owner_id = %s WHERE id = ANY(%s)", (trade['receiver_id'], coin_ids))
+                # Record coin trades for RAP
+                for cid in coin_ids:
+                    cur.execute("""
+                        INSERT INTO coin_trades (coin_id, seller_id, buyer_id, price)
+                        VALUES (%s, %s, %s, %s)
+                    """, (cid, trade['initiator_id'], trade['receiver_id'], credits_offer // len(coin_ids) if coin_ids else 0))
 
             if credits_offer > 0:
                 tax = int(round(credits_offer * TRADE_TAX_PCT))
@@ -911,7 +1088,7 @@ class CoinflipView(discord.ui.View):
 @bot.event
 async def on_ready():
     init_db()
-    generate_market_prices()  # Initialize prices on startup
+    generate_market_prices()
     if not auction_checker.is_running():
         auction_checker.start()
     if not daily_bank_distribution.is_running():
@@ -942,16 +1119,21 @@ async def help(ctx):
     e.add_field(name="💰 Economy (Credits)", value=(
         "`-balance` — Your credits & stats\n"
         "`-daily` — Claim daily credits (streak bonuses!)\n"
-        "`-work` — Work for credits (4h cooldown)\n"
+        "`-work` — Work for credits (4h cooldown, pay grows with experience!)\n"
         "`-rob @user` — Attempt to rob someone (6h cooldown)\n"
         "`-gamble <amount>` — Coinflip bet\n"
         "`-slots <amount>` — Spin the slot machine\n"
         "`-prestige` — Spend 5,000 credits to prestige (+10% all earnings)\n"
         "`-cd` / `-cooldown` — Check your command cooldowns\n"
     ), inline=False)
+    e.add_field(name="🏦 Virtual Bank", value=(
+        "`-vbank` — View your virtual bank account (earns 1.05× every 10 min!)\n"
+        "`-deposit <amount>` — Move credits to virtual bank\n"
+        "`-withdraw <amount>` — Move credits out of virtual bank\n"
+    ), inline=False)
     e.add_field(name="🛒 Shop", value=(
         "`-shop` — Browse the credit shop\n"
-        "`-buy crate` — 100 credits → open a crate\n"
+        "`-buy crate` — 100 credits → open a crate (10% to bank)\n"
         "`-buy crate_x3` — 270 credits → 3 crates\n"
         "`-buy crate_x5` — 420 credits → 5 crates\n"
         "`-buy polish <coin_id>` — 150 credits → upgrade coin status\n"
@@ -959,9 +1141,11 @@ async def help(ctx):
     ), inline=False)
     e.add_field(name="🎒 Inventory", value=(
         "`-inventory [page]` / `-inv` — View your coins\n"
-        "`-coin <id>` — Detailed coin view\n"
+        "`-inventory @user [page]` — View another user's coins (if they allow it)\n"
+        "`-coin <id>` — Detailed coin view with RAP\n"
         "`-sell <coin_id>` — Sell coin for credits\n"
         "`-sellall` — Sell all coins (get credits)\n"
+        "`-privacy on/off` — Toggle if others can see your inventory/wallet\n"
     ), inline=False)
     e.add_field(name="🤝 Trading", value=(
         "`-trade @user [coin_ids] [credits:<amount>]` — Offer trade\n"
@@ -986,7 +1170,7 @@ async def help(ctx):
         "`-prices` — Current market price multipliers\n"
         "`-prices material` — Material price table\n"
         "`-prices float` — Float price table\n"
-        "`-coinprice <coin_id>` — Live market price of a coin\n"
+        "`-coinprice <coin_id>` — Live market price + RAP of a coin\n"
     ), inline=False)
     e.set_footer(text="Credits are the ONLY currency • Earn from messages, daily, work, gamble, trading & selling coins")
     await ctx.send(embed=e)
@@ -1003,13 +1187,15 @@ async def balance(ctx):
     portfolio = get_portfolio_value(uid)
     prestige_val = u.get('prestige') or 0
     pmult = prestige_multiplier(prestige_val)
+    vbank = get_user_bank(uid)
 
     e = discord.Embed(title=f"💳 {ctx.author.display_name}'s Balance", color=0x57F287)
-    e.add_field(name="🎟️ Credits",        value=f"**{u['credits']:,}**",                   inline=True)
-    e.add_field(name="🪙 Coins Owned",     value=f"**{u['total_coins']}**",                  inline=True)
-    e.add_field(name="📈 Portfolio Value", value=f"**${portfolio:.4f}**",                    inline=True)
-    e.add_field(name="⭐ Prestige",        value=f"**{prestige_val}** (×{pmult:.1f} earnings)", inline=True)
-    e.add_field(name="🔥 Daily Streak",    value=f"**{u.get('daily_streak', 0)}** days",     inline=True)
+    e.add_field(name="🎟️ Credits",        value=f"**{u['credits']:,}**",                       inline=True)
+    e.add_field(name="🏦 Bank Balance",    value=f"**{vbank['balance']:,}** credits",             inline=True)
+    e.add_field(name="🪙 Coins Owned",     value=f"**{u['total_coins']}**",                       inline=True)
+    e.add_field(name="📈 Portfolio Value", value=f"**${portfolio:.4f}**",                         inline=True)
+    e.add_field(name="⭐ Prestige",        value=f"**{prestige_val}** (×{pmult:.1f} earnings)",    inline=True)
+    e.add_field(name="🔥 Daily Streak",    value=f"**{u.get('daily_streak', 0)}** days",           inline=True)
     await ctx.send(embed=e)
 
 @bot.command()
@@ -1086,17 +1272,23 @@ async def work(ctx):
         await ctx.send(f"⏳ You're tired! Work again in **{h}h {m}m**.")
         return
 
-    earned = random.randint(WORK_MIN, WORK_MAX)
+    # ─── Progressive pay system ───────────────────────────────────────────────
+    work_count = u.get('work_count') or 0
+    base_pay = int(WORK_BASE * (WORK_MULTIPLIER ** work_count))
+    # Cap at a reasonable max so it doesn't explode
+    base_pay = min(base_pay, 5000)
+
     prestige_val = u.get('prestige') or 0
-    earned = int(earned * prestige_multiplier(prestige_val))
+    earned = int(base_pay * prestige_multiplier(prestige_val))
     action = random.choice(WORK_ACTIONS)
+    new_work_count = work_count + 1
 
     conn = db()
     cur = conn.cursor()
     try:
         cur.execute(
-            "UPDATE users SET credits = credits + %s, last_work_ts = %s WHERE user_id = %s",
-            (earned, now_ts, uid)
+            "UPDATE users SET credits = credits + %s, last_work_ts = %s, work_count = %s WHERE user_id = %s",
+            (earned, now_ts, new_work_count, uid)
         )
         cur.execute("INSERT INTO credit_log (user_id, amount, reason) VALUES (%s,%s,'work')", (uid, earned))
         conn.commit()
@@ -1110,7 +1302,14 @@ async def work(ctx):
 
     e = discord.Embed(title="💼 Work Complete!", color=0x57F287)
     e.description = f"{ctx.author.display_name} {action} and earned **{earned:,} credits**!"
-    e.set_footer(text=f"Next work available in {WORK_COOLDOWN_H} hours")
+    e.add_field(name="📊 Work Experience", value=f"Job #{new_work_count}", inline=True)
+    e.add_field(name="💵 Base Pay",        value=f"{base_pay:,} credits", inline=True)
+    if prestige_val > 0:
+        e.add_field(name="⭐ Prestige Bonus", value=f"×{prestige_multiplier(prestige_val):.1f}", inline=True)
+
+    # Show next pay preview
+    next_pay = min(int(WORK_BASE * (WORK_MULTIPLIER ** new_work_count)), 5000)
+    e.set_footer(text=f"Next work in {WORK_COOLDOWN_H}h • Next paycheck: ~{next_pay:,} credits (1.1× growth)")
     await ctx.send(embed=e)
 
 @bot.command()
@@ -1332,13 +1531,9 @@ async def cooldown(ctx):
         else:
             return f"⏳ {s}s"
 
-    # Work cooldown
     work_status = fmt_remaining(u.get('last_work_ts') or 0, WORK_COOLDOWN_H)
+    rob_status  = fmt_remaining(u.get('last_rob_ts') or 0, ROB_COOLDOWN_H)
 
-    # Rob cooldown
-    rob_status = fmt_remaining(u.get('last_rob_ts') or 0, ROB_COOLDOWN_H)
-
-    # Daily cooldown
     last_daily = u.get('last_daily')
     today = now_dt.date()
     if not last_daily or last_daily < today:
@@ -1350,7 +1545,6 @@ async def cooldown(ctx):
         m = rem // 60
         daily_status = f"⏳ {h}h {m}m"
 
-    # Market price refresh
     if _market_prices["last_updated"]:
         next_update = _market_prices["last_updated"] + timedelta(minutes=20)
         diff = next_update - now_dt
@@ -1363,17 +1557,190 @@ async def cooldown(ctx):
     else:
         market_status = "🔄 Unknown"
 
+    work_count = u.get('work_count') or 0
+    next_pay = min(int(WORK_BASE * (WORK_MULTIPLIER ** work_count)), 5000)
+
     e = discord.Embed(
         title=f"⏱️ {ctx.author.display_name}'s Cooldowns",
         color=0x5865F2
     )
-    e.add_field(name="📅 Daily",         value=daily_status,  inline=True)
-    e.add_field(name="💼 Work",          value=work_status,   inline=True)
-    e.add_field(name="🦹 Rob",           value=rob_status,    inline=True)
-    e.add_field(name="🎰 Gamble/Slots",  value="✅ No CD",    inline=True)
-    e.add_field(name="📈 Market Prices", value=market_status, inline=True)
+    e.add_field(name="📅 Daily",          value=daily_status,             inline=True)
+    e.add_field(name="💼 Work",           value=work_status,              inline=True)
+    e.add_field(name="🦹 Rob",            value=rob_status,               inline=True)
+    e.add_field(name="🎰 Gamble/Slots",   value="✅ No CD",              inline=True)
+    e.add_field(name="📈 Market Prices",  value=market_status,            inline=True)
+    e.add_field(name="💵 Next Work Pay",  value=f"~{next_pay:,} credits", inline=True)
     e.set_footer(text="Use -work, -daily, -rob to use these commands")
     await ctx.send(embed=e)
+
+# ─── Virtual Bank Commands ─────────────────────────────────────────────────────
+@bot.command(aliases=['vb', 'mybank'])
+async def vbank(ctx):
+    """View your virtual bank account with interest info."""
+    uid = ctx.author.id
+    ensure_user(uid, str(ctx.author))
+    interest = apply_bank_interest(uid)
+    vb = get_user_bank(uid)
+    u = get_user(uid)
+    if not u:
+        await ctx.send("❌ Could not load your profile. Try again.")
+        return
+
+    now = datetime.now(timezone.utc)
+    last = vb['last_interest']
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    next_interest = last + timedelta(minutes=BANK_INTEREST_MINS)
+    diff = next_interest - now
+    secs = max(0, int(diff.total_seconds()))
+    m, s = divmod(secs, 60)
+
+    e = discord.Embed(title=f"🏦 {ctx.author.display_name}'s Virtual Bank", color=0x57F287)
+    e.add_field(name="🏦 Bank Balance",    value=f"**{vb['balance']:,} credits**",      inline=True)
+    e.add_field(name="💳 Wallet",          value=f"**{u['credits']:,} credits**",        inline=True)
+    e.add_field(name="📈 Interest Rate",   value=f"**+5%** every 10 minutes",             inline=True)
+    e.add_field(name="⏰ Next Interest",   value=f"In **{m}m {s}s**",                    inline=True)
+    if interest > 0:
+        e.add_field(name="✅ Interest Earned", value=f"+**{interest:,} credits**",        inline=True)
+    e.set_footer(text="Use -deposit <amount> and -withdraw <amount> to manage your bank")
+    await ctx.send(embed=e)
+
+@bot.command()
+async def deposit(ctx, amount: str):
+    """Deposit credits into your virtual bank account."""
+    uid = ctx.author.id
+    ensure_user(uid, str(ctx.author))
+    u = get_user(uid)
+    if not u:
+        await ctx.send("❌ Could not load your profile. Try again.")
+        return
+
+    if amount.lower() == 'all':
+        amt = u['credits']
+    else:
+        try:
+            amt = int(amount)
+        except ValueError:
+            await ctx.send("❌ Invalid amount. Use a number or `all`.")
+            return
+
+    if amt <= 0:
+        await ctx.send("❌ Amount must be positive.")
+        return
+    if amt > u['credits']:
+        await ctx.send(f"❌ Not enough credits. You have **{u['credits']:,}**.")
+        return
+
+    # Apply interest before depositing
+    apply_bank_interest(uid)
+
+    conn = db()
+    cur = conn.cursor()
+    try:
+        cur.execute("UPDATE users SET credits = credits - %s WHERE user_id = %s", (amt, uid))
+        cur.execute("""
+            INSERT INTO user_bank (user_id, balance, last_interest)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (user_id) DO UPDATE
+            SET balance = user_bank.balance + %s
+        """, (uid, amt, amt))
+        conn.commit()
+    except Exception as ex:
+        conn.rollback()
+        print(f"deposit error: {ex}")
+        await ctx.send("❌ An error occurred. Try again.")
+        return
+    finally:
+        release(conn)
+
+    vb = get_user_bank(uid)
+    e = discord.Embed(title="🏦 Deposit Successful!", color=0x57F287)
+    e.add_field(name="💰 Deposited",    value=f"**{amt:,} credits**",         inline=True)
+    e.add_field(name="🏦 New Balance",  value=f"**{vb['balance']:,} credits**", inline=True)
+    e.set_footer(text="Your balance grows 1.05× every 10 minutes!")
+    await ctx.send(embed=e)
+
+@bot.command()
+async def withdraw(ctx, amount: str):
+    """Withdraw credits from your virtual bank account."""
+    uid = ctx.author.id
+    ensure_user(uid, str(ctx.author))
+
+    # Apply interest first
+    apply_bank_interest(uid)
+    vb = get_user_bank(uid)
+
+    if amount.lower() == 'all':
+        amt = vb['balance']
+    else:
+        try:
+            amt = int(amount)
+        except ValueError:
+            await ctx.send("❌ Invalid amount. Use a number or `all`.")
+            return
+
+    if amt <= 0:
+        await ctx.send("❌ Amount must be positive.")
+        return
+    if amt > vb['balance']:
+        await ctx.send(f"❌ Not enough in bank. Balance: **{vb['balance']:,}**.")
+        return
+
+    conn = db()
+    cur = conn.cursor()
+    try:
+        cur.execute("UPDATE users SET credits = credits + %s WHERE user_id = %s", (amt, uid))
+        cur.execute("UPDATE user_bank SET balance = balance - %s WHERE user_id = %s", (amt, uid))
+        conn.commit()
+    except Exception as ex:
+        conn.rollback()
+        print(f"withdraw error: {ex}")
+        await ctx.send("❌ An error occurred. Try again.")
+        return
+    finally:
+        release(conn)
+
+    u = get_user(uid)
+    e = discord.Embed(title="🏦 Withdrawal Successful!", color=0x57F287)
+    e.add_field(name="💰 Withdrawn",  value=f"**{amt:,} credits**",              inline=True)
+    e.add_field(name="💳 Wallet",     value=f"**{u['credits']:,} credits**",      inline=True)
+    e.add_field(name="🏦 Remaining",  value=f"**{vb['balance'] - amt:,} credits**", inline=True)
+    await ctx.send(embed=e)
+
+# ─── Privacy Toggle ────────────────────────────────────────────────────────────
+@bot.command()
+async def privacy(ctx, setting: str = None):
+    """Toggle inventory/wallet visibility to other users."""
+    uid = ctx.author.id
+    ensure_user(uid, str(ctx.author))
+
+    if setting is None or setting.lower() not in ('on', 'off'):
+        u = get_user(uid)
+        current = u.get('inventory_public', False)
+        await ctx.send(
+            f"🔒 Privacy is currently **{'public (others can see)' if current else 'private'}**.\n"
+            f"Use `-privacy on` to allow others to view your inventory/wallet, or `-privacy off` to hide it."
+        )
+        return
+
+    is_public = setting.lower() == 'on'
+    conn = db()
+    cur = conn.cursor()
+    try:
+        cur.execute("UPDATE users SET inventory_public = %s WHERE user_id = %s", (is_public, uid))
+        conn.commit()
+    except Exception as ex:
+        conn.rollback()
+        print(f"privacy error: {ex}")
+        await ctx.send("❌ An error occurred. Try again.")
+        return
+    finally:
+        release(conn)
+
+    if is_public:
+        await ctx.send("🔓 Your inventory and wallet are now **public** — others can view them with `-inventory @you` or `-profile @you`.")
+    else:
+        await ctx.send("🔒 Your inventory and wallet are now **private**.")
 
 # ─── Market Prices Commands ───────────────────────────────────────────────────
 @bot.command()
@@ -1401,7 +1768,6 @@ async def prices(ctx, category: str = "all"):
         lines = []
         for mat, (lo, hi) in MATERIAL_PRICE_RANGES.items():
             current = _market_prices["materials"].get(mat, 0)
-            # Trend arrow
             mid = (lo + hi) / 2
             arrow = "📈" if current > mid else "📉"
             lines.append(f"{arrow} **{mat}**: `{current:.4f}×` *(range: {lo}–{hi}×)*")
@@ -1423,7 +1789,6 @@ async def prices(ctx, category: str = "all"):
         await ctx.send(embed=e)
 
     else:
-        # Show summary of both
         e = discord.Embed(title="📈 Live Market Prices", color=0xEB459E)
         e.description = f"Last updated: **{last_str}** • {next_str}"
 
@@ -1448,7 +1813,7 @@ async def prices(ctx, category: str = "all"):
 
 @bot.command()
 async def coinprice(ctx, coin_id: int):
-    """Check the live market price of a specific coin."""
+    """Check the live market price and RAP of a specific coin."""
     conn = db()
     cur = conn.cursor()
     try:
@@ -1466,10 +1831,10 @@ async def coinprice(ctx, coin_id: int):
         return
 
     market_val = get_market_price(c)
-    base_val = c['value']
-    diff = market_val - base_val
-    diff_pct = (diff / base_val * 100) if base_val > 0 else 0
-    arrow = "📈" if diff >= 0 else "📉"
+    base_val   = c['value']
+    diff       = market_val - base_val
+    diff_pct   = (diff / base_val * 100) if base_val > 0 else 0
+    arrow      = "📈" if diff >= 0 else "📉"
 
     mat_live = _market_prices["materials"].get(c['material'], c['mat_mult'])
     flt_live = _market_prices["floats"].get(c['float'], c['flt_mult'])
@@ -1478,12 +1843,39 @@ async def coinprice(ctx, coin_id: int):
     name = coin_name(c)
     serial_str = str(c['serial']).zfill(4)
 
+    # RAP calculation
+    rap = get_coin_rap(coin_id)
+    trade_history = get_coin_trade_history(coin_id)
+
     e = discord.Embed(title=f"{tier} Live Price — {name} #{serial_str}", color=0xFFD700)
-    e.add_field(name="📦 Base Value",    value=f"${base_val:.4f}",    inline=True)
-    e.add_field(name="📈 Market Value",  value=f"**${market_val:.4f}**", inline=True)
+    e.add_field(name="📦 Base Value",    value=f"${base_val:.4f}",         inline=True)
+    e.add_field(name="📈 Market Value",  value=f"**${market_val:.4f}**",   inline=True)
     e.add_field(name=f"{arrow} Change",  value=f"{'+' if diff >= 0 else ''}{diff:.4f} ({diff_pct:+.1f}%)", inline=True)
     e.add_field(name="🪨 Mat Price",     value=f"`{mat_live:.4f}×` (base: {c['mat_mult']}×)", inline=True)
     e.add_field(name="🌊 Float Price",   value=f"`{flt_live:.4f}×` (base: {c['flt_mult']}×)", inline=True)
+
+    # RAP field
+    if rap is not None:
+        rap_diff = rap - base_val
+        rap_arrow = "📈" if rap_diff >= 0 else "📉"
+        e.add_field(name="💹 RAP (Avg Trade Price)", value=f"**{rap:,.2f} credits** {rap_arrow}", inline=True)
+    else:
+        e.add_field(name="💹 RAP (Avg Trade Price)", value="No trades yet (raw coin)", inline=True)
+
+    # Trade history
+    if trade_history:
+        history_lines = []
+        for t in trade_history:
+            ts = t['traded_at']
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            history_lines.append(
+                f"`{t['price']:,} cr` — {t.get('seller_name','?')} → {t.get('buyer_name','?')} "
+                f"<t:{int(ts.timestamp())}:R>"
+            )
+        e.add_field(name="🔄 Recent Trades", value="\n".join(history_lines), inline=False)
+    else:
+        e.add_field(name="🔄 Trade History", value="This coin has never been traded (raw from crate)", inline=False)
 
     if _market_prices["last_updated"]:
         now_dt = datetime.now(timezone.utc)
@@ -1491,7 +1883,7 @@ async def coinprice(ctx, coin_id: int):
         diff_t = next_update - now_dt
         secs = int(diff_t.total_seconds())
         m, s = divmod(max(0, secs), 60)
-        e.set_footer(text=f"Prices refresh in {m}m {s}s • Market value ≠ sell value (sell uses base)")
+        e.set_footer(text=f"Prices refresh in {m}m {s}s • RAP = avg of last 10 trades")
     await ctx.send(embed=e)
 
 @bot.command()
@@ -1500,7 +1892,7 @@ async def shop(ctx):
     e.description = "Spend your credits here!\n"
     for item, data in SHOP_ITEMS.items():
         e.add_field(name=f"`-buy {item}` — {data['cost']:,} credits", value=data['desc'], inline=False)
-    e.set_footer(text="Credits are earned by chatting, daily, work, gambling, and selling coins")
+    e.set_footer(text="Credits are earned by chatting, daily, work, gambling, and selling coins • Crate fee: 10% to bank")
     await ctx.send(embed=e)
 
 @bot.command()
@@ -1582,7 +1974,7 @@ async def buy(ctx, item: str = None, *args):
                 f"Total ×: **{coin['total_mult']:.4f}**\n"
                 f"**Final: ${coin['value']:.4f}**"
             ), inline=True)
-            e.set_footer(text=f"Coin ID: #{coin['id']} • Credits left: {credits_left:,}")
+            e.set_footer(text=f"Coin ID: #{coin['id']} • Credits left: {credits_left:,} • Bank received {bank_cut} credits (10% fee)")
             await ctx.send(embed=e)
         else:
             e = discord.Embed(title=f"📦 {n} Crates Opened!", color=0xFFD700)
@@ -1595,7 +1987,7 @@ async def buy(ctx, item: str = None, *args):
                 )
             e.description = "\n".join(lines)
             total_val = sum(c['value'] for c in opened)
-            e.set_footer(text=f"Total value: ${total_val:.4f} • Credits left: {credits_left:,}")
+            e.set_footer(text=f"Total value: ${total_val:.4f} • Credits left: {credits_left:,} • Bank received {bank_cut} credits (10% fee)")
             await ctx.send(embed=e)
         return
 
@@ -1707,20 +2099,62 @@ async def buy(ctx, item: str = None, *args):
     await ctx.send(f"❌ Unknown item `{item}`. See `-shop`.")
 
 @bot.command(aliases=['inv'])
-async def inventory(ctx, page: int = 1):
+async def inventory(ctx, *args):
+    """View inventory. Usage: -inv [page] or -inv @user [page]"""
     uid = ctx.author.id
     ensure_user(uid, str(ctx.author))
+
+    target_member = None
+    page = 1
+
+    # Parse arguments: could be (@member) or (page) or (@member page)
+    for arg in args:
+        if arg.startswith('<@') and arg.endswith('>'):
+            # It's a mention
+            mid_str = arg.strip('<@!>').strip('>')
+            try:
+                mid = int(mid_str)
+                target_member = ctx.guild.get_member(mid)
+                if not target_member:
+                    try:
+                        target_member = await bot.fetch_user(mid)
+                    except Exception:
+                        pass
+            except ValueError:
+                pass
+        else:
+            try:
+                page = int(arg)
+            except ValueError:
+                pass
+
+    # Check if viewing another user
+    if target_member and target_member.id != uid:
+        # Check privacy
+        tu = get_user(target_member.id)
+        if not tu:
+            await ctx.send(f"❌ User not found.")
+            return
+        if not tu.get('inventory_public', False):
+            await ctx.send(f"🔒 **{target_member.display_name}**'s inventory is private. They need to use `-privacy on` to allow viewing.")
+            return
+        view_uid = target_member.id
+        view_name = target_member.display_name
+    else:
+        view_uid = uid
+        view_name = ctx.author.display_name
+
     per_page = 8
     offset   = (page - 1) * per_page
 
     conn = db()
     cur = conn.cursor()
     try:
-        cur.execute("SELECT COUNT(*) as c FROM coins WHERE owner_id = %s", (uid,))
+        cur.execute("SELECT COUNT(*) as c FROM coins WHERE owner_id = %s", (view_uid,))
         total = cur.fetchone()['c']
         cur.execute(
             "SELECT * FROM coins WHERE owner_id = %s ORDER BY value DESC LIMIT %s OFFSET %s",
-            (uid, per_page, offset)
+            (view_uid, per_page, offset)
         )
         coins = cur.fetchall()
     except Exception as ex:
@@ -1734,19 +2168,22 @@ async def inventory(ctx, page: int = 1):
         if page > 1:
             await ctx.send(f"❌ No coins on page {page}.")
         else:
-            await ctx.send("🎒 Your inventory is empty! Use `-buy crate` to open one.")
+            await ctx.send(f"🎒 {'Your' if view_uid == uid else view_name + \"'s\"} inventory is empty!")
         return
 
     pages = max(1, math.ceil(total / per_page))
-    e = discord.Embed(title=f"🎒 {ctx.author.display_name}'s Inventory", color=0x5865F2)
+    e = discord.Embed(title=f"🎒 {view_name}'s Inventory", color=0x5865F2)
     lines = []
     for c in coins:
         serial_str = str(c['serial']).zfill(4)
         name = c.get('custom_name') or f"{c['variant']} {c['material']} Coin"
         tier = tier_emoji(c['value'])
+        # Check if it has trade history
+        rap = get_coin_rap(c['id'])
+        rap_str = f" | RAP: {rap:,.0f}cr" if rap else " | Raw"
         lines.append(
             f"{tier} `#{c['id']}` **{name}** #{serial_str}\n"
-            f"  {c['status']} | {c['float']} | **${c['value']:.4f}**"
+            f"  {c['status']} | {c['float']} | **${c['value']:.4f}**{rap_str}"
         )
     e.description = f"Page **{page}/{pages}** | Total: **{total}** coins\n\n" + "\n\n".join(lines)
     e.set_footer(text=f"-coin <id> for details • -inventory {page+1} for next page")
@@ -1772,10 +2209,12 @@ async def coin(ctx, coin_id: int):
         await ctx.send(f"❌ Coin #{coin_id} not found.")
         return
 
-    serial_str = str(c['serial']).zfill(4)
-    tier = tier_emoji(c['value'])
+    serial_str   = str(c['serial']).zfill(4)
+    tier         = tier_emoji(c['value'])
     display_name = c.get('custom_name') or f"{c['variant']} {c['material']} Coin"
-    market_val = get_market_price(c)
+    market_val   = get_market_price(c)
+    rap          = get_coin_rap(coin_id)
+    trade_hist   = get_coin_trade_history(coin_id)
 
     e = discord.Embed(title=f"{tier} Coin #{coin_id} — {display_name}", color=0xFFD700)
     e.add_field(name="Owner",    value=c['username'],   inline=True)
@@ -1795,6 +2234,21 @@ async def coin(ctx, coin_id: int):
         f"**Base Value: ${c['value']:.4f}**\n"
         f"**📈 Market: ${market_val:.4f}**"
     ), inline=True)
+
+    if rap is not None:
+        e.add_field(name="💹 RAP", value=f"**{rap:,.2f} credits** (avg of trades)", inline=True)
+    else:
+        e.add_field(name="💹 RAP", value="**Raw** (never traded)", inline=True)
+
+    if trade_hist:
+        lines = []
+        for t in trade_hist:
+            ts = t['traded_at']
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            lines.append(f"`{t['price']:,} cr` <t:{int(ts.timestamp())}:R>")
+        e.add_field(name="🔄 Recent Trades", value="\n".join(lines), inline=False)
+
     await ctx.send(embed=e)
 
 @bot.command()
@@ -2100,12 +2554,11 @@ async def market(ctx, page: int = 1):
 
     for a in rows:
         serial_str = str(a['serial']).zfill(4)
-        # Calculate live market price
         market_val = get_market_price(a)
-        tier = tier_emoji(market_val)
-        top_bid = f"{a['current_bid']:,} credits" if a['current_bid'] else "No bids"
-        name = a.get('custom_name') or f"{a['variant']} {a['material']} Coin"
-        ends_ts = a['ends_at']
+        tier       = tier_emoji(market_val)
+        top_bid    = f"{a['current_bid']:,} credits" if a['current_bid'] else "No bids"
+        name       = a.get('custom_name') or f"{a['variant']} {a['material']} Coin"
+        ends_ts    = a['ends_at']
         if ends_ts.tzinfo is None:
             ends_ts = ends_ts.replace(tzinfo=timezone.utc)
 
@@ -2113,11 +2566,15 @@ async def market(ctx, page: int = 1):
         diff_pct = ((market_val - base_val) / base_val * 100) if base_val > 0 else 0
         price_arrow = "📈" if diff_pct >= 0 else "📉"
 
+        # RAP
+        rap = get_coin_rap(a['coin_id'])
+        rap_str = f"RAP: **{rap:,.0f} cr**" if rap else "RAP: Raw"
+
         e.add_field(
             name=f"{tier} Auction #{a['id']} — {name} #{serial_str}",
             value=(
                 f"Cond: **{a['cond']}** | Float: **{a['float']}**\n"
-                f"Base: **${base_val:.4f}** | {price_arrow} Market: **${market_val:.4f}** ({diff_pct:+.1f}%)\n"
+                f"Base: **${base_val:.4f}** | {price_arrow} Market: **${market_val:.4f}** ({diff_pct:+.1f}%) | {rap_str}\n"
                 f"Start: **{a['start_price']:,}** | Top Bid: **{top_bid}**\n"
                 f"Seller: {a['seller_name']} | Ends: <t:{int(ends_ts.timestamp())}:R>"
             ),
@@ -2224,6 +2681,13 @@ async def profile(ctx, member: discord.Member = None):
     uid = target.id
     ensure_user(uid, str(target))
 
+    # Check privacy if viewing another user
+    if member and member.id != ctx.author.id:
+        tu = get_user(uid)
+        if not tu or not tu.get('inventory_public', False):
+            await ctx.send(f"🔒 **{target.display_name}**'s profile is private.")
+            return
+
     conn = db()
     cur = conn.cursor()
     try:
@@ -2251,19 +2715,26 @@ async def profile(ctx, member: discord.Member = None):
         await ctx.send("❌ User not found.")
         return
 
+    # Apply bank interest and get balance
+    apply_bank_interest(uid)
+    vb = get_user_bank(uid)
+
     prestige_val = u.get('prestige') or 0
     pmult = prestige_multiplier(prestige_val)
     e = discord.Embed(title=f"👤 {target.display_name}'s Profile", color=0x5865F2)
     e.set_thumbnail(url=target.display_avatar.url)
     e.add_field(name="🎟️ Credits",       value=f"{u['credits']:,}",             inline=True)
+    e.add_field(name="🏦 Bank",           value=f"{vb['balance']:,}",             inline=True)
     e.add_field(name="🪙 Coins",          value=str(u['total_coins']),            inline=True)
     e.add_field(name="⭐ Prestige",       value=f"{prestige_val} (×{pmult:.1f})", inline=True)
     e.add_field(name="📈 Portfolio",      value=f"${total_val:.4f}",              inline=True)
     e.add_field(name="🏆 Best Coin",      value=f"${best['value']:.4f}" if best else "None", inline=True)
     e.add_field(name="🛒 Sales / Trades", value=f"{sales} / {trades_done}",       inline=True)
     e.add_field(name="🔥 Daily Streak",   value=f"{u.get('daily_streak', 0)} days", inline=True)
+    e.add_field(name="💼 Work Count",     value=f"{u.get('work_count', 0)} jobs",   inline=True)
     joined = u.get('joined_at')
-    e.set_footer(text=f"Member since {joined.strftime('%Y-%m-%d') if joined else 'Unknown'}")
+    privacy_status = "🔓 Public" if u.get('inventory_public', False) else "🔒 Private"
+    e.set_footer(text=f"Member since {joined.strftime('%Y-%m-%d') if joined else 'Unknown'} • Profile: {privacy_status}")
     await ctx.send(embed=e)
 
 @bot.command(aliases=['lb'])
@@ -2355,7 +2826,7 @@ async def bank(ctx):
             value=f"{last['paid_date']} — {last['amount']:,}/user",
             inline=True
         )
-    e.set_footer(text="Funded by: crate fees • trade taxes • gambling house edge • rob fines • prestige")
+    e.set_footer(text="Funded by: crate fees (10%) • trade taxes • gambling • rob fines • prestige")
     await ctx.send(embed=e)
 
 @bot.command()
@@ -2373,10 +2844,10 @@ async def stats(ctx):
             await ctx.send("❌ User not found.")
             return
 
-        # Apply safe defaults for any missing fields
         safe_u = dict(u)
         for key, default in [('credits', 0), ('prestige', 0), ('total_coins', 0),
-                              ('daily_streak', 0), ('last_work_ts', 0), ('last_rob_ts', 0)]:
+                              ('daily_streak', 0), ('last_work_ts', 0), ('last_rob_ts', 0),
+                              ('work_count', 0)]:
             if safe_u.get(key) is None:
                 safe_u[key] = default
 
@@ -2386,11 +2857,16 @@ async def stats(ctx):
         )
         cs = cur.fetchone()
 
-        cur.execute(
-            "SELECT COUNT(*) as c FROM trades WHERE (initiator_id=%s OR receiver_id=%s) AND status='completed'",
-            (uid, uid)
-        )
-        trades_done = cur.fetchone()['c']
+        # ── FIXED: safe trades query using correct column names ────────────────
+        try:
+            cur.execute(
+                "SELECT COUNT(*) as c FROM trades WHERE (initiator_id=%s OR receiver_id=%s) AND status='completed'",
+                (uid, uid)
+            )
+            trades_done = cur.fetchone()['c']
+        except Exception as te:
+            print(f"stats trades query error: {te}")
+            trades_done = 0
 
         cur.execute(
             "SELECT COALESCE(SUM(amount),0) as t FROM credit_log WHERE user_id=%s AND amount > 0",
@@ -2411,16 +2887,25 @@ async def stats(ctx):
     finally:
         release(conn)
 
+    # Apply interest and get bank balance
+    apply_bank_interest(uid)
+    vb = get_user_bank(uid)
+
     prestige_val = safe_u.get('prestige') or 0
     pmult = prestige_multiplier(prestige_val)
+    work_count = safe_u.get('work_count') or 0
+    next_pay = min(int(WORK_BASE * (WORK_MULTIPLIER ** work_count)), 5000)
+
     e = discord.Embed(title=f"📊 Stats — {ctx.author.display_name}", color=0x5865F2)
-    e.add_field(name="🎟️ Credits",        value=f"{safe_u['credits']:,}",        inline=True)
-    e.add_field(name="💹 Total Earned",    value=f"{int(total_earned):,} credits", inline=True)
-    e.add_field(name="⭐ Prestige",        value=f"{prestige_val} (×{pmult:.1f})", inline=True)
-    e.add_field(name="🪙 Coins Owned",     value=str(int(cs['c']) if cs else 0),   inline=True)
+    e.add_field(name="🎟️ Credits",        value=f"{safe_u['credits']:,}",             inline=True)
+    e.add_field(name="🏦 Bank Balance",    value=f"{vb['balance']:,}",                  inline=True)
+    e.add_field(name="💹 Total Earned",    value=f"{int(total_earned):,} credits",       inline=True)
+    e.add_field(name="⭐ Prestige",        value=f"{prestige_val} (×{pmult:.1f})",       inline=True)
+    e.add_field(name="🪙 Coins Owned",     value=str(int(cs['c']) if cs else 0),         inline=True)
     e.add_field(name="📈 Portfolio Value", value=f"${float(cs['s']):.4f}" if cs else "$0.0000", inline=True)
-    e.add_field(name="🤝 Trades Done",     value=str(trades_done),                inline=True)
+    e.add_field(name="🤝 Trades Done",     value=str(trades_done),                       inline=True)
     e.add_field(name="🔥 Daily Streak",    value=f"{safe_u.get('daily_streak', 0)} days", inline=True)
+    e.add_field(name="💼 Work Count",      value=f"{work_count} jobs (next: ~{next_pay:,} cr)", inline=True)
     if top_mats:
         e.add_field(
             name="🏅 Top Materials",
