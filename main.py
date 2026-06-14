@@ -1,3 +1,4 @@
+import os
 import sys
 import json
 import time
@@ -221,7 +222,7 @@ JOB_TYPE_ACTIONS = {
     "smuggler":  ["moved contraband through checkpoints","bribed a border officer","stashed goods in a safe house","delivered a black market order","evaded a patrol scan"],
     "executive": ["closed a multi-million deal","restructured the vault holdings","attended a shadow board meeting","greenlit a covert acquisition","signed off on vault expansion"],
 }
-WORK_ACTIONS = [a for actions in JOB_TYPE_ACTIONS.values() for a in actions]  # fallback
+WORK_ACTIONS = [a for actions in JOB_TYPE_ACTIONS.values() for a in actions]
 
 # ─── Market Price Ranges ───────────────────────────────────────────────────────
 MATERIAL_PRICE_RANGES = {
@@ -269,7 +270,7 @@ SHOP_ITEMS = {
 
 # ─── Black Market Items ────────────────────────────────────────────────────────
 BLACK_MARKET_ITEMS = {
-    "identity_tracker":     {"name":"Identity Tracker",             "price":5100,  "stock":10,"chance":0.60,"desc":"Reveal a user bank ID by username (one-time).","emoji":"🕵️"},
+    "identity_tracker":     {"name":"Identity Tracker",             "price":5100,  "stock":10,"chance":0.60,"desc":"Reveal a user bank ID by username (one-time use per purchase).","emoji":"🕵️"},
     "data_leak_generator":  {"name":"Data Leak Generator",          "price":15500, "stock":1, "chance":0.30,"desc":"Each failed hack gives +1% success chance (max 51%).","emoji":"💾"},
     "suspicious_os":        {"name":"Suspicious Operating System",  "price":41000, "stock":1, "chance":0.70,"desc":"Unlocks -hack in DMs.","emoji":"💻"},
     "transfer_system":      {"name":"Transfer System",              "price":27000, "stock":1, "chance":0.65,"desc":"Hacked funds transfer in 2 hours (safer).","emoji":"📡"},
@@ -448,17 +449,49 @@ def generate_bank_id() -> str:
 
 # ─── Username lookup helper ────────────────────────────────────────────────────
 def find_user_by_username(username: str):
-    """Find a user row by username (case-insensitive, partial match supported)."""
+    """Find a user row by stored username (case-insensitive, partial match)."""
     conn = db(); cur = conn.cursor()
     try:
+        # Exact match first
         cur.execute("SELECT * FROM users WHERE LOWER(username) = LOWER(%s)", (username,))
         row = cur.fetchone()
         if not row:
+            # Partial match fallback
             cur.execute("SELECT * FROM users WHERE LOWER(username) LIKE LOWER(%s) LIMIT 1", (f"%{username}%",))
             row = cur.fetchone()
         return dict(row) if row else None
     except Exception as e:
         print(f"find_user_by_username error: {e}"); return None
+    finally:
+        release(conn)
+
+# ─── Tracker ownership helper ──────────────────────────────────────────────────
+def get_tracker_count(uid: int) -> int:
+    """Return how many unused Identity Trackers the user owns."""
+    conn = db(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT tracker_count FROM user_items WHERE user_id=%s", (uid,))
+        row = cur.fetchone()
+        return int(row["tracker_count"]) if row and row.get("tracker_count") else 0
+    except:
+        return 0
+    finally:
+        release(conn)
+
+def consume_tracker(uid: int) -> bool:
+    """Consume one tracker. Returns True if successful."""
+    conn = db(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT tracker_count FROM user_items WHERE user_id=%s", (uid,))
+        row = cur.fetchone()
+        if not row or (row.get("tracker_count") or 0) <= 0:
+            return False
+        cur.execute("UPDATE user_items SET tracker_count = tracker_count - 1 WHERE user_id=%s AND tracker_count > 0", (uid,))
+        conn.commit()
+        _cache_invalidate(uid)
+        return True
+    except Exception as e:
+        conn.rollback(); print(f"consume_tracker error: {e}"); return False
     finally:
         release(conn)
 
@@ -508,10 +541,7 @@ def init_db():
             joined_at        TIMESTAMP DEFAULT NOW()
         )
     """)
-    # Add job_type column if upgrading from older schema
-    cur.execute("""
-        ALTER TABLE users ADD COLUMN IF NOT EXISTS job_type TEXT DEFAULT 'miner'
-    """)
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS job_type TEXT DEFAULT 'miner'")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS coins (
             id          SERIAL PRIMARY KEY,
@@ -575,6 +605,7 @@ def init_db():
             created_at  TIMESTAMP DEFAULT NOW()
         )
     """)
+    # user_items — note tracker_count column for stackable trackers
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_items (
             user_id               BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
@@ -587,9 +618,12 @@ def init_db():
             last_ai_ts            BIGINT DEFAULT 0,
             has_dlg               BOOLEAN DEFAULT FALSE,
             has_sos               BOOLEAN DEFAULT FALSE,
-            has_transfer          BOOLEAN DEFAULT FALSE
+            has_transfer          BOOLEAN DEFAULT FALSE,
+            tracker_count         INT DEFAULT 0
         )
     """)
+    # Add tracker_count if upgrading from older schema
+    cur.execute("ALTER TABLE user_items ADD COLUMN IF NOT EXISTS tracker_count INT DEFAULT 0")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS hack_progress (
             id             SERIAL PRIMARY KEY,
@@ -1686,6 +1720,7 @@ class HackChallengeView:
         self.target_uid=target_uid; self.hack_chance=hack_chance
         self.stage=0; self.passed=0; self.required=3
         self._gen()
+
     def _gen(self):
         t=random.choice(["math","sequence","password"]); self.current_type=t
         if t=="math":
@@ -1796,13 +1831,22 @@ class BlackMarketBuyView(discord.ui.View):
         try:
             cur.execute("UPDATE users SET credits=credits-%s WHERE user_id=%s",(self.price,uid))
             cur.execute("INSERT INTO black_market_log(user_id,item_key,price) VALUES(%s,%s,%s)",(uid,self.item_key,self.price))
-            col_map={"data_leak_generator":"has_dlg","suspicious_os":"has_sos","transfer_system":"has_transfer","ai_machine":"has_ai_machine"}
-            if self.item_key in col_map:
+            # Map item keys to DB columns; identity_tracker is stackable (tracker_count)
+            col_map={
+                "data_leak_generator":"has_dlg",
+                "suspicious_os":"has_sos",
+                "transfer_system":"has_transfer",
+                "ai_machine":"has_ai_machine"
+            }
+            if self.item_key == "identity_tracker":
+                cur.execute("UPDATE user_items SET tracker_count = tracker_count + 1 WHERE user_id=%s",(uid,))
+            elif self.item_key in col_map:
                 cur.execute(f"UPDATE user_items SET {col_map[self.item_key]}=TRUE WHERE user_id=%s",(uid,))
             conn.commit(); _cache_invalidate(uid)
             bm["stock"][self.item_key]=bm["stock"].get(self.item_key,1)-1
         except Exception as e:
-            conn.rollback(); await i.response.send_message("❌ Purchase failed.",ephemeral=True); return
+            conn.rollback(); print(f"BlackMarketBuyView error: {e}")
+            await i.response.send_message("❌ Purchase failed.",ephemeral=True); return
         finally: release(conn)
         await i.response.send_message(f"✅ Purchased **{item['name']}**!",ephemeral=True)
         self.stop()
@@ -1950,6 +1994,10 @@ async def _send_cooldowns(target, uid: int):
         e.add_field(name="🌑 Black Market",value=f"✅ Active! {mm}m {ss}s left",           inline=True)
     else:
         e.add_field(name="🌑 Black Market",value="❌ Inactive (10%/2h)",                    inline=True)
+    # Show tracker count
+    tc = get_tracker_count(uid)
+    if tc > 0:
+        e.add_field(name="🕵️ Trackers", value=f"**{tc}** available", inline=True)
     await _respond(target, embed=e, view=QuickNav(uid))
 
 async def _send_shop(target, uid: int):
@@ -1966,7 +2014,7 @@ async def _send_shop(target, uid: int):
     e.add_field(name="🧠 Cognitive Machine — 6,000 cr",       value="Auto-work 30min @ 0.75x salary",     inline=False)
     e.add_field(name="✨ Polish — 150 cr",                     value="`-buy polish <coin_id>` — upgrade status", inline=False)
     e.add_field(name="✏️ Rename — 200 cr",                    value="`-buy rename <coin_id> <name>`",     inline=False)
-    e.set_footer(text="🌑 AI Machine only from Black Market • -help for all commands")
+    e.set_footer(text="🌑 AI Machine & Identity Tracker only from Black Market • -help for all commands")
     await _respond(target, embed=e, view=ShopView(uid))
 
 async def _do_buy_crate(target, uid: int, count: int):
@@ -2088,11 +2136,8 @@ async def _do_work(target, uid: int):
     rn,rs,re,ri=get_job_rank(wc); pm=JOB_RANKS[ri][1]
     wm=min(1.0+(wc-pm)*0.02,1.5)
 
-    # Career pay: use job type range scaled by rank multiplier
     career_pay = int(random.randint(jt_min, jt_max) * wm)
-    # Also get rank base pay
     rank_pay   = min(int(rs*wm), 5000)
-    # Final: average of career and rank pay, boosted by prestige
     base_pay   = (career_pay + rank_pay) // 2
     earned     = int(base_pay * prestige_multiplier(pv))
 
@@ -2171,6 +2216,37 @@ async def _do_market_trigger(target, uid: int):
     else:
         await _respond(target, content="⚡ **Market Trigger!** Prices refreshed, no event this cycle.")
 
+# ─── Internal hack starter ────────────────────────────────────────────────────
+async def _start_hack(ctx_or_dm, uid: int, bank_id: str, target_uid: int, target_balance: int):
+    """Shared logic to start a hack session in DMs."""
+    items = get_user_items(uid)
+    conn = db(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT id FROM hack_transfers WHERE hacker_id=%s AND done=FALSE",(uid,))
+        pending = cur.fetchone()
+        if pending:
+            await ctx_or_dm.send("❌ You have a pending transfer in progress. Wait for it to complete.")
+            return
+    finally:
+        release(conn)
+
+    fc = get_hack_progress(uid, bank_id)
+    bonus = fc * 0.01 if items.get("has_dlg") else 0.0
+    chance = min(HACK_BASE_CHANCE + bonus, HACK_MAX_CHANCE)
+    hv = HackChallengeView(uid, bank_id, target_uid, chance)
+    e = discord.Embed(title="💻 Hacking Terminal",
+        description=(
+            f"🎯 Target Bank: `{bank_id}`\n"
+            f"💰 Vault Balance: **{target_balance:,}**\n"
+            f"📊 Base Chance: **{chance*100:.1f}%**"
+            + (f" (+{fc}% from DLG)" if fc > 0 and items.get("has_dlg") else "") +
+            f"\n\n**Stage 1/3:** {hv.challenge}\n\n"
+            f"Solve all 3 stages to maximize your success chance!"
+        ), color=0x00FF41)
+    sv = HackStageView(hv, None)
+    msg = await ctx_or_dm.send(embed=e, view=sv)
+    sv.dm_msg = msg
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  COMMANDS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2217,7 +2293,7 @@ async def help(ctx):
         "`-vbank` — Virtual bank (5%/10min interest)\n"
         "`-deposit <amount|all>` — Deposit credits\n"
         "`-withdraw <amount|all>` — Withdraw credits\n"
-        "`-mybankid` — Your secret bank ID (DM only)\n"
+        "`-mybankid` — Your secret bank ID (sent to DMs)\n"
     ),inline=False)
     e.add_field(name="🛒 Shop & Items",value=(
         "`-shop` — Browse with quick-buy buttons\n"
@@ -2258,16 +2334,17 @@ async def help(ctx):
     e.add_field(name="🌑 Black Market (DM only · role required)",value=(
         "`-blackmarket` — View your personal BM\n"
         "`-bmbuy <item_key>` — Purchase item\n"
-        "`-usetracker <username>` — Reveal bank ID by username (one-use)\n"
+        "`-usetracker <plain_username>` — Use a tracker to reveal bank ID (DM only)\n"
+        "  *(Trackers are stackable; buy multiple from Black Market)*\n"
     ),inline=False)
     e.add_field(name="🔓 Hacking (DM only · role required)",value=(
-        "Requires: Suspicious OS + Data Leak Gen + Transfer System\n"
-        "`-hack <bank_id>` — Hack a bank (2h transfer delay)\n"
-        "`-hackuser <username>` — Look up bank ID then hack\n"
+        "Requires: **Suspicious OS** from Black Market\n"
+        "`-hack <bank_id>` — Hack a vault directly\n"
+        "`-hackuser <plain_username>` — Find user then hack (no tracker consumed)\n"
         "`-hackinventory` — Hack items & data cards\n"
         "`-hacktransfers` — Pending transfers\n"
     ),inline=False)
-    e.set_footer(text="Rob CD: 1h • Hack transfer: 2h • Career CDs: 15min–4h")
+    e.set_footer(text="Rob CD: 1h • Hack transfer: 2h • Career CDs: 15min–4h • DM commands require role")
     await ctx.send(embed=e, view=QuickNav(uid))
 
 @bot.command(aliases=["bal","wallet"])
@@ -2287,7 +2364,6 @@ async def work(ctx):
 
 @bot.command()
 async def setjob(ctx, career: str=None):
-    """Change your active career/job type."""
     uid=ctx.author.id; ensure_user(uid,str(ctx.author))
     if not career:
         await ctx.send("❌ Usage: `-setjob <career_key>` | See `-careers` for options.")
@@ -2303,16 +2379,16 @@ async def setjob(ctx, career: str=None):
     except: conn.rollback(); await ctx.send("❌ Error."); return
     finally: release(conn)
     jt=JOB_TYPES[career]
-    await ctx.send(embed=discord.Embed(title=f"✅ Career Changed!",color=0x57F287,
-        description=f"You are now a **{jt[0]} {jt[1]}**\nCooldown: **{jt[2]}h** | Pay range: **{jt[3]}–{jt[4]} cr**\n_{jt[5]}_"))
+    cd_str = f"{int(jt[2]*60)}min" if jt[2] < 1 else f"{jt[2]}h"
+    await ctx.send(embed=discord.Embed(title="✅ Career Changed!",color=0x57F287,
+        description=f"You are now a **{jt[0]} {jt[1]}**\nCooldown: **{cd_str}** | Pay range: **{jt[3]}–{jt[4]} cr**\n_{jt[5]}_"))
 
 @bot.command()
 async def careers(ctx):
-    """List all available career types."""
     e=discord.Embed(title="💼 Available Careers",color=0x5865F2,
         description="Use `-setjob <key>` to change career.\nPay is scaled by your job rank multiplier.\n")
     for key,(name,emoji,cd,mn,mx,desc) in JOB_TYPES.items():
-        cd_str=f"{int(cd*60)}min" if cd<1 else (f"{cd}h" if cd==int(cd) else f"{cd}h")
+        cd_str = f"{int(cd*60)}min" if cd < 1 else (f"{cd}h" if cd == int(cd) else f"{cd}h")
         e.add_field(name=f"{emoji} {name} — `{key}`",
             value=f"Cooldown: **{cd_str}** | Pay: **{mn}–{mx} cr** (base)\n_{desc}_",inline=False)
     e.set_footer(text="Higher pay = longer cooldown • All pay is also multiplied by rank & prestige")
@@ -2352,6 +2428,8 @@ async def items(ctx, member: discord.Member=None):
     e.add_field(name="💾 Data Leak Gen",   value=tick(inv.get("has_dlg")),               inline=True)
     e.add_field(name="💻 Suspicious OS",   value=tick(inv.get("has_sos")),               inline=True)
     e.add_field(name="📡 Transfer System", value=tick(inv.get("has_transfer")),          inline=True)
+    tc = inv.get("tracker_count") or 0
+    e.add_field(name="🕵️ Identity Trackers", value=f"**{tc}** available",              inline=True)
     mlines=[]
     if inv.get("has_cognitive_machine"): mlines.append(f"🧠 Cognitive: {'ON 🟢' if inv.get('cognitive_enabled') else 'OFF 🔴'}")
     if inv.get("has_ai_machine"):        mlines.append(f"🤖 AI: {'ON 🟢' if inv.get('ai_enabled') else 'OFF 🔴'}")
@@ -2365,7 +2443,8 @@ async def mybankid(ctx):
     bid=vb.get("bank_id") or "Not generated yet."
     try:
         await ctx.author.send(f"🏦 **Your Bank ID:**\n```\n{bid}\n```\n⚠️ Keep private! Hackers use this.")
-        await ctx.send("✅ Bank ID sent to your DMs.")
+        if not isinstance(ctx.channel, discord.DMChannel):
+            await ctx.send("✅ Bank ID sent to your DMs.")
     except discord.Forbidden:
         await ctx.send(f"🏦 **Bank ID:**\n||`{bid}`||\n*(Enable DMs for privacy)*")
 
@@ -2718,7 +2797,8 @@ async def jobrank(ctx, member: discord.Member=None):
     e.add_field(name="📊 Rank",    value=f"**{rn}** (Tier {ri+1}/{len(JOB_RANKS)})", inline=True)
     e.add_field(name="💼 Jobs",    value=f"**{wc}**",                        inline=True)
     e.add_field(name="💵 Salary",  value=f"**{cs:,}** cr/job (x{wm:.2f})",  inline=True)
-    e.add_field(name=f"{jt_info[1]} Career", value=f"**{jt_info[0]}** (CD: {jt_info[2]}h | {jt_info[3]}–{jt_info[4]} cr)", inline=True)
+    cd_str = f"{int(jt_info[2]*60)}min" if jt_info[2] < 1 else f"{jt_info[2]}h"
+    e.add_field(name=f"{jt_info[1]} Career", value=f"**{jt_info[0]}** (CD: {cd_str} | {jt_info[3]}–{jt_info[4]} cr)", inline=True)
     if nxt:
         nn,nm2,ns2,ne=nxt; need=nm2-wc; tot=nm2-pm; done=wc-pm
         bar="█"*int((done/tot)*10)+"░"*(10-int((done/tot)*10))
@@ -3053,200 +3133,296 @@ async def bank(ctx):
 # ─── Black Market ──────────────────────────────────────────────────────────────
 @bot.command()
 async def blackmarket(ctx):
-    if not isinstance(ctx.channel,discord.DMChannel):
+    if not isinstance(ctx.channel, discord.DMChannel):
         try: await ctx.message.delete()
         except: pass
-        await ctx.send("⚠️ Black Market is **DM only**.",delete_after=8); return
-    uid=ctx.author.id
-    if not await has_black_market_role(ctx.author): await ctx.send("❌ Missing required role."); return
-    bm=get_user_bm(uid)
-    if not bm: await ctx.send("🌑 No active Black Market. It appears every 2h with 10% chance!"); return
-    now=datetime.now(timezone.utc); tl=bm["expires"]-now; m=int(tl.total_seconds()//60); s=int(tl.total_seconds()%60)
-    e=discord.Embed(title="🌑 YOUR BLACK MARKET",description=f"⏳ Closes in **{m}m {s}s**\nUse `-bmbuy <key>` to purchase.\n",color=0x2F3136)
-    for key,item in BLACK_MARKET_ITEMS.items():
-        stock=bm["stock"].get(key,0)
-        if stock>0: e.add_field(name=f"{item['emoji']} {item['name']} — {item['price']:,} cr",value=f"{item['desc']}\nStock: **{stock}** | Key: `{key}`",inline=False)
-        else: e.add_field(name=f"~~{item['emoji']} {item['name']}~~ — SOLD OUT",value=f"~~{item['desc']}~~",inline=False)
-    e.set_footer(text="DM only • Extremely rare items")
+        await ctx.send("⚠️ Black Market is **DM only**.", delete_after=8); return
+    uid = ctx.author.id
+    if not await has_black_market_role(ctx.author):
+        await ctx.send("❌ Missing required role."); return
+    bm = get_user_bm(uid)
+    if not bm:
+        await ctx.send("🌑 No active Black Market. It appears every 2h with 10% chance!"); return
+    now = datetime.now(timezone.utc); tl = bm["expires"] - now
+    m = int(tl.total_seconds()//60); s = int(tl.total_seconds()%60)
+    e = discord.Embed(title="🌑 YOUR BLACK MARKET",
+        description=f"⏳ Closes in **{m}m {s}s**\nUse `-bmbuy <key>` to purchase.\n",
+        color=0x2F3136)
+    for key, item in BLACK_MARKET_ITEMS.items():
+        stock = bm["stock"].get(key, 0)
+        if stock > 0:
+            e.add_field(name=f"{item['emoji']} {item['name']} — {item['price']:,} cr",
+                value=f"{item['desc']}\nStock: **{stock}** | Key: `{key}`", inline=False)
+        else:
+            e.add_field(name=f"~~{item['emoji']} {item['name']}~~ — SOLD OUT",
+                value=f"~~{item['desc']}~~", inline=False)
+    e.set_footer(text="DM only • Trackers are stackable — buy multiple!")
     await ctx.send(embed=e)
 
 @bot.command()
 async def bmbuy(ctx, item_key: str=None):
-    if not isinstance(ctx.channel,discord.DMChannel):
+    if not isinstance(ctx.channel, discord.DMChannel):
         try: await ctx.message.delete()
         except: pass
-        await ctx.send("⚠️ DM only.",delete_after=8); return
-    uid=ctx.author.id
-    if not await has_black_market_role(ctx.author): await ctx.send("❌ Missing required role."); return
-    if not item_key: await ctx.send("❌ Usage: `-bmbuy <item_key>`"); return
-    bm=get_user_bm(uid)
-    if not bm: await ctx.send("❌ No active Black Market."); return
-    item_key=item_key.lower()
-    if item_key not in BLACK_MARKET_ITEMS: await ctx.send("❌ Unknown item. See `-blackmarket`."); return
-    if bm["stock"].get(item_key,0)<=0: await ctx.send("❌ Out of stock!"); return
-    item=BLACK_MARKET_ITEMS[item_key]; ensure_user(uid,str(ctx.author))
-    inv=get_user_items(uid)
-    perm={"data_leak_generator":"has_dlg","suspicious_os":"has_sos","transfer_system":"has_transfer","ai_machine":"has_ai_machine"}
-    if item_key in perm and inv.get(perm[item_key]): await ctx.send(f"❌ Already own **{item['name']}**."); return
-    e=discord.Embed(title="🌑 Purchase",description=f"{item['emoji']} **{item['name']}**\n{item['desc']}\n\nPrice: **{item['price']:,} cr**",color=0x2F3136)
-    await ctx.send(embed=e,view=BlackMarketBuyView(item_key,item["price"],uid))
+        await ctx.send("⚠️ DM only.", delete_after=8); return
+    uid = ctx.author.id
+    if not await has_black_market_role(ctx.author):
+        await ctx.send("❌ Missing required role."); return
+    if not item_key:
+        await ctx.send("❌ Usage: `-bmbuy <item_key>`"); return
+    bm = get_user_bm(uid)
+    if not bm:
+        await ctx.send("❌ No active Black Market."); return
+    item_key = item_key.lower()
+    if item_key not in BLACK_MARKET_ITEMS:
+        await ctx.send("❌ Unknown item. See `-blackmarket`."); return
+    if bm["stock"].get(item_key, 0) <= 0:
+        await ctx.send("❌ Out of stock!"); return
+    item = BLACK_MARKET_ITEMS[item_key]
+    ensure_user(uid, str(ctx.author))
+    inv = get_user_items(uid)
+    # Non-stackable items: check if already owned
+    perm = {
+        "data_leak_generator": "has_dlg",
+        "suspicious_os": "has_sos",
+        "transfer_system": "has_transfer",
+        "ai_machine": "has_ai_machine"
+    }
+    if item_key in perm and inv.get(perm[item_key]):
+        await ctx.send(f"❌ Already own **{item['name']}**."); return
+    e = discord.Embed(title="🌑 Purchase",
+        description=f"{item['emoji']} **{item['name']}**\n{item['desc']}\n\nPrice: **{item['price']:,} cr**",
+        color=0x2F3136)
+    await ctx.send(embed=e, view=BlackMarketBuyView(item_key, item["price"], uid))
 
+# ─── FIXED: usetracker — plain string username, stackable tracker_count ────────
 @bot.command()
 async def usetracker(ctx, *, username: str=None):
-    """Reveal a user bank ID by their in-game username. DM only."""
-    if not isinstance(ctx.channel,discord.DMChannel):
+    """
+    Reveal a user's bank ID using an Identity Tracker you own.
+    Usage: -usetracker <plain_username>   (DM only, no @ mention needed)
+    """
+    if not isinstance(ctx.channel, discord.DMChannel):
         try: await ctx.message.delete()
         except: pass
-        await ctx.send("⚠️ DM only.",delete_after=8); return
-    if not await has_black_market_role(ctx.author): await ctx.send("❌ Missing required role."); return
-    if not username: await ctx.send("❌ Usage: `-usetracker <username>`"); return
-    uid=ctx.author.id; ensure_user(uid,str(ctx.author))
-    conn=db(); cur=conn.cursor()
-    try:
-        cur.execute("SELECT id FROM black_market_log WHERE user_id=%s AND item_key='identity_tracker' ORDER BY bought_at DESC LIMIT 1",(uid,))
-        tracker=cur.fetchone()
-        if not tracker: await ctx.send("❌ No **Identity Tracker** in inventory. Buy one from the Black Market."); return
-        # Lookup target by username
-        target=find_user_by_username(username)
-        if not target: await ctx.send(f"❌ No player found with username `{username}`."); return
-        tvb=get_user_bank(target["user_id"]); bid=tvb.get("bank_id") or "No bank ID set."
-        cur.execute("DELETE FROM black_market_log WHERE id=%s",(tracker["id"],)); conn.commit()
-    except Exception as e:
-        conn.rollback(); await ctx.send("❌ Error."); return
-    finally: release(conn)
-    await ctx.send(f"🕵️ **Identity Tracker Result**\nTarget: **{target['username']}**\n```\n{bid}\n```\n⚠️ One-time use consumed. Guard this ID carefully.")
+        await ctx.send("⚠️ DM only.", delete_after=8); return
+    if not await has_black_market_role(ctx.author):
+        await ctx.send("❌ Missing required role."); return
+    if not username:
+        await ctx.send("❌ Usage: `-usetracker <username>` (plain text, no @ needed)"); return
+
+    uid = ctx.author.id
+    ensure_user(uid, str(ctx.author))
+
+    # Check tracker count
+    tc = get_tracker_count(uid)
+    if tc <= 0:
+        await ctx.send(
+            "❌ You have no **Identity Trackers**.\n"
+            "Buy one from the Black Market with `-bmbuy identity_tracker`."
+        ); return
+
+    # Strip any accidental @ from input
+    clean_username = username.strip().lstrip("@")
+
+    target = find_user_by_username(clean_username)
+    if not target:
+        await ctx.send(
+            f"❌ No player found with username `{clean_username}`.\n"
+            "Make sure to use their exact in-game username (not a Discord mention)."
+        ); return
+
+    if target["user_id"] == uid:
+        await ctx.send("❌ You can't track yourself."); return
+
+    tvb = get_user_bank(target["user_id"])
+    bid = tvb.get("bank_id") or "No bank ID set."
+
+    # Consume one tracker
+    consumed = consume_tracker(uid)
+    if not consumed:
+        await ctx.send("❌ Failed to consume tracker. Try again."); return
+
+    remaining = get_tracker_count(uid)
+    await ctx.send(
+        f"🕵️ **Identity Tracker Result**\n"
+        f"Target: **{target['username']}**\n"
+        f"```\n{bid}\n```\n"
+        f"⚠️ One tracker consumed. **{remaining}** tracker(s) remaining.\n"
+        f"You can now use `-hack {bid}` to attempt a hack."
+    )
 
 # ─── Hacking ───────────────────────────────────────────────────────────────────
 @bot.command()
 async def hack(ctx, bank_id: str=None):
-    uid=ctx.author.id; ensure_user(uid,str(ctx.author))
-    if not isinstance(ctx.channel,discord.DMChannel):
+    """
+    Hack a vault by bank ID. DM only.
+    Usage: -hack <bank_id>
+    """
+    uid = ctx.author.id
+    ensure_user(uid, str(ctx.author))
+
+    if not isinstance(ctx.channel, discord.DMChannel):
         try: await ctx.message.delete()
         except: pass
-        await ctx.send("⚠️ Hacking is **DM only**.",delete_after=8); return
-    if not await has_black_market_role(ctx.author): await ctx.send("❌ Missing required role."); return
-    if not bank_id: await ctx.send("❌ Usage: `-hack <bank_id>`\nDon't have one? Use `-usetracker <username>` first."); return
-    items=get_user_items(uid)
-    if not items.get("has_sos"): await ctx.send("❌ Need **Suspicious Operating System** from the Black Market."); return
-    conn=db(); cur=conn.cursor()
+        await ctx.send("⚠️ Hacking is **DM only**.", delete_after=8); return
+    if not await has_black_market_role(ctx.author):
+        await ctx.send("❌ Missing required role."); return
+    if not bank_id:
+        await ctx.send(
+            "❌ Usage: `-hack <bank_id>`\n"
+            "Don't have a bank ID? Use `-usetracker <username>` first."
+        ); return
+
+    items = get_user_items(uid)
+    if not items.get("has_sos"):
+        await ctx.send(
+            "❌ Need **Suspicious Operating System** from the Black Market to hack.\n"
+            "Buy it with `-bmbuy suspicious_os`."
+        ); return
+
+    # Find target by bank ID
+    conn = db(); cur = conn.cursor()
     try:
-        cur.execute("SELECT user_id,balance FROM user_bank WHERE bank_id=%s",(bank_id,)); tb=cur.fetchone()
-        if not tb: await ctx.send("❌ Bank ID not found. Double-check it."); return
-        if tb["user_id"]==uid: await ctx.send("❌ Can't hack yourself."); return
-        cur.execute("SELECT id FROM hack_transfers WHERE hacker_id=%s AND done=FALSE",(uid,)); pending=cur.fetchone()
-        if pending: await ctx.send("❌ You have a pending transfer in progress. Wait for it to complete."); return
-    finally: release(conn)
-    fc=get_hack_progress(uid,bank_id)
-    bonus=fc*0.01 if items.get("has_dlg") else 0.0
-    chance=min(HACK_BASE_CHANCE+bonus,HACK_MAX_CHANCE)
-    hv=HackChallengeView(uid,bank_id,tb["user_id"],chance)
-    e=discord.Embed(title="💻 Hacking Terminal",
-        description=(f"🎯 Target Bank: `{bank_id}`\n💰 Vault Balance: **{tb['balance']:,}**\n"
-                     f"📊 Base Chance: **{chance*100:.1f}%**\n\n"
-                     f"**Stage 1/3:** {hv.challenge}\n\nSolve all 3 stages to maximize your success chance!"),color=0x00FF41)
-    sv=HackStageView(hv,None); msg=await ctx.send(embed=e,view=sv); sv.dm_msg=msg
+        cur.execute("SELECT user_id, balance FROM user_bank WHERE bank_id=%s", (bank_id,))
+        tb = cur.fetchone()
+    finally:
+        release(conn)
+
+    if not tb:
+        await ctx.send("❌ Bank ID not found. Double-check it."); return
+    if tb["user_id"] == uid:
+        await ctx.send("❌ Can't hack yourself."); return
+
+    await _start_hack(ctx, uid, bank_id, tb["user_id"], tb["balance"])
 
 @bot.command()
 async def hackuser(ctx, *, username: str=None):
-    """Look up a username and immediately attempt a hack if you have a Tracker on file. DM only."""
-    uid=ctx.author.id; ensure_user(uid,str(ctx.author))
-    if not isinstance(ctx.channel,discord.DMChannel):
+    """
+    Look up a player username and hack them directly (no tracker consumed).
+    DM only. Usage: -hackuser <plain_username>
+    """
+    uid = ctx.author.id
+    ensure_user(uid, str(ctx.author))
+
+    if not isinstance(ctx.channel, discord.DMChannel):
         try: await ctx.message.delete()
         except: pass
-        await ctx.send("⚠️ Hacking is **DM only**.",delete_after=8); return
-    if not await has_black_market_role(ctx.author): await ctx.send("❌ Missing required role."); return
-    if not username: await ctx.send("❌ Usage: `-hackuser <username>`"); return
-    items=get_user_items(uid)
-    if not items.get("has_sos"): await ctx.send("❌ Need **Suspicious Operating System**."); return
-    target=find_user_by_username(username)
-    if not target: await ctx.send(f"❌ No player found with username `{username}`. Try `-usetracker` first to get their bank ID."); return
-    if target["user_id"]==uid: await ctx.send("❌ Can't hack yourself."); return
-    tvb=get_user_bank(target["user_id"]); bank_id=tvb.get("bank_id")
-    if not bank_id: await ctx.send(f"❌ **{target['username']}** has no bank ID yet."); return
-    # Proxy into hack
-    conn=db(); cur=conn.cursor()
-    try:
-        cur.execute("SELECT id FROM hack_transfers WHERE hacker_id=%s AND done=FALSE",(uid,)); pending=cur.fetchone()
-        if pending: await ctx.send("❌ You have a pending transfer. Wait for it first."); return
-    finally: release(conn)
-    fc=get_hack_progress(uid,bank_id)
-    bonus=fc*0.01 if items.get("has_dlg") else 0.0
-    chance=min(HACK_BASE_CHANCE+bonus,HACK_MAX_CHANCE)
-    hv=HackChallengeView(uid,bank_id,target["user_id"],chance)
-    e=discord.Embed(title="💻 Hacking Terminal",
-        description=(f"🎯 Target: **{target['username']}**\n🏦 Bank: `{bank_id}`\n"
-                     f"💰 Vault: **{tvb['balance']:,}**\n📊 Chance: **{chance*100:.1f}%**\n\n"
-                     f"**Stage 1/3:** {hv.challenge}\n\nSolve all 3 stages to maximize success!"),color=0x00FF41)
-    sv=HackStageView(hv,None); msg=await ctx.send(embed=e,view=sv); sv.dm_msg=msg
+        await ctx.send("⚠️ Hacking is **DM only**.", delete_after=8); return
+    if not await has_black_market_role(ctx.author):
+        await ctx.send("❌ Missing required role."); return
+    if not username:
+        await ctx.send("❌ Usage: `-hackuser <plain_username>`"); return
+
+    items = get_user_items(uid)
+    if not items.get("has_sos"):
+        await ctx.send(
+            "❌ Need **Suspicious Operating System** from the Black Market.\n"
+            "Buy it with `-bmbuy suspicious_os`."
+        ); return
+
+    clean_username = username.strip().lstrip("@")
+    target = find_user_by_username(clean_username)
+    if not target:
+        await ctx.send(
+            f"❌ No player found with username `{clean_username}`.\n"
+            "Use `-usetracker <username>` to get their bank ID first, then `-hack <bank_id>`."
+        ); return
+    if target["user_id"] == uid:
+        await ctx.send("❌ Can't hack yourself."); return
+
+    tvb = get_user_bank(target["user_id"])
+    bank_id = tvb.get("bank_id")
+    if not bank_id:
+        await ctx.send(f"❌ **{target['username']}** has no bank ID yet."); return
+
+    await _start_hack(ctx, uid, bank_id, target["user_id"], tvb["balance"])
 
 @bot.command()
 async def hackinventory(ctx):
-    uid=ctx.author.id; ensure_user(uid,str(ctx.author)); items=get_user_items(uid)
-    conn=db(); cur=conn.cursor()
+    uid = ctx.author.id; ensure_user(uid, str(ctx.author))
+    items = get_user_items(uid)
+    conn = db(); cur = conn.cursor()
     try:
-        cur.execute("SELECT * FROM data_cards WHERE owner_id=%s ORDER BY created_at DESC LIMIT 10",(uid,)); cards=cur.fetchall()
-        cur.execute("SELECT * FROM hack_progress WHERE hacker_id=%s ORDER BY fail_count DESC",(uid,)); prog=cur.fetchall()
-    finally: release(conn)
-    tick=lambda h: "✅" if h else "❌"
-    e=discord.Embed(title="🔓 Hack Inventory",color=0x00FF41)
-    e.add_field(name="💻 Suspicious OS",  value=tick(items.get("has_sos")),     inline=True)
-    e.add_field(name="💾 Data Leak Gen",  value=tick(items.get("has_dlg")),     inline=True)
-    e.add_field(name="📡 Transfer System",value=tick(items.get("has_transfer")),inline=True)
+        cur.execute("SELECT * FROM data_cards WHERE owner_id=%s ORDER BY created_at DESC LIMIT 10", (uid,))
+        cards = cur.fetchall()
+        cur.execute("SELECT * FROM hack_progress WHERE hacker_id=%s ORDER BY fail_count DESC", (uid,))
+        prog = cur.fetchall()
+    finally:
+        release(conn)
+
+    tick = lambda h: "✅" if h else "❌"
+    tc = items.get("tracker_count") or 0
+    e = discord.Embed(title="🔓 Hack Inventory", color=0x00FF41)
+    e.add_field(name="💻 Suspicious OS",   value=tick(items.get("has_sos")),      inline=True)
+    e.add_field(name="💾 Data Leak Gen",   value=tick(items.get("has_dlg")),      inline=True)
+    e.add_field(name="📡 Transfer System", value=tick(items.get("has_transfer")), inline=True)
+    e.add_field(name="🕵️ Trackers",       value=f"**{tc}** available",           inline=True)
     if cards:
-        e.add_field(name="🃏 Data Cards",value="\n".join(f"`{c['target_bank_id'][:20]}...` — {c['fail_count_snapshot']} fail(s)" for c in cards),inline=False)
+        e.add_field(name="🃏 Data Cards",
+            value="\n".join(f"`{c['target_bank_id'][:20]}...` — {c['fail_count_snapshot']} fail(s)" for c in cards),
+            inline=False)
     if prog:
-        e.add_field(name="📊 Progress",value="\n".join(f"`{p['target_bank_id'][:25]}...` — {p['fail_count']} fail(s) → {min(HACK_BASE_CHANCE*100+p['fail_count'],HACK_MAX_CHANCE*100):.1f}%" for p in prog),inline=False)
+        e.add_field(name="📊 Hack Progress",
+            value="\n".join(
+                f"`{p['target_bank_id'][:25]}...` — {p['fail_count']} fail(s) → "
+                f"{min(HACK_BASE_CHANCE*100 + p['fail_count'], HACK_MAX_CHANCE*100):.1f}%"
+                for p in prog
+            ), inline=False)
     e.set_footer(text="-hack <bank_id> or -hackuser <username> in DMs • Transfer delay: 2h")
     await ctx.send(embed=e)
 
 @bot.command()
 async def hacktransfers(ctx):
-    uid=ctx.author.id; ensure_user(uid,str(ctx.author))
-    conn=db(); cur=conn.cursor()
+    uid = ctx.author.id; ensure_user(uid, str(ctx.author))
+    conn = db(); cur = conn.cursor()
     try:
-        cur.execute("SELECT * FROM hack_transfers WHERE hacker_id=%s ORDER BY completes_at ASC",(uid,)); rows=cur.fetchall()
-    finally: release(conn)
-    if not rows: await ctx.send("📡 No hack transfers."); return
-    e=discord.Embed(title="📡 Hack Transfers",color=0x00FF41)
+        cur.execute("SELECT * FROM hack_transfers WHERE hacker_id=%s ORDER BY completes_at ASC", (uid,))
+        rows = cur.fetchall()
+    finally:
+        release(conn)
+    if not rows:
+        await ctx.send("📡 No hack transfers."); return
+    e = discord.Embed(title="📡 Hack Transfers", color=0x00FF41)
     for r in rows:
-        comp=r["completes_at"]
-        if comp.tzinfo is None: comp=comp.replace(tzinfo=timezone.utc)
-        status="✅ Done" if r["done"] else f"⏳ <t:{int(comp.timestamp())}:R>"
-        e.add_field(name=f"Transfer #{r['id']}",value=f"**{r['amount']:,} credits** | {status}",inline=False)
+        comp = r["completes_at"]
+        if comp.tzinfo is None: comp = comp.replace(tzinfo=timezone.utc)
+        status = "✅ Done" if r["done"] else f"⏳ <t:{int(comp.timestamp())}:R>"
+        e.add_field(name=f"Transfer #{r['id']}", value=f"**{r['amount']:,} credits** | {status}", inline=False)
     await ctx.send(embed=e)
 
 # ─── Admin ─────────────────────────────────────────────────────────────────────
 @bot.command(aliases=["removecredits","deduct"])
 async def rmcredits(ctx, member: discord.Member, amount: int):
-    if ctx.author.id!=ADMIN_ID: await ctx.send("❌ No permission."); return
-    if amount<=0: await ctx.send("❌ Positive only."); return
-    ensure_user(member.id,str(member))
-    conn=db(); cur=conn.cursor()
+    if ctx.author.id != ADMIN_ID: await ctx.send("❌ No permission."); return
+    if amount <= 0: await ctx.send("❌ Positive only."); return
+    ensure_user(member.id, str(member))
+    conn = db(); cur = conn.cursor()
     try:
-        cur.execute("UPDATE users SET credits=GREATEST(0,credits-%s) WHERE user_id=%s",(amount,member.id))
-        cur.execute("INSERT INTO credit_log(user_id,amount,reason) VALUES(%s,%s,'admin_deduct')",(member.id,-amount))
+        cur.execute("UPDATE users SET credits=GREATEST(0,credits-%s) WHERE user_id=%s", (amount, member.id))
+        cur.execute("INSERT INTO credit_log(user_id,amount,reason) VALUES(%s,%s,'admin_deduct')", (member.id, -amount))
         conn.commit(); _cache_invalidate(member.id)
     except: conn.rollback(); await ctx.send("❌ Error."); return
     finally: release(conn)
-    u=get_user(member.id)
-    await ctx.send(embed=discord.Embed(title="🛠️ Credits Removed",color=discord.Color.orange(),
+    u = get_user(member.id)
+    await ctx.send(embed=discord.Embed(title="🛠️ Credits Removed", color=discord.Color.orange(),
         description=f"**{member}** — Removed **{amount:,}** | New balance: **{u['credits']:,}**"))
 
 @bot.command()
 async def addcredits(ctx, member: discord.Member, amount: int):
-    if ctx.author.id!=ADMIN_ID: await ctx.send("❌ No permission."); return
-    ensure_user(member.id,str(member))
+    if ctx.author.id != ADMIN_ID: await ctx.send("❌ No permission."); return
+    ensure_user(member.id, str(member))
     add_credits(member.id, amount, "admin_add")
-    u=get_user(member.id)
-    await ctx.send(embed=discord.Embed(title="🛠️ Credits Added",color=discord.Color.green(),
+    u = get_user(member.id)
+    await ctx.send(embed=discord.Embed(title="🛠️ Credits Added", color=discord.Color.green(),
         description=f"**{member}** — Added **{amount:,}** | New balance: **{u['credits']:,}**"))
 
 @bot.command()
 async def givecoin(ctx, member: discord.Member):
-    if ctx.author.id!=ADMIN_ID: await ctx.send("❌ No permission."); return
-    ensure_user(member.id,str(member))
-    c=generate_coin()
-    conn=db(); cur=conn.cursor()
+    if ctx.author.id != ADMIN_ID: await ctx.send("❌ No permission."); return
+    ensure_user(member.id, str(member))
+    c = generate_coin()
+    conn = db(); cur = conn.cursor()
     try:
         cur.execute("""INSERT INTO coins(owner_id,material,variant,status,float,serial,
             base_value,mat_mult,var_mult,sta_mult,flt_mult,ser_mult,total_mult,value)
@@ -3254,31 +3430,48 @@ async def givecoin(ctx, member: discord.Member):
             (member.id,c["material"],c["variant"],c["status"],c["float"],c["serial"],
              c["base_value"],c["mat_mult"],c["var_mult"],c["sta_mult"],c["flt_mult"],
              c["ser_mult"],c["total_mult"],c["value"]))
-        sync_coin_count(member.id,cur); conn.commit(); _cache_invalidate(member.id)
+        sync_coin_count(member.id, cur); conn.commit(); _cache_invalidate(member.id)
     except: conn.rollback(); await ctx.send("❌ Error."); return
     finally: release(conn)
-    mkt=get_market_price(c)
+    mkt = get_market_price(c)
     await ctx.send(f"✅ Gave **{member}** a **{c['variant']} {c['material']} Coin** (Market: ${mkt:.4f})")
 
 @bot.command()
 async def setannouncechannel(ctx):
-    if ctx.author.id!=ADMIN_ID: await ctx.send("❌ No permission."); return
-    global _announce_channel_id; _announce_channel_id=ctx.channel.id
+    if ctx.author.id != ADMIN_ID: await ctx.send("❌ No permission."); return
+    global _announce_channel_id; _announce_channel_id = ctx.channel.id
     await ctx.send(f"✅ Announcements → **#{ctx.channel.name}**")
 
 @bot.command()
 async def forcemarketupdate(ctx):
-    if ctx.author.id!=ADMIN_ID: await ctx.send("❌ No permission."); return
-    event=generate_market_prices()
-    if event: ev_type,mat,mult=event; await ctx.send(f"✅ Market updated! **{ev_type.upper()}** on **{mat}** x{mult}")
-    else: await ctx.send("✅ Market updated. No event.")
+    if ctx.author.id != ADMIN_ID: await ctx.send("❌ No permission."); return
+    event = generate_market_prices()
+    if event:
+        ev_type, mat, mult = event
+        await ctx.send(f"✅ Market updated! **{ev_type.upper()}** on **{mat}** x{mult}")
+    else:
+        await ctx.send("✅ Market updated. No event.")
 
 @bot.command()
 async def forceblackmarket(ctx, member: discord.Member=None):
-    if ctx.author.id!=ADMIN_ID: await ctx.send("❌ No permission."); return
-    target=member or ctx.author; bm=spawn_user_bm(target.id)
+    if ctx.author.id != ADMIN_ID: await ctx.send("❌ No permission."); return
+    target = member or ctx.author
+    spawn_user_bm(target.id)
     await ctx.send(f"✅ Black Market spawned for **{target}** for {BLACK_MARKET_DURATION_MIN} minutes.")
+
+# Admin: give trackers directly
+@bot.command()
+async def givetrackers(ctx, member: discord.Member, amount: int=1):
+    if ctx.author.id != ADMIN_ID: await ctx.send("❌ No permission."); return
+    if amount <= 0: await ctx.send("❌ Amount must be > 0."); return
+    ensure_user(member.id, str(member))
+    conn = db(); cur = conn.cursor()
+    try:
+        cur.execute("UPDATE user_items SET tracker_count = tracker_count + %s WHERE user_id=%s", (amount, member.id))
+        conn.commit(); _cache_invalidate(member.id)
+    except: conn.rollback(); await ctx.send("❌ Error."); return
+    finally: release(conn)
+    await ctx.send(f"✅ Gave **{member}** **{amount}** tracker(s).")
 
 # ─── Run ───────────────────────────────────────────────────────────────────────
 bot.run(TOKEN)
-'''
