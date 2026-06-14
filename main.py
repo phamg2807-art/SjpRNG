@@ -17,29 +17,20 @@ from functools import lru_cache
 
 sys.stdout.reconfigure(line_buffering=True)
 
-# ─── Flask Keep-Alive ──────────────────────────────────────────────────────────
 app = Flask('')
 @app.route('/')
 def home(): return "CoinVault Bot is alive!"
 Thread(target=lambda: app.run(host='0.0.0.0', port=8080), daemon=True).start()
 
-# ─── Environment ──────────────────────────────────────────────────────────────
 DB_URL = os.getenv('DATABASE_URL') or exit("ERROR: DATABASE_URL missing!")
 TOKEN  = os.getenv('DISCORD_TOKEN')  or exit("ERROR: DISCORD_TOKEN missing!")
 
-# ─── Connection Pool ──────────────────────────────────────────────────────────
 _pool = None
 
 def get_pool():
     global _pool
     if _pool is None or _pool.closed:
-        _pool = ThreadedConnectionPool(
-            4, 20,
-            dsn=DB_URL,
-            cursor_factory=RealDictCursor,
-            sslmode='require',
-            connect_timeout=10
-        )
+        _pool = ThreadedConnectionPool(4, 20, dsn=DB_URL, cursor_factory=RealDictCursor, sslmode='require', connect_timeout=10)
     return _pool
 
 def db():
@@ -51,7 +42,6 @@ def release(conn):
     except Exception:
         pass
 
-# ─── In-Memory Cache ──────────────────────────────────────────────────────────
 _user_cache: dict = {}
 _items_cache: dict = {}
 _bank_cache: dict = {}
@@ -71,7 +61,6 @@ def _cache_invalidate(uid: int):
     _items_cache.pop(uid, None)
     _bank_cache.pop(uid, None)
 
-# ─── Constants ─────────────────────────────────────────────────────────────────
 CRATE_COST         = 100
 CRATE_FEE_PCT      = 0.10
 TRADE_TAX_PCT      = 0.05
@@ -91,7 +80,6 @@ BANK_INTEREST_PCT  = 0.05
 BANK_INTEREST_MINS = 10
 TRANSFER_DELAY_MINS = 120
 
-# Economy growth
 SUPPLY_DECAY_MINS   = 60
 SUPPLY_DECAY_RATE   = 0.85
 DEMAND_IMPACT       = 0.15
@@ -103,24 +91,24 @@ BOOM_MULT           = 2.5
 BUST_MULT           = 0.4
 EVENT_DURATION_MINS = 40
 
-# Black Market
 BLACK_MARKET_CHANNEL_ID    = 1514515923455705178
 BLACK_MARKET_CHANCE        = 0.10
 BLACK_MARKET_DURATION_MIN  = 15
 BLACK_MARKET_ROLE_ID       = 1515614836653031475
 
-# Hacking
 HACK_BASE_CHANCE = 0.01
 HACK_MAX_CHANCE  = 0.51
 HACK_MIN_EARN    = 2000
 HACK_MAX_EARN    = 25000
 HACK_PENALTY_PCT = 0.10
 
-# Admin
 ADMIN_ID = 920309927375933490
 
-# ─── Job Types (selectable careers, each with own cooldown & income range) ─────
-# Format: key -> (display_name, emoji, cooldown_hours, base_min, base_max, description)
+# Material stock constants
+MATERIAL_DEFAULT_STOCK = 500
+MATERIAL_MAX_STOCK = 2000
+MINER_MINE_AMOUNT = 50
+
 JOB_TYPES = {
     "miner":      ("Miner",           "⛏️",  0.25, 15,  40,  "Mine resources underground"),
     "trader":     ("Trader",          "📦",  0.50, 25,  70,  "Trade goods at the market"),
@@ -132,7 +120,6 @@ JOB_TYPES = {
     "executive":  ("Executive",       "👔",  4.00, 400, 900, "Run high-level operations"),
 }
 
-# ─── Job Ranks (progression within a job type) ─────────────────────────────────
 JOB_RANKS = [
     ("Intern",       0,    20,   "🟤"),
     ("Junior Worker",5,    35,   "⚪"),
@@ -178,15 +165,35 @@ def get_next_job_rank(work_count: int):
         return nxt[0], nxt[1], nxt[2], nxt[3]
     return None
 
-# ─── Coin Tables ───────────────────────────────────────────────────────────────
+# (name, mat_mult, rarity_denominator)
 MATERIALS = [
-    ("Plastic",  0.50, 10), ("Wood",    0.75,  8), ("Stone",   1.00,  6),
-    ("Bronze",   1.20,  8), ("Copper",  1.25,  9), ("Iron",    1.50, 12),
-    ("Steel",    1.60, 14), ("Gold",    3.00, 30), ("Aluminum",1.75, 18),
-    ("Carbon",   2.00, 20), ("Tungsten",2.25, 25), ("Obsidian",2.50, 30),
-    ("Topaz",    2.30, 25), ("Diamond", 5.00,100), ("Amethyst",10.00,250),
-    ("Plasma", 100.00,2500),
+    ("Plastic",    0.50,    10),
+    ("Wood",       0.75,     8),
+    ("Stone",      1.00,     6),
+    ("Bronze",     1.20,     8),
+    ("Copper",     1.25,     9),
+    ("Iron",       1.50,    12),
+    ("Steel",      1.60,    14),
+    ("Gold",       3.00,    30),
+    ("Aluminum",   1.75,    18),
+    ("Carbon",     2.00,    20),
+    ("Tungsten",   2.25,    25),
+    ("Obsidian",   2.50,    30),
+    ("Topaz",      2.30,    25),
+    ("Cobalt",     3.00,    35),
+    ("Diamond",   20.00,   100),
+    ("Jade",       8.00,    50),
+    ("Ruby",      10.00,    75),
+    ("Amethyst",  10.00,   250),
+    ("Plasma",   100.00,  2500),
+    ("Plutonium",110.00,  3000),
+    ("Tritium",  120.00,  3500),
+    ("Dark Matter",300.00,25000),
+    ("Antimatter",500.00,150000),
 ]
+
+ALL_MATERIAL_NAMES = [m[0] for m in MATERIALS]
+
 VARIANTS = [
     ("Brown",    0.75,  4), ("Gray",    1.00, 2), ("Blue",    1.50,  6),
     ("Yellow",   1.75, 10), ("Black",   1.80,12), ("White",   2.00, 15),
@@ -211,7 +218,6 @@ FLOATS = [
     ("Dimensional", 200.00,1000), ("Illusional",   250.00,2000),
 ]
 
-# ─── Job work actions per job type ─────────────────────────────────────────────
 JOB_TYPE_ACTIONS = {
     "miner":     ["drilled through the rock face","hauled ore carts to the surface","set charges in the deep shaft","extracted rare minerals","shored up the mine tunnels"],
     "trader":    ["brokered a bulk deal","flipped coins at the bazaar","negotiated rare goods import","moved a shipment across borders","cleared warehouse inventory"],
@@ -224,13 +230,30 @@ JOB_TYPE_ACTIONS = {
 }
 WORK_ACTIONS = [a for actions in JOB_TYPE_ACTIONS.values() for a in actions]
 
-# ─── Market Price Ranges ───────────────────────────────────────────────────────
 MATERIAL_PRICE_RANGES = {
-    "Plastic":(0.4,0.9),"Wood":(0.6,0.9),"Stone":(0.8,1.5),"Bronze":(1.0,2.0),
-    "Copper":(1.1,2.3),"Iron":(1.3,2.8),"Steel":(1.5,3.0),"Gold":(2.5,5.0),
-    "Aluminum":(1.5,4.0),"Carbon":(1.5,3.0),"Tungsten":(2.0,5.0),
-    "Obsidian":(2.3,6.0),"Topaz":(2.1,5.5),"Diamond":(5.0,10.0),
-    "Amethyst":(10.0,30.0),"Plasma":(100.0,250.0),
+    "Plastic":    (0.4,   0.9),
+    "Wood":       (0.6,   0.9),
+    "Stone":      (0.8,   1.5),
+    "Bronze":     (1.0,   2.0),
+    "Copper":     (1.1,   2.3),
+    "Iron":       (1.3,   2.8),
+    "Steel":      (1.5,   3.0),
+    "Gold":       (2.5,   5.0),
+    "Aluminum":   (1.5,   4.0),
+    "Carbon":     (1.5,   3.0),
+    "Tungsten":   (2.0,   5.0),
+    "Obsidian":   (2.3,   6.0),
+    "Topaz":      (2.1,   5.5),
+    "Cobalt":     (2.7,   3.8),
+    "Diamond":    (15.0, 30.0),
+    "Jade":       (7.5,  10.0),
+    "Ruby":       (8.0,  12.0),
+    "Amethyst":   (10.0, 30.0),
+    "Plasma":     (100.0,250.0),
+    "Plutonium":  (100.0,120.0),
+    "Tritium":    (115.0,125.0),
+    "Dark Matter":(275.0,400.0),
+    "Antimatter": (450.0,1000.0),
 }
 FLOAT_PRICE_RANGES = {
     "Bad":(0.3,1.0),"Good":(0.7,1.3),"Great":(1.6,2.4),"Amazing":(2.5,3.5),
@@ -246,7 +269,6 @@ STATUS_PRICE_RANGES = {
     "Shiny":(1.75,5.0),"Modern":(2.0,6.0),"Elegant":(2.5,8.0),"Stunning":(2.75,10.0),
 }
 
-# ─── Economy State ─────────────────────────────────────────────────────────────
 _market_prices = {"materials":{},"floats":{},"statuses":{},"last_updated":None}
 _supply_counters   = {m: 0.0 for m in MATERIAL_PRICE_RANGES}
 _supply_last_decay = time.monotonic()
@@ -254,7 +276,15 @@ _market_events: dict = {}
 _user_black_markets: dict = {}
 _announce_channel_id = None
 
-# ─── Shop Items ────────────────────────────────────────────────────────────────
+# In-memory material stock cache (loaded from DB on ready)
+_material_stocks: dict = {}
+
+def get_material_stock(material: str) -> int:
+    return _material_stocks.get(material, MATERIAL_DEFAULT_STOCK)
+
+def set_material_stock_cache(material: str, amount: int):
+    _material_stocks[material] = max(0, amount)
+
 SHOP_ITEMS = {
     "crate":              {"cost": 100,   "desc": "Open a coin crate"},
     "crate_x3":           {"cost": 270,   "desc": "Open 3 crates (10% off)"},
@@ -268,7 +298,6 @@ SHOP_ITEMS = {
     "rename":             {"cost": 200,   "desc": "Rename a coin"},
 }
 
-# ─── Black Market Items ────────────────────────────────────────────────────────
 BLACK_MARKET_ITEMS = {
     "identity_tracker":     {"name":"Identity Tracker",             "price":5100,  "stock":10,"chance":0.60,"desc":"Reveal a user bank ID by username (one-time use per purchase).","emoji":"🕵️"},
     "data_leak_generator":  {"name":"Data Leak Generator",          "price":15500, "stock":1, "chance":0.30,"desc":"Each failed hack gives +1% success chance (max 51%).","emoji":"💾"},
@@ -277,7 +306,6 @@ BLACK_MARKET_ITEMS = {
     "ai_machine":           {"name":"AI Machine",                   "price":50000, "stock":1, "chance":0.20,"desc":"Auto-work every 15min @ 2x salary.","emoji":"🤖"},
 }
 
-# ─── Supply & Demand ──────────────────────────────────────────────────────────
 def record_material_sale(material: str, qty: int = 1):
     if material in _supply_counters:
         _supply_counters[material] += qty
@@ -302,6 +330,20 @@ def get_event_mult(material: str) -> float:
     ev  = _market_events.get(material)
     if ev and now < ev["expires"]:
         return ev["mult"]
+    return 1.0
+
+def get_stock_price_mult(material: str) -> float:
+    stock = get_material_stock(material)
+    if stock <= 0:
+        return 2.0
+    if stock < 50:
+        return 1.5
+    if stock < 150:
+        return 1.2
+    if stock > 1000:
+        return 0.85
+    if stock > 500:
+        return 0.95
     return 1.0
 
 def maybe_trigger_market_event():
@@ -331,7 +373,7 @@ def generate_market_prices():
     mat = {}
     for name,(lo,hi) in MATERIAL_PRICE_RANGES.items():
         base   = random.uniform(lo, hi)
-        raw    = base * get_supply_demand_mult(name) * get_event_mult(name)
+        raw    = base * get_supply_demand_mult(name) * get_event_mult(name) * get_stock_price_mult(name)
         mat[name] = round(max(lo*0.5, min(raw, hi*3.0)), 4)
     flt = {n: round(random.uniform(lo,hi),4) for n,(lo,hi) in FLOAT_PRICE_RANGES.items()}
     sta = {n: round(random.uniform(lo,hi),4) for n,(lo,hi) in STATUS_PRICE_RANGES.items()}
@@ -380,6 +422,26 @@ def weighted_choice(table):
             return name, mult
     return table[-1][0], table[-1][1]
 
+def weighted_choice_materials_with_stock():
+    available = []
+    for name, mat_mult, rarity_denom in MATERIALS:
+        stock = get_material_stock(name)
+        if stock <= 0:
+            continue
+        weight = (1.0 / rarity_denom) * (1.0 + (MATERIAL_DEFAULT_STOCK - min(stock, MATERIAL_DEFAULT_STOCK)) / MATERIAL_DEFAULT_STOCK * 0.5)
+        available.append((name, mat_mult, weight))
+    if not available:
+        name, mat_mult, _ = MATERIALS[0]
+        return name, mat_mult
+    total = sum(w for _,_,w in available)
+    r = random.uniform(0, total)
+    cum = 0
+    for name, mat_mult, w in available:
+        cum += w
+        if r <= cum:
+            return name, mat_mult
+    return available[-1][0], available[-1][1]
+
 def serial_multiplier(s: int):
     if s > 0 and s % 1000 == 0: return s, 10.0
     if s == 9999:                return s, 10.0
@@ -391,7 +453,7 @@ def serial_multiplier(s: int):
     return s, 1.0
 
 def generate_coin():
-    material, mat_mult = weighted_choice(MATERIALS)
+    material, mat_mult = weighted_choice_materials_with_stock()
     variant,  var_mult = weighted_choice(VARIANTS)
     status,   sta_mult = weighted_choice(STATUSES)
     float_n,  flt_mult = weighted_choice(FLOATS)
@@ -447,16 +509,12 @@ def generate_bank_id() -> str:
     seg   = lambda n: "".join(random.choices(chars, k=n))
     return f"CVB-{seg(4)}-{seg(6)}-{seg(4)}-{seg(8)}"
 
-# ─── Username lookup helper ────────────────────────────────────────────────────
 def find_user_by_username(username: str):
-    """Find a user row by stored username (case-insensitive, partial match)."""
     conn = db(); cur = conn.cursor()
     try:
-        # Exact match first
         cur.execute("SELECT * FROM users WHERE LOWER(username) = LOWER(%s)", (username,))
         row = cur.fetchone()
         if not row:
-            # Partial match fallback
             cur.execute("SELECT * FROM users WHERE LOWER(username) LIKE LOWER(%s) LIMIT 1", (f"%{username}%",))
             row = cur.fetchone()
         return dict(row) if row else None
@@ -465,9 +523,7 @@ def find_user_by_username(username: str):
     finally:
         release(conn)
 
-# ─── Tracker ownership helper ──────────────────────────────────────────────────
 def get_tracker_count(uid: int) -> int:
-    """Return how many unused Identity Trackers the user owns."""
     conn = db(); cur = conn.cursor()
     try:
         cur.execute("SELECT tracker_count FROM user_items WHERE user_id=%s", (uid,))
@@ -479,7 +535,6 @@ def get_tracker_count(uid: int) -> int:
         release(conn)
 
 def consume_tracker(uid: int) -> bool:
-    """Consume one tracker. Returns True if successful."""
     conn = db(); cur = conn.cursor()
     try:
         cur.execute("SELECT tracker_count FROM user_items WHERE user_id=%s", (uid,))
@@ -495,7 +550,6 @@ def consume_tracker(uid: int) -> bool:
     finally:
         release(conn)
 
-# ─── Black Market Helpers ──────────────────────────────────────────────────────
 def _generate_bm_stock():
     return {k: item["stock"] for k,item in BLACK_MARKET_ITEMS.items() if random.random() < item["chance"]}
 
@@ -512,7 +566,6 @@ def spawn_user_bm(uid: int):
     _user_black_markets[uid] = bm
     return bm
 
-# ─── Role Check ────────────────────────────────────────────────────────────────
 async def has_black_market_role(user) -> bool:
     for guild in bot.guilds:
         member = guild.get_member(user.id)
@@ -520,7 +573,40 @@ async def has_black_market_role(user) -> bool:
             return True
     return False
 
-# ─── DB Init ──────────────────────────────────────────────────────────────────
+def load_material_stocks():
+    conn = db(); cur = conn.cursor()
+    try:
+        cur.execute("SELECT material, stock FROM material_stocks")
+        rows = cur.fetchall()
+        for r in rows:
+            _material_stocks[r["material"]] = r["stock"]
+        for mat in ALL_MATERIAL_NAMES:
+            if mat not in _material_stocks:
+                _material_stocks[mat] = MATERIAL_DEFAULT_STOCK
+    except Exception as e:
+        print(f"load_material_stocks error: {e}")
+        for mat in ALL_MATERIAL_NAMES:
+            _material_stocks[mat] = MATERIAL_DEFAULT_STOCK
+    finally:
+        release(conn)
+
+def db_update_stock(material: str, delta: int):
+    conn = db(); cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO material_stocks(material, stock) VALUES(%s, %s)
+            ON CONFLICT(material) DO UPDATE SET stock = GREATEST(0, material_stocks.stock + %s)
+            RETURNING stock
+        """, (material, max(0, MATERIAL_DEFAULT_STOCK + delta), delta))
+        row = cur.fetchone()
+        if row:
+            set_material_stock_cache(material, row["stock"])
+        conn.commit()
+    except Exception as e:
+        conn.rollback(); print(f"db_update_stock error: {e}")
+    finally:
+        release(conn)
+
 def init_db():
     conn = db(); cur = conn.cursor()
     cur.execute("""
@@ -605,7 +691,6 @@ def init_db():
             created_at  TIMESTAMP DEFAULT NOW()
         )
     """)
-    # user_items — note tracker_count column for stackable trackers
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_items (
             user_id               BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
@@ -622,8 +707,15 @@ def init_db():
             tracker_count         INT DEFAULT 0
         )
     """)
-    # Add tracker_count if upgrading from older schema
     cur.execute("ALTER TABLE user_items ADD COLUMN IF NOT EXISTS tracker_count INT DEFAULT 0")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS material_stocks (
+            material   TEXT PRIMARY KEY,
+            stock      INT DEFAULT 500
+        )
+    """)
+    for mat in ALL_MATERIAL_NAMES:
+        cur.execute("INSERT INTO material_stocks(material, stock) VALUES(%s, %s) ON CONFLICT(material) DO NOTHING", (mat, MATERIAL_DEFAULT_STOCK))
     cur.execute("""
         CREATE TABLE IF NOT EXISTS hack_progress (
             id             SERIAL PRIMARY KEY,
@@ -712,7 +804,6 @@ def init_db():
     print("DB initialized!")
     release(conn)
 
-# ─── DB Helpers ───────────────────────────────────────────────────────────────
 MSG_COOLDOWNS: dict = {}
 
 def ensure_user(uid: int, username: str):
@@ -891,12 +982,10 @@ def get_portfolio_value(uid: int) -> float:
         return float(cur.fetchone()["pv"])
     finally: release(conn)
 
-# ─── Bot Setup ─────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="-", intents=intents, help_command=None)
 
-# ─── Message Listener ──────────────────────────────────────────────────────────
 @bot.event
 async def on_message(message):
     if message.author.bot: return
@@ -910,7 +999,6 @@ async def on_message(message):
         add_credits(uid, int(CREDITS_PER_MSG * prestige_multiplier(prestige_val)), "message")
     await bot.process_commands(message)
 
-# ─── Background Tasks ──────────────────────────────────────────────────────────
 @tasks.loop(minutes=20)
 async def update_market_prices():
     event = generate_market_prices()
@@ -1074,10 +1162,6 @@ async def hack_transfer_checker():
         except: pass
     finally: release(conn)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  VIEWS & UI COMPONENTS
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class QuickNav(discord.ui.View):
     def __init__(self, uid: int):
         super().__init__(timeout=60)
@@ -1236,14 +1320,18 @@ async def _send_inventory_view(interaction, uid, target_uid, page, sort, filter_
         e.description += "\n\n".join(lines)
 
     e.set_footer(text="Use -coin <id> for details • -sell <id> to sell")
-    try:
-        if hasattr(interaction, "response") and not interaction.response.is_done():
-            await interaction.response.edit_message(embed=e, view=view)
-        else:
-            await interaction.edit_original_response(embed=e, view=view)
-    except:
-        try: await interaction.followup.send(embed=e, view=view)
-        except: pass
+    if isinstance(interaction, discord.Interaction):
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(embed=e, view=view)
+            else:
+                await interaction.edit_original_response(embed=e, view=view)
+        except:
+            try: await interaction.followup.send(embed=e, view=view)
+            except: pass
+    else:
+        try: await interaction.edit(embed=e, view=view)
+        except: await interaction.channel.send(embed=e, view=view)
 
 class LeaderboardView(discord.ui.View):
     def __init__(self, uid: int, mode: str="portfolio"):
@@ -1271,6 +1359,8 @@ class LeaderboardView(discord.ui.View):
 async def _send_leaderboard_view(interaction, uid, mode):
     conn = db(); cur = conn.cursor()
     medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+    rows = []; title = "Leaderboard"; color = 0xFFD700
+    def row_val(r): return ""
     try:
         if mode == "portfolio":
             cur.execute("""
@@ -1312,13 +1402,10 @@ async def _send_leaderboard_view(interaction, uid, mode):
             title = "🏦 Bank Balances"
             color = 0x57F287
             def row_val(r): return f"Bank: **{r['balance']:,}** credits"
-        else:
-            rows = []; title = "Leaderboard"; color = 0xFFD700
-            def row_val(r): return ""
     except Exception as e:
-        print(f"LB error: {e}"); conn.rollback()
-        rows = []; title = "Leaderboard"; color = 0xFFD700
-        def row_val(r): return ""
+        print(f"LB error: {e}")
+        try: conn.rollback()
+        except: pass
     finally: release(conn)
 
     e = discord.Embed(title=title, color=color)
@@ -1332,14 +1419,18 @@ async def _send_leaderboard_view(interaction, uid, mode):
     if not rows: e.description = "No data yet."
 
     view = LeaderboardView(uid, mode)
-    try:
-        if hasattr(interaction,"response") and not interaction.response.is_done():
-            await interaction.response.edit_message(embed=e, view=view)
-        else:
-            await interaction.edit_original_response(embed=e, view=view)
-    except:
-        try: await interaction.followup.send(embed=e, view=view)
-        except: pass
+    if isinstance(interaction, discord.Interaction):
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(embed=e, view=view)
+            else:
+                await interaction.edit_original_response(embed=e, view=view)
+        except:
+            try: await interaction.followup.send(embed=e, view=view)
+            except: pass
+    else:
+        try: await interaction.edit(embed=e, view=view)
+        except: await interaction.channel.send(embed=e, view=view)
 
 class BalanceView(discord.ui.View):
     def __init__(self, uid: int):
@@ -1705,14 +1796,18 @@ async def _send_market_view(interaction, uid, page, sort, filter_mat):
 
     view=MarketView(uid,page,sort,filter_mat)
     view.prev.disabled=page<=1; view.next_p.disabled=page>=pages
-    try:
-        if hasattr(interaction,"response") and not interaction.response.is_done():
-            await interaction.response.edit_message(embed=e,view=view)
-        else:
-            await interaction.edit_original_response(embed=e,view=view)
-    except:
-        try: await interaction.followup.send(embed=e,view=view)
-        except: pass
+    if isinstance(interaction, discord.Interaction):
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(embed=e,view=view)
+            else:
+                await interaction.edit_original_response(embed=e,view=view)
+        except:
+            try: await interaction.followup.send(embed=e,view=view)
+            except: pass
+    else:
+        try: await interaction.edit(embed=e,view=view)
+        except: await interaction.channel.send(embed=e,view=view)
 
 class HackChallengeView:
     def __init__(self, hacker_id, target_bank_id, target_uid, hack_chance):
@@ -1831,13 +1926,7 @@ class BlackMarketBuyView(discord.ui.View):
         try:
             cur.execute("UPDATE users SET credits=credits-%s WHERE user_id=%s",(self.price,uid))
             cur.execute("INSERT INTO black_market_log(user_id,item_key,price) VALUES(%s,%s,%s)",(uid,self.item_key,self.price))
-            # Map item keys to DB columns; identity_tracker is stackable (tracker_count)
-            col_map={
-                "data_leak_generator":"has_dlg",
-                "suspicious_os":"has_sos",
-                "transfer_system":"has_transfer",
-                "ai_machine":"has_ai_machine"
-            }
+            col_map={"data_leak_generator":"has_dlg","suspicious_os":"has_sos","transfer_system":"has_transfer","ai_machine":"has_ai_machine"}
             if self.item_key == "identity_tracker":
                 cur.execute("UPDATE user_items SET tracker_count = tracker_count + 1 WHERE user_id=%s",(uid,))
             elif self.item_key in col_map:
@@ -1850,10 +1939,6 @@ class BlackMarketBuyView(discord.ui.View):
         finally: release(conn)
         await i.response.send_message(f"✅ Purchased **{item['name']}**!",ephemeral=True)
         self.stop()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  CORE LOGIC HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
 
 async def _respond(target, embed=None, content=None, view=None, ephemeral=False):
     if isinstance(target, discord.Interaction):
@@ -1950,7 +2035,6 @@ async def _send_cooldowns(target, uid: int):
     u = get_user(uid)
     if not u: await _respond(target, content="❌ Profile not found."); return
     now_ts = int(time.time()); now_dt = datetime.now(timezone.utc)
-
     jt_key = u.get("job_type") or "miner"
     jt_info = JOB_TYPES.get(jt_key, JOB_TYPES["miner"])
     jt_cd_s = int(jt_info[2] * 3600)
@@ -1994,7 +2078,6 @@ async def _send_cooldowns(target, uid: int):
         e.add_field(name="🌑 Black Market",value=f"✅ Active! {mm}m {ss}s left",           inline=True)
     else:
         e.add_field(name="🌑 Black Market",value="❌ Inactive (10%/2h)",                    inline=True)
-    # Show tracker count
     tc = get_tracker_count(uid)
     if tc > 0:
         e.add_field(name="🕵️ Trackers", value=f"**{tc}** available", inline=True)
@@ -2041,6 +2124,7 @@ async def _do_buy_crate(target, uid: int, count: int):
                  c["ser_mult"],c["total_mult"],c["value"]))
             cur.execute("SELECT lastval() as id"); c["id"]=cur.fetchone()["id"]
             opened.append(c)
+            db_update_stock(c["material"], -1)
         sync_coin_count(uid,cur); conn.commit(); _cache_invalidate(uid)
     except Exception as ex:
         conn.rollback(); await _respond(target, content=f"❌ Error: {str(ex)[:80]}"); return
@@ -2054,6 +2138,8 @@ async def _do_buy_crate(target, uid: int, count: int):
             f"Variant: **{c['variant']}** x{c['var_mult']}\nStatus: **{c['status']}** x{c['sta_mult']}\n"
             f"Float: **{c['float']}** x{c['flt_mult']}\nSerial: #{str(c['serial']).zfill(4)} x{c['ser_mult']}"),inline=True)
         e.add_field(name="💰 Value", value=f"Base: **${c['base_value']:.2f}**\nStored: **${c['value']:.4f}**\n📈 Market: **${mkt:.4f}**",inline=True)
+        stock_left = get_material_stock(c["material"])
+        e.add_field(name="📦 Stock", value=f"**{c['material']}**: {stock_left} remaining", inline=False)
         rl=rarity_label(coin_rarity_score(c))
         e.add_field(name="✨ Rarity", value=f"**{rl}**",inline=False)
         e.set_footer(text=f"Coin ID: #{c['id']} • Credits left: {u['credits']-cost:,}")
@@ -2136,7 +2222,22 @@ async def _do_work(target, uid: int):
     rn,rs,re,ri=get_job_rank(wc); pm=JOB_RANKS[ri][1]
     wm=min(1.0+(wc-pm)*0.02,1.5)
 
-    career_pay = int(random.randint(jt_min, jt_max) * wm)
+    mined_material = None
+    mined_amount = 0
+    miner_bonus = 0
+
+    if jt_key == "miner":
+        available_mats = [(name, mat_mult, rd) for name, mat_mult, rd in MATERIALS if get_material_stock(name) < MATERIAL_MAX_STOCK]
+        if available_mats:
+            mined_name, mined_mult, _ = random.choice(available_mats)
+            mined_material = mined_name
+            mined_amount = MINER_MINE_AMOUNT
+            db_update_stock(mined_name, mined_amount)
+            miner_bonus = int(mined_mult * 5 * wm)
+        career_pay = int(random.randint(jt_min, jt_max) * wm) + miner_bonus
+    else:
+        career_pay = int(random.randint(jt_min, jt_max) * wm)
+
     rank_pay   = min(int(rs*wm), 5000)
     base_pay   = (career_pay + rank_pay) // 2
     earned     = int(base_pay * prestige_multiplier(pv))
@@ -2160,6 +2261,11 @@ async def _do_work(target, uid: int):
     e.add_field(name="📊 Rank",   value=f"{re} {rn} (#{nwc})",        inline=True)
     e.add_field(name="💵 Pay",    value=f"{earned:,} cr",              inline=True)
     e.add_field(name="⏰ CD",     value=f"{jt_cd_h}h",                inline=True)
+    if mined_material:
+        stock_now = get_material_stock(mined_material)
+        e.add_field(name="⛏️ Mined",
+            value=f"**+{mined_amount}x {mined_material}** (Stock: {stock_now}/{MATERIAL_MAX_STOCK})\n+{miner_bonus} bonus pay",
+            inline=False)
     if pv>0: e.add_field(name="⭐ Prestige",value=f"x{prestige_multiplier(pv):.1f}",inline=True)
     nxt=get_next_job_rank(nwc)
     if nxt:
@@ -2216,9 +2322,7 @@ async def _do_market_trigger(target, uid: int):
     else:
         await _respond(target, content="⚡ **Market Trigger!** Prices refreshed, no event this cycle.")
 
-# ─── Internal hack starter ────────────────────────────────────────────────────
 async def _start_hack(ctx_or_dm, uid: int, bank_id: str, target_uid: int, target_balance: int):
-    """Shared logic to start a hack session in DMs."""
     items = get_user_items(uid)
     conn = db(); cur = conn.cursor()
     try:
@@ -2247,13 +2351,11 @@ async def _start_hack(ctx_or_dm, uid: int, bank_id: str, target_uid: int, target
     msg = await ctx_or_dm.send(embed=e, view=sv)
     sv.dm_msg = msg
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  COMMANDS
-# ═══════════════════════════════════════════════════════════════════════════════
-
 @bot.event
 async def on_ready():
-    init_db(); generate_market_prices()
+    init_db()
+    load_material_stocks()
+    generate_market_prices()
     for task in [auction_checker,daily_bank_distribution,update_market_prices,
                  black_market_spawner,auto_worker_task,hack_transfer_checker]:
         if not task.is_running(): task.start()
@@ -2326,6 +2428,7 @@ async def help(ctx):
         "`-profile [@user]` — Profile card\n"
         "`-lb` — Leaderboard (5 modes)\n"
         "`-prices [material/float/status]` — Live prices\n"
+        "`-stocks` — Material stock levels\n"
         "`-economy` — Economy overview\n"
         "`-coinprice <id>` — Live coin price\n"
         "`-jobrank [@user]` — Career progress\n"
@@ -2334,17 +2437,16 @@ async def help(ctx):
     e.add_field(name="🌑 Black Market (DM only · role required)",value=(
         "`-blackmarket` — View your personal BM\n"
         "`-bmbuy <item_key>` — Purchase item\n"
-        "`-usetracker <plain_username>` — Use a tracker to reveal bank ID (DM only)\n"
-        "  *(Trackers are stackable; buy multiple from Black Market)*\n"
+        "`-usetracker <plain_username>` — Reveal bank ID\n"
     ),inline=False)
     e.add_field(name="🔓 Hacking (DM only · role required)",value=(
         "Requires: **Suspicious OS** from Black Market\n"
         "`-hack <bank_id>` — Hack a vault directly\n"
-        "`-hackuser <plain_username>` — Find user then hack (no tracker consumed)\n"
+        "`-hackuser <plain_username>` — Find user then hack\n"
         "`-hackinventory` — Hack items & data cards\n"
         "`-hacktransfers` — Pending transfers\n"
     ),inline=False)
-    e.set_footer(text="Rob CD: 1h • Hack transfer: 2h • Career CDs: 15min–4h • DM commands require role")
+    e.set_footer(text="⛏️ Miners refill material stocks! Low stock = higher price & lower drop chance")
     await ctx.send(embed=e, view=QuickNav(uid))
 
 @bot.command(aliases=["bal","wallet"])
@@ -2386,12 +2488,45 @@ async def setjob(ctx, career: str=None):
 @bot.command()
 async def careers(ctx):
     e=discord.Embed(title="💼 Available Careers",color=0x5865F2,
-        description="Use `-setjob <key>` to change career.\nPay is scaled by your job rank multiplier.\n")
+        description="Use `-setjob <key>` to change career.\nPay is scaled by your job rank multiplier.\n⛏️ **Miners** refill material stocks & earn bonus pay based on material value!\n")
     for key,(name,emoji,cd,mn,mx,desc) in JOB_TYPES.items():
         cd_str = f"{int(cd*60)}min" if cd < 1 else (f"{cd}h" if cd == int(cd) else f"{cd}h")
         e.add_field(name=f"{emoji} {name} — `{key}`",
             value=f"Cooldown: **{cd_str}** | Pay: **{mn}–{mx} cr** (base)\n_{desc}_",inline=False)
     e.set_footer(text="Higher pay = longer cooldown • All pay is also multiplied by rank & prestige")
+    await ctx.send(embed=e)
+
+@bot.command()
+async def stocks(ctx):
+    e=discord.Embed(title="📦 Material Stocks",color=0x57F287,
+        description="Stock levels affect drop rates and market prices.\n⛏️ Miners replenish stocks by working.\n\n")
+    lines=[]
+    for name, mat_mult, rarity_denom in MATERIALS:
+        stock = get_material_stock(name)
+        pct = min(stock / MATERIAL_DEFAULT_STOCK, 1.0)
+        bar_filled = int(pct * 8)
+        bar = "█"*bar_filled + "░"*(8-bar_filled)
+        if stock <= 0:
+            status = "🚫 EMPTY"
+        elif stock < 50:
+            status = "🔴 Critical"
+        elif stock < 150:
+            status = "🟠 Low"
+        elif stock > 1000:
+            status = "🟢 Surplus"
+        elif stock > 500:
+            status = "🟡 Plentiful"
+        else:
+            status = "⚪ Normal"
+        price_mult = get_stock_price_mult(name)
+        pm_tag = f" (price x{price_mult:.2f})" if price_mult != 1.0 else ""
+        lines.append(f"**{name}** `[{bar}]` {stock}/{MATERIAL_DEFAULT_STOCK} — {status}{pm_tag}")
+    chunk_size = 8
+    chunks = [lines[i:i+chunk_size] for i in range(0, len(lines), chunk_size)]
+    for i, chunk in enumerate(chunks):
+        e.add_field(name=f"Materials ({i*chunk_size+1}–{min((i+1)*chunk_size, len(lines))})",
+            value="\n".join(chunk), inline=False)
+    e.set_footer(text=f"Default stock: {MATERIAL_DEFAULT_STOCK} | Max stock: {MATERIAL_MAX_STOCK} | Miners add {MINER_MINE_AMOUNT}/work")
     await ctx.send(embed=e)
 
 @bot.command()
@@ -2730,9 +2865,13 @@ async def coin(ctx, coin_id: int):
         f"Stored: **${c['value']:.4f}**\n📈 Market: **${mkt:.4f}**\n"
         f"RAP: **{'${:,.2f}'.format(rap) if rap else 'None'}**"),inline=True)
     e.add_field(name="✨ Rarity",value=f"**{rarity_label(rarity)}** (score {rarity:.2f})",inline=True)
+    stock = get_material_stock(c["material"])
+    e.add_field(name="📦 Material Stock", value=f"**{c['material']}**: {stock}/{MATERIAL_DEFAULT_STOCK}", inline=True)
     econ=[]
     if ev!=1.0: econ.append(f"{'🚀 BOOM' if ev>1.0 else '💥 BUST'} x{ev}")
     if abs(sd-1.0)>0.01: econ.append(f"{'📦 Oversupply' if sd<1.0 else '🔥 Scarce'} x{sd:.3f}")
+    pm=get_stock_price_mult(c["material"])
+    if pm!=1.0: econ.append(f"{'📈 Stock Scarcity' if pm>1.0 else '📉 Stock Surplus'} x{pm:.2f}")
     if econ: e.add_field(name="🌐 Market Conditions",value="\n".join(econ),inline=False)
     await ctx.send(embed=e)
 
@@ -3018,12 +3157,15 @@ async def prices(ctx, category: str="all"):
         for mat,(lo,hi) in MATERIAL_PRICE_RANGES.items():
             cur_p=_market_prices["materials"].get(mat,0); mid=(lo+hi)/2
             arr="📈" if cur_p>mid else "📉"; ev=get_event_mult(mat); sd=get_supply_demand_mult(mat)
+            stock=get_material_stock(mat)
             tags=""
             if ev>1.0: tags+=" 🚀BOOM"
             elif ev<1.0: tags+=" 💥BUST"
             if sd<0.95: tags+=" 📦oversupply"
             elif sd>1.05: tags+=" 🔥scarce"
-            lines.append(f"{arr} **{mat}**: `{cur_p:.4f}x`{tags}")
+            if stock<=0: tags+=" 🚫EMPTY"
+            elif stock<50: tags+=" ⚠️low"
+            lines.append(f"{arr} **{mat}**: `{cur_p:.4f}x` (stock:{stock}){tags}")
         e.description=f"Updated: **{last_str}** • {nxt_str}\n\n"+"\n".join(lines)
     elif cat in ("float","floats","flt"):
         e=discord.Embed(title="📊 Float Prices",color=0x5865F2)
@@ -3043,13 +3185,19 @@ async def prices(ctx, category: str="all"):
     else:
         e=discord.Embed(title="📈 All Market Prices",color=0xEB459E)
         e.description=f"Updated: **{last_str}** • {nxt_str}"
-        mat_l=[f"{'📈' if _market_prices['materials'].get(m,0)>(lo+hi)/2 else '📉'} **{m}**: `{_market_prices['materials'].get(m,0):.3f}x`{'🚀' if get_event_mult(m)>1.0 else ('💥' if get_event_mult(m)<1.0 else '')}" for m,(lo,hi) in MATERIAL_PRICE_RANGES.items()]
+        mat_l=[]
+        for m,(lo,hi) in MATERIAL_PRICE_RANGES.items():
+            p=_market_prices['materials'].get(m,0); ev=get_event_mult(m)
+            stock=get_material_stock(m)
+            tag='🚀' if ev>1.0 else ('💥' if ev<1.0 else '')
+            stag='🚫' if stock<=0 else ('⚠️' if stock<50 else '')
+            mat_l.append(f"{'📈' if p>(lo+hi)/2 else '📉'} **{m}**: `{p:.3f}x`{tag}{stag}")
         flt_l=[f"{'📈' if _market_prices['floats'].get(f,0)>(lo+hi)/2 else '📉'} **{f}**: `{_market_prices['floats'].get(f,0):.3f}x`" for f,(lo,hi) in FLOAT_PRICE_RANGES.items()]
         sta_l=[f"{'📈' if _market_prices['statuses'].get(s,1.0)>(lo+hi)/2 else '📉'} **{s}**: `{_market_prices['statuses'].get(s,1.0):.3f}x`" for s,(lo,hi) in STATUS_PRICE_RANGES.items()]
         e.add_field(name="🪨 Materials",value="\n".join(mat_l),inline=True)
         e.add_field(name="🌊 Floats",   value="\n".join(flt_l),inline=True)
         e.add_field(name="🏷️ Statuses", value="\n".join(sta_l),inline=True)
-        e.set_footer(text="Use -prices material / float / status for details")
+        e.set_footer(text="Use -prices material / float / status for details • -stocks for stock levels")
     await ctx.send(embed=e)
 
 @bot.command()
@@ -3070,6 +3218,8 @@ async def coinprice(ctx, coin_id: int):
     econ=[]
     if ev!=1.0: econ.append(f"{'🚀 BOOM' if ev>1.0 else '💥 BUST'} x{ev}")
     if abs(sd-1.0)>0.01: econ.append(f"{'📦 Oversupply' if sd<1.0 else '🔥 Scarce'} x{sd:.3f}")
+    pm=get_stock_price_mult(c["material"])
+    if pm!=1.0: econ.append(f"{'📈 Stock Scarcity' if pm>1.0 else '📉 Surplus'} x{pm:.2f}")
     if econ: e.add_field(name="🌐 Economy",value="\n".join(econ),inline=False)
     await ctx.send(embed=e)
 
@@ -3092,6 +3242,9 @@ async def economy(ctx):
     e.add_field(name="📊 Scale",value=f"Users: **{tu:,}**\nCoins: **{tc:,}**\nPortfolio: **${tv:,.2f}**\nCredits: **{tw+tb+tr:,}**",inline=False)
     e.add_field(name="💸 Credits",value=f"Wallets: **{tw:,}**\nBanks: **{tb:,}**\nTreasury: **{tr:,}**",inline=True)
     e.add_field(name="📦 Inflation",value=f"Crate: **{cc}** (+{inf}%)\nCap: **{MAX_CRATE_COST}**",inline=True)
+    low_stock=[name for name in ALL_MATERIAL_NAMES if get_material_stock(name)<50]
+    if low_stock:
+        e.add_field(name="⚠️ Low Stock",value=", ".join(f"**{m}**" for m in low_stock[:8]),inline=False)
     now=datetime.now(timezone.utc)
     evs=[(m,ev) for m,ev in _market_events.items() if now<ev["expires"]]
     if evs:
@@ -3130,7 +3283,6 @@ async def bank(ctx):
     e.set_footer(text="Funded by: crate fees • taxes • gambling • rob fines • prestige")
     await ctx.send(embed=e)
 
-# ─── Black Market ──────────────────────────────────────────────────────────────
 @bot.command()
 async def blackmarket(ctx):
     if not isinstance(ctx.channel, discord.DMChannel):
@@ -3181,13 +3333,7 @@ async def bmbuy(ctx, item_key: str=None):
     item = BLACK_MARKET_ITEMS[item_key]
     ensure_user(uid, str(ctx.author))
     inv = get_user_items(uid)
-    # Non-stackable items: check if already owned
-    perm = {
-        "data_leak_generator": "has_dlg",
-        "suspicious_os": "has_sos",
-        "transfer_system": "has_transfer",
-        "ai_machine": "has_ai_machine"
-    }
+    perm = {"data_leak_generator": "has_dlg","suspicious_os": "has_sos","transfer_system": "has_transfer","ai_machine": "has_ai_machine"}
     if item_key in perm and inv.get(perm[item_key]):
         await ctx.send(f"❌ Already own **{item['name']}**."); return
     e = discord.Embed(title="🌑 Purchase",
@@ -3195,13 +3341,8 @@ async def bmbuy(ctx, item_key: str=None):
         color=0x2F3136)
     await ctx.send(embed=e, view=BlackMarketBuyView(item_key, item["price"], uid))
 
-# ─── FIXED: usetracker — plain string username, stackable tracker_count ────────
 @bot.command()
 async def usetracker(ctx, *, username: str=None):
-    """
-    Reveal a user's bank ID using an Identity Tracker you own.
-    Usage: -usetracker <plain_username>   (DM only, no @ mention needed)
-    """
     if not isinstance(ctx.channel, discord.DMChannel):
         try: await ctx.message.delete()
         except: pass
@@ -3210,39 +3351,22 @@ async def usetracker(ctx, *, username: str=None):
         await ctx.send("❌ Missing required role."); return
     if not username:
         await ctx.send("❌ Usage: `-usetracker <username>` (plain text, no @ needed)"); return
-
     uid = ctx.author.id
     ensure_user(uid, str(ctx.author))
-
-    # Check tracker count
     tc = get_tracker_count(uid)
     if tc <= 0:
-        await ctx.send(
-            "❌ You have no **Identity Trackers**.\n"
-            "Buy one from the Black Market with `-bmbuy identity_tracker`."
-        ); return
-
-    # Strip any accidental @ from input
+        await ctx.send("❌ You have no **Identity Trackers**.\nBuy one from the Black Market with `-bmbuy identity_tracker`."); return
     clean_username = username.strip().lstrip("@")
-
     target = find_user_by_username(clean_username)
     if not target:
-        await ctx.send(
-            f"❌ No player found with username `{clean_username}`.\n"
-            "Make sure to use their exact in-game username (not a Discord mention)."
-        ); return
-
+        await ctx.send(f"❌ No player found with username `{clean_username}`."); return
     if target["user_id"] == uid:
         await ctx.send("❌ You can't track yourself."); return
-
     tvb = get_user_bank(target["user_id"])
     bid = tvb.get("bank_id") or "No bank ID set."
-
-    # Consume one tracker
     consumed = consume_tracker(uid)
     if not consumed:
         await ctx.send("❌ Failed to consume tracker. Try again."); return
-
     remaining = get_tracker_count(uid)
     await ctx.send(
         f"🕵️ **Identity Tracker Result**\n"
@@ -3252,16 +3376,10 @@ async def usetracker(ctx, *, username: str=None):
         f"You can now use `-hack {bid}` to attempt a hack."
     )
 
-# ─── Hacking ───────────────────────────────────────────────────────────────────
 @bot.command()
 async def hack(ctx, bank_id: str=None):
-    """
-    Hack a vault by bank ID. DM only.
-    Usage: -hack <bank_id>
-    """
     uid = ctx.author.id
     ensure_user(uid, str(ctx.author))
-
     if not isinstance(ctx.channel, discord.DMChannel):
         try: await ctx.message.delete()
         except: pass
@@ -3269,42 +3387,26 @@ async def hack(ctx, bank_id: str=None):
     if not await has_black_market_role(ctx.author):
         await ctx.send("❌ Missing required role."); return
     if not bank_id:
-        await ctx.send(
-            "❌ Usage: `-hack <bank_id>`\n"
-            "Don't have a bank ID? Use `-usetracker <username>` first."
-        ); return
-
+        await ctx.send("❌ Usage: `-hack <bank_id>`"); return
     items = get_user_items(uid)
     if not items.get("has_sos"):
-        await ctx.send(
-            "❌ Need **Suspicious Operating System** from the Black Market to hack.\n"
-            "Buy it with `-bmbuy suspicious_os`."
-        ); return
-
-    # Find target by bank ID
+        await ctx.send("❌ Need **Suspicious Operating System** from the Black Market.\nBuy it with `-bmbuy suspicious_os`."); return
     conn = db(); cur = conn.cursor()
     try:
         cur.execute("SELECT user_id, balance FROM user_bank WHERE bank_id=%s", (bank_id,))
         tb = cur.fetchone()
     finally:
         release(conn)
-
     if not tb:
         await ctx.send("❌ Bank ID not found. Double-check it."); return
     if tb["user_id"] == uid:
         await ctx.send("❌ Can't hack yourself."); return
-
     await _start_hack(ctx, uid, bank_id, tb["user_id"], tb["balance"])
 
 @bot.command()
 async def hackuser(ctx, *, username: str=None):
-    """
-    Look up a player username and hack them directly (no tracker consumed).
-    DM only. Usage: -hackuser <plain_username>
-    """
     uid = ctx.author.id
     ensure_user(uid, str(ctx.author))
-
     if not isinstance(ctx.channel, discord.DMChannel):
         try: await ctx.message.delete()
         except: pass
@@ -3313,29 +3415,19 @@ async def hackuser(ctx, *, username: str=None):
         await ctx.send("❌ Missing required role."); return
     if not username:
         await ctx.send("❌ Usage: `-hackuser <plain_username>`"); return
-
     items = get_user_items(uid)
     if not items.get("has_sos"):
-        await ctx.send(
-            "❌ Need **Suspicious Operating System** from the Black Market.\n"
-            "Buy it with `-bmbuy suspicious_os`."
-        ); return
-
+        await ctx.send("❌ Need **Suspicious Operating System** from the Black Market.\nBuy it with `-bmbuy suspicious_os`."); return
     clean_username = username.strip().lstrip("@")
     target = find_user_by_username(clean_username)
     if not target:
-        await ctx.send(
-            f"❌ No player found with username `{clean_username}`.\n"
-            "Use `-usetracker <username>` to get their bank ID first, then `-hack <bank_id>`."
-        ); return
+        await ctx.send(f"❌ No player found with username `{clean_username}`."); return
     if target["user_id"] == uid:
         await ctx.send("❌ Can't hack yourself."); return
-
     tvb = get_user_bank(target["user_id"])
     bank_id = tvb.get("bank_id")
     if not bank_id:
         await ctx.send(f"❌ **{target['username']}** has no bank ID yet."); return
-
     await _start_hack(ctx, uid, bank_id, target["user_id"], tvb["balance"])
 
 @bot.command()
@@ -3350,7 +3442,6 @@ async def hackinventory(ctx):
         prog = cur.fetchall()
     finally:
         release(conn)
-
     tick = lambda h: "✅" if h else "❌"
     tc = items.get("tracker_count") or 0
     e = discord.Embed(title="🔓 Hack Inventory", color=0x00FF41)
@@ -3391,7 +3482,6 @@ async def hacktransfers(ctx):
         e.add_field(name=f"Transfer #{r['id']}", value=f"**{r['amount']:,} credits** | {status}", inline=False)
     await ctx.send(embed=e)
 
-# ─── Admin ─────────────────────────────────────────────────────────────────────
 @bot.command(aliases=["removecredits","deduct"])
 async def rmcredits(ctx, member: discord.Member, amount: int):
     if ctx.author.id != ADMIN_ID: await ctx.send("❌ No permission."); return
@@ -3431,6 +3521,7 @@ async def givecoin(ctx, member: discord.Member):
              c["base_value"],c["mat_mult"],c["var_mult"],c["sta_mult"],c["flt_mult"],
              c["ser_mult"],c["total_mult"],c["value"]))
         sync_coin_count(member.id, cur); conn.commit(); _cache_invalidate(member.id)
+        db_update_stock(c["material"], -1)
     except: conn.rollback(); await ctx.send("❌ Error."); return
     finally: release(conn)
     mkt = get_market_price(c)
@@ -3459,7 +3550,6 @@ async def forceblackmarket(ctx, member: discord.Member=None):
     spawn_user_bm(target.id)
     await ctx.send(f"✅ Black Market spawned for **{target}** for {BLACK_MARKET_DURATION_MIN} minutes.")
 
-# Admin: give trackers directly
 @bot.command()
 async def givetrackers(ctx, member: discord.Member, amount: int=1):
     if ctx.author.id != ADMIN_ID: await ctx.send("❌ No permission."); return
@@ -3473,5 +3563,30 @@ async def givetrackers(ctx, member: discord.Member, amount: int=1):
     finally: release(conn)
     await ctx.send(f"✅ Gave **{member}** **{amount}** tracker(s).")
 
-# ─── Run ───────────────────────────────────────────────────────────────────────
+@bot.command()
+async def resetstock(ctx, material: str=None, amount: int=None):
+    if ctx.author.id != ADMIN_ID: await ctx.send("❌ No permission."); return
+    if not material:
+        conn=db(); cur=conn.cursor()
+        try:
+            for mat in ALL_MATERIAL_NAMES:
+                cur.execute("UPDATE material_stocks SET stock=%s WHERE material=%s",(MATERIAL_DEFAULT_STOCK,mat))
+                set_material_stock_cache(mat, MATERIAL_DEFAULT_STOCK)
+            conn.commit()
+        finally: release(conn)
+        await ctx.send(f"✅ All material stocks reset to **{MATERIAL_DEFAULT_STOCK}**.")
+        return
+    mat_names_lower = {m.lower(): m for m in ALL_MATERIAL_NAMES}
+    canonical = mat_names_lower.get(material.lower())
+    if not canonical:
+        await ctx.send(f"❌ Unknown material `{material}`."); return
+    stock_val = amount if amount is not None else MATERIAL_DEFAULT_STOCK
+    conn=db(); cur=conn.cursor()
+    try:
+        cur.execute("UPDATE material_stocks SET stock=%s WHERE material=%s",(stock_val,canonical))
+        set_material_stock_cache(canonical, stock_val)
+        conn.commit()
+    finally: release(conn)
+    await ctx.send(f"✅ **{canonical}** stock set to **{stock_val}**.")
+
 bot.run(TOKEN)
