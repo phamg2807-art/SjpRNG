@@ -178,7 +178,6 @@ def init_database():
     conn = db()
     try:
         cur = conn.cursor()
-        # players
         cur.execute("""
             CREATE TABLE IF NOT EXISTS players (
                 user_id BIGINT PRIMARY KEY,
@@ -207,7 +206,6 @@ def init_database():
             except Exception:
                 pass
 
-        # caught_fish
         cur.execute("""
             CREATE TABLE IF NOT EXISTS caught_fish (
                 id SERIAL PRIMARY KEY,
@@ -223,7 +221,6 @@ def init_database():
             )
         """)
 
-        # user_rods
         cur.execute("""
             CREATE TABLE IF NOT EXISTS user_rods (
                 id SERIAL PRIMARY KEY,
@@ -236,7 +233,6 @@ def init_database():
                 acquired_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # migrate old rods if exists
         cur.execute("""
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
@@ -253,7 +249,6 @@ def init_database():
             """)
             cur.execute("DROP TABLE rods")
 
-        # locked_fish (user-level lock by fish name)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS locked_fish (
                 user_id BIGINT REFERENCES players(user_id),
@@ -262,7 +257,6 @@ def init_database():
             )
         """)
 
-        # merchant_stock
         cur.execute("""
             CREATE TABLE IF NOT EXISTS merchant_stock (
                 id SERIAL PRIMARY KEY,
@@ -283,7 +277,7 @@ def init_database():
     finally:
         release(conn)
 
-# -------------------- Background Tasks (unchanged) --------------------
+# -------------------- Background Tasks --------------------
 info_message_id = None
 world_message_id = None
 
@@ -344,7 +338,7 @@ async def update_info_channel():
                         "`-shop` – visit the local market\n"
                         "`-sell <fish>` – sell one fish\n"
                         "`-sell all` – sell all unlocked fish\n"
-                        "`-sell <fish> all` – sell all unlocked fish of that name\n"
+                        "`-sell <fish> all` – sell all unlocked of that fish\n"
                         "`-lock <fish>` – lock all fish of that name (prevents selling)\n"
                         "`-unlock <fish>` – unlock them\n"
                         "`-collection` / `-col` – view your fish collection"
@@ -441,6 +435,11 @@ async def on_interaction(interaction):
     elif custom_id.startswith("buy_rod_"):
         rod_name = custom_id.replace("buy_rod_", "")
         await buy_rod(interaction, rod_name)
+    elif custom_id == "equip_rod":
+        rod_id = int(interaction.data['values'][0])
+        await equip_rod(interaction, rod_id)
+    else:
+        pass
 
 # -------------------- Commands --------------------
 @bot.command(name='fish')
@@ -460,24 +459,23 @@ async def cmd_rods(ctx):
 async def cmd_shop(ctx):
     await show_shop(ctx)
 
+# --- FIXED SELL COMMAND ---
 @bot.command(name='sell')
 async def cmd_sell(ctx, *, args: str = None):
     if not args:
         await ctx.send("Usage: `-sell <fish_name>` or `-sell all` or `-sell <fish_name> all`")
         return
     parts = args.split()
+    # If first word is "all", sell all unlocked fish
+    if parts[0].lower() == 'all':
+        await sell_all_fish(ctx)
+        return
     if len(parts) == 1:
         fish_name = parts[0]
         await sell_fish(ctx, fish_name, all_of_type=False)
-    elif len(parts) == 2:
-        if parts[1].lower() == 'all':
-            fish_name = parts[0]
-            if fish_name.lower() == 'all':
-                await sell_all_fish(ctx)
-            else:
-                await sell_fish(ctx, fish_name, all_of_type=True)
-        else:
-            await ctx.send("Invalid syntax. Use `-sell <fish_name>` or `-sell all` or `-sell <fish_name> all`")
+    elif len(parts) == 2 and parts[1].lower() == 'all':
+        fish_name = parts[0]
+        await sell_fish(ctx, fish_name, all_of_type=True)
     else:
         await ctx.send("Invalid syntax. Use `-sell <fish_name>` or `-sell all` or `-sell <fish_name> all`")
 
@@ -586,14 +584,12 @@ async def fish_action(ctx):
             await ctx.send("You have no rod equipped! Use `-rods` to equip one.")
             return
 
-        # Cooldown 5 seconds
         if player['last_fish_time']:
             cd = (time.time() - player['last_fish_time'].timestamp())
             if cd < 5:
                 await ctx.send(f"⏳ Wait {int(5-cd)}s.")
                 return
 
-        # Animation
         msg = await ctx.send("🎣 Casting line...")
         await asyncio.sleep(1.5)
         await msg.edit(content="🌊 Waiting for a bite...")
@@ -697,7 +693,6 @@ async def show_rods(ctx):
                 value=f"Max Depth: {r['max_depth']}m | Max Weight: {r['max_weight']}kg{bonus_text}\n{status}",
                 inline=False
             )
-        # Add equip dropdown
         if len(rods) > 1:
             select = discord.ui.Select(
                 placeholder="Equip a rod...",
@@ -716,21 +711,6 @@ async def show_rods(ctx):
         await ctx.send(f"Error: {e}")
     finally:
         release(conn)
-
-@bot.event
-async def on_interaction(interaction):
-    if interaction.type != discord.InteractionType.component:
-        return
-    custom_id = interaction.data.get('custom_id')
-    if custom_id == "equip_rod":
-        rod_id = int(interaction.data['values'][0])
-        await equip_rod(interaction, rod_id)
-    # ... other handlers already defined, we'll combine with the previous one
-    # To avoid duplication, we'll combine all handlers in one event.
-    # We'll define a single on_interaction that covers all.
-
-# We'll redefine on_interaction to include all cases (combine with earlier)
-# For cleanliness, we'll redefine on_interaction after all functions, overriding.
 
 async def equip_rod(interaction, rod_id):
     user = interaction.user
@@ -855,7 +835,6 @@ async def sell_fish(ctx, fish_name, all_of_type=False):
     conn = db()
     try:
         cur = conn.cursor()
-        # Check if this fish name is locked
         cur.execute("SELECT 1 FROM locked_fish WHERE user_id = %s AND fish_name = %s", (user.id, fish_name))
         locked = cur.fetchone()
         if locked:
@@ -863,7 +842,6 @@ async def sell_fish(ctx, fish_name, all_of_type=False):
             return
 
         if all_of_type:
-            # Sell all of this fish
             cur.execute("""
                 SELECT id, final_price FROM caught_fish
                 WHERE user_id = %s AND fish_name ILIKE %s
@@ -879,7 +857,6 @@ async def sell_fish(ctx, fish_name, all_of_type=False):
             conn.commit()
             await ctx.send(f"✅ Sold **{len(fish_list)}** **{fish_name}** for **{total_coins}** coins!")
         else:
-            # Sell one
             cur.execute("""
                 SELECT id, final_price FROM caught_fish
                 WHERE user_id = %s AND fish_name ILIKE %s
@@ -904,7 +881,6 @@ async def sell_all_fish(ctx):
     conn = db()
     try:
         cur = conn.cursor()
-        # Get all fish, excluding locked ones
         cur.execute("""
             SELECT cf.id, cf.final_price
             FROM caught_fish cf
@@ -962,7 +938,7 @@ async def show_collection(ctx):
     finally:
         release(conn)
 
-# -------------------- Inventory System (updated with origin) --------------------
+# -------------------- Inventory System --------------------
 INVENTORY_PAGE_SIZE = 10
 
 async def show_inventory(ctx_or_inter, filter=None, page=0):
@@ -1043,38 +1019,6 @@ async def show_inventory(ctx_or_inter, filter=None, page=0):
         await response(f"Error: {e}", ephemeral=True)
     finally:
         release(conn)
-
-# -------------------- Final Interaction Handler (combined) --------------------
-@bot.event
-async def on_interaction(interaction):
-    if interaction.type != discord.InteractionType.component:
-        return
-    custom_id = interaction.data.get('custom_id')
-    if custom_id == "join_game":
-        await join_game(interaction)
-    elif custom_id == "world_select":
-        location_key = interaction.data['values'][0]
-        await move_and_assign_role(interaction, location_key)
-    elif custom_id == "inv_filter_select":
-        filter = interaction.data['values'][0]
-        await show_inventory(interaction, filter=filter, page=0)
-    elif custom_id.startswith("inv_page_"):
-        parts = custom_id.split("_")
-        if len(parts) == 4:
-            filter = parts[2]
-            page = int(parts[3])
-            await show_inventory(interaction, filter=filter, page=page)
-        else:
-            await interaction.response.send_message("Invalid pagination.", ephemeral=True)
-    elif custom_id.startswith("buy_rod_"):
-        rod_name = custom_id.replace("buy_rod_", "")
-        await buy_rod(interaction, rod_name)
-    elif custom_id == "equip_rod":
-        rod_id = int(interaction.data['values'][0])
-        await equip_rod(interaction, rod_id)
-    else:
-        # unknown
-        pass
 
 # -------------------- Run Bot --------------------
 if __name__ == "__main__":
