@@ -1,11 +1,11 @@
 import os
 import time
 import asyncio
-import json
+import random
 from threading import Thread
 from flask import Flask
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
@@ -17,7 +17,6 @@ app = Flask('SjpFish')
 def home():
     return "SjpFish is alive!"
 
-# Run Flask in a background thread
 Thread(target=lambda: app.run(host='0.0.0.0', port=8080), daemon=True).start()
 
 # -------------------- Environment & Database --------------------
@@ -39,11 +38,9 @@ def get_pool():
     return _pool
 
 def db():
-    """Get a connection from the pool."""
     return get_pool().getconn()
 
 def release(conn):
-    """Return a connection to the pool."""
     try:
         get_pool().putconn(conn)
     except Exception:
@@ -54,7 +51,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(command_prefix='!', intents=intents)  # prefix kept but no commands used
 
 # Channel IDs
 CHANNELS = {
@@ -64,19 +61,24 @@ CHANNELS = {
     'fisher_shore': 1516793333790408845
 }
 
-# Role IDs
 ROLES = {
-    'player': 1515614836653031475,
-    'shore': 1516793333790408845,  # Example role ID for shore access
+    'player': 1515614836653031475
 }
+
+# Only one location now (as requested)
+LOCATIONS = {
+    '1-fisher-shore': '🏖️ Starter area – Safe fishing'
+}
+
+# Store message IDs for editing
+info_message_id = None
+world_message_id = None
 
 # -------------------- Database Initialization --------------------
 def init_database():
     conn = db()
     try:
         cursor = conn.cursor()
-        
-        # Players table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS players (
                 user_id BIGINT PRIMARY KEY,
@@ -90,8 +92,6 @@ def init_database():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        
-        # Fish inventory
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS fish_inventory (
                 id SERIAL PRIMARY KEY,
@@ -103,8 +103,6 @@ def init_database():
                 caught_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        
-        # Merchant stock
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS merchant_stock (
                 id SERIAL PRIMARY KEY,
@@ -117,149 +115,230 @@ def init_database():
                 last_restock TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        
         conn.commit()
-        print("Database initialized successfully!")
+        print("Database initialized.")
     except Exception as e:
-        print(f"Database init error: {e}")
+        print(f"DB init error: {e}")
         conn.rollback()
     finally:
         release(conn)
 
-# -------------------- Bot Events --------------------
-@bot.event
-async def on_ready():
-    print(f'{bot.user} has connected to Discord!')
-    init_database()
-    await setup_info_channel()
-    await setup_world_channel()
-
-async def setup_info_channel():
-    """Setup the info channel with persistent message"""
+# -------------------- Background Tasks --------------------
+@tasks.loop(seconds=30)
+async def update_info_channel():
+    """Refresh the info embed with live statistics."""
+    if info_message_id is None:
+        return
     channel = bot.get_channel(CHANNELS['info'])
     if not channel:
         return
-    
-    # Check for existing info message
-    async for message in channel.history(limit=50):
-        if message.author == bot.user and "**🎣 SJpFISH - Fishing Adventure**" in message.content:
-            return
-    
-    # Create initial info message
+    try:
+        msg = await channel.fetch_message(info_message_id)
+    except:
+        return
+
+    conn = db()
+    try:
+        cur = conn.cursor()
+        # Total fish caught
+        cur.execute("SELECT COUNT(*) as total FROM fish_inventory")
+        total_fish = cur.fetchone()['total'] or 0
+
+        # Total players
+        cur.execute("SELECT COUNT(*) as total FROM players")
+        total_players = cur.fetchone()['total'] or 0
+
+        # Active players (fished in last hour)
+        cur.execute("""
+            SELECT COUNT(DISTINCT user_id) as active
+            FROM fish_inventory
+            WHERE caught_at > NOW() - INTERVAL '1 hour'
+        """)
+        active_players = cur.fetchone()['active'] or 0
+
+        # Top fisher (by fish count)
+        cur.execute("""
+            SELECT username, fish_caught
+            FROM players
+            ORDER BY fish_caught DESC
+            LIMIT 1
+        """)
+        top = cur.fetchone()
+        top_fisher = f"{top['username']} ({top['fish_caught']} fish)" if top else "None"
+
+    except Exception as e:
+        print(f"Stats query error: {e}")
+        return
+    finally:
+        release(conn)
+
     embed = discord.Embed(
-        title="🎣 SJpFISH - Fishing Adventure",
+        title="🎣 SJpFISH – Fishing Adventure",
         description="Welcome to the ultimate fishing adventure!",
         color=discord.Color.blue()
     )
     embed.add_field(
-        name="📚 **How to Play**",
+        name="📊 Live Statistics",
         value=(
-            "1. Click the **'Join Game'** button below to start\n"
-            "2. Type `!fish` in the shore channel to fish\n"
-            "3. Type `!inventory` to see your catches\n"
-            "4. Type `!stats` to check your progress\n"
-            "5. Visit the merchant channel to buy/sell items"
+            f"🐟 **Total Fish Caught:** {total_fish}\n"
+            f"👥 **Total Players:** {total_players}\n"
+            f"🟢 **Active (last hour):** {active_players}\n"
+            f"🏆 **Top Fisher:** {top_fisher}"
         ),
         inline=False
     )
     embed.add_field(
-        name="📍 **Locations**",
+        name="📘 How to Play",
         value=(
-            "• 🏖️ **1-fisher-shore** - Starter location\n"
-            "• 🌍 Check `#sjpfish-world` for more areas"
+            "1. Click the **'Join Game'** button below\n"
+            "2. Use the **'Fish'** button to catch fish\n"
+            "3. Check your **'Inventory'** with the button\n"
+            "4. Visit the merchant channel to buy/sell"
         ),
         inline=False
     )
     embed.add_field(
-        name="💰 **Commands**",
-        value=(
-            "`!fish` - Go fishing\n"
-            "`!inventory` - View your inventory\n"
-            "`!stats` - View your statistics\n"
-            "`!sell [item]` - Sell items\n"
-            "`!buy [item]` - Buy from merchant\n"
-            "`!move [location]` - Change location"
-        ),
+        name="📍 Your Location",
+        value="🏖️ **1-fisher-shore** – your current spot",
         inline=False
     )
-    
-    view = discord.ui.View()
-    view.add_item(discord.ui.Button(
-        label="🎣 Join Game",
-        style=discord.ButtonStyle.success,
-        custom_id="join_game"
-    ))
-    view.add_item(discord.ui.Button(
-        label="📖 Guide",
-        style=discord.ButtonStyle.secondary,
-        custom_id="guide"
-    ))
-    
-    await channel.send(embed=embed, view=view)
 
-async def setup_world_channel():
-    """Setup world map in the world channel"""
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="🎣 Join Game", style=discord.ButtonStyle.success, custom_id="join_game"))
+    view.add_item(discord.ui.Button(label="📖 Guide", style=discord.ButtonStyle.secondary, custom_id="guide"))
+    view.add_item(discord.ui.Button(label="🎣 Fish!", style=discord.ButtonStyle.primary, custom_id="fish"))
+    view.add_item(discord.ui.Button(label="🎒 Inventory", style=discord.ButtonStyle.secondary, custom_id="inventory"))
+
+    await msg.edit(embed=embed, view=view)
+
+@tasks.loop(seconds=60)
+async def update_world_channel():
+    """Update world embed – now only shows Fisher Shore and user location."""
+    if world_message_id is None:
+        return
     channel = bot.get_channel(CHANNELS['world'])
     if not channel:
         return
-    
-    # Check for existing world message
-    async for message in channel.history(limit=50):
-        if message.author == bot.user and "🗺️ **SJPFISH WORLD MAP**" in message.content:
-            return
-    
+    try:
+        msg = await channel.fetch_message(world_message_id)
+    except:
+        return
+
+    # We'll show that the only location is Fisher Shore
     embed = discord.Embed(
-        title="🗺️ **SJPFISH WORLD MAP**",
-        description="Select a location to explore!",
+        title="🗺️ SJPFISH WORLD MAP",
+        description="Select your location (only one available for now)",
         color=discord.Color.green()
     )
-    
-    locations = {
-        "🏖️ 1-fisher-shore": "Starter area - Safe fishing",
-        "🌊 Deep Ocean": "Medium difficulty - Better catches",
-        "🏝️ Coral Reef": "Advanced - Rare fish spawn",
-        "🌋 Volcanic Bay": "Expert - Legendary fish"
-    }
-    
-    for location, desc in locations.items():
-        embed.add_field(name=location, value=desc, inline=False)
-    
-    await channel.send(embed=embed)
+    embed.add_field(
+        name="🏖️ 1-fisher-shore",
+        value="Starter area – Safe fishing",
+        inline=False
+    )
+    embed.set_footer(text="Your current location is shown below")
 
-# -------------------- Button Interactions --------------------
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(
+        label="📍 Go to Fisher Shore",
+        style=discord.ButtonStyle.primary,
+        custom_id="move_1-fisher-shore"
+    ))
+
+    await msg.edit(embed=embed, view=view)
+
+# -------------------- Bot Events --------------------
+@bot.event
+async def on_ready():
+    print(f'{bot.user} has connected!')
+    init_database()
+    await setup_info_channel()
+    await setup_world_channel()
+    update_info_channel.start()
+    update_world_channel.start()
+
+async def setup_info_channel():
+    """Send or retrieve the info message."""
+    global info_message_id
+    channel = bot.get_channel(CHANNELS['info'])
+    if not channel:
+        return
+
+    # Look for existing message
+    async for msg in channel.history(limit=50):
+        if msg.author == bot.user and "SJPFISH" in msg.content.upper():
+            info_message_id = msg.id
+            await update_info_channel()  # immediately update it
+            return
+
+    # If none, send a new one (will be edited by the task)
+    embed = discord.Embed(title="Loading stats...", color=discord.Color.blue())
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="Join Game", style=discord.ButtonStyle.success, custom_id="join_game"))
+    view.add_item(discord.ui.Button(label="Guide", style=discord.ButtonStyle.secondary, custom_id="guide"))
+    view.add_item(discord.ui.Button(label="Fish", style=discord.ButtonStyle.primary, custom_id="fish"))
+    view.add_item(discord.ui.Button(label="Inventory", style=discord.ButtonStyle.secondary, custom_id="inventory"))
+    msg = await channel.send(embed=embed, view=view)
+    info_message_id = msg.id
+
+async def setup_world_channel():
+    """Send or retrieve the world message."""
+    global world_message_id
+    channel = bot.get_channel(CHANNELS['world'])
+    if not channel:
+        return
+
+    async for msg in channel.history(limit=50):
+        if msg.author == bot.user and "WORLD MAP" in msg.content.upper():
+            world_message_id = msg.id
+            await update_world_channel()
+            return
+
+    embed = discord.Embed(title="🗺️ World Map", color=discord.Color.green())
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="Go to Fisher Shore", style=discord.ButtonStyle.primary, custom_id="move_1-fisher-shore"))
+    msg = await channel.send(embed=embed, view=view)
+    world_message_id = msg.id
+
+# -------------------- Interaction Handlers --------------------
 @bot.event
 async def on_interaction(interaction):
-    if interaction.type == discord.InteractionType.component:
-        if interaction.data['custom_id'] == "join_game":
-            await join_game(interaction)
-        elif interaction.data['custom_id'] == "guide":
-            await send_guide(interaction)
+    if interaction.type != discord.InteractionType.component:
+        return
+
+    custom_id = interaction.data['custom_id']
+    user = interaction.user
+
+    if custom_id == "join_game":
+        await join_game(interaction)
+    elif custom_id == "guide":
+        await send_guide(interaction)
+    elif custom_id == "inventory":
+        await show_inventory(interaction)
+    elif custom_id == "fish":
+        await fish_action(interaction)
+    elif custom_id.startswith("move_"):
+        location = custom_id.replace("move_", "")
+        await move_location(interaction, location)
 
 async def join_game(interaction):
-    """Handle join game button click"""
-    user = interaction.user
     guild = interaction.guild
-    
-    # Add player role
     role = guild.get_role(ROLES['player'])
     if role:
         await user.add_roles(role)
-    
-    # Add to database
+
     conn = db()
     try:
-        cursor = conn.cursor()
-        cursor.execute("""
+        cur = conn.cursor()
+        cur.execute("""
             INSERT INTO players (user_id, username, current_location)
             VALUES (%s, %s, '1-fisher-shore')
-            ON CONFLICT (user_id) DO UPDATE 
+            ON CONFLICT (user_id) DO UPDATE
             SET username = EXCLUDED.username
         """, (user.id, user.name))
         conn.commit()
-        
         embed = discord.Embed(
-            title="✅ Welcome to SJpFISH!",
-            description=f"**{user.name}** has joined the adventure!\n\nYou can now use `!fish` in the shore channel.",
+            title="✅ Welcome!",
+            description=f"You are now a fisher! Use the **Fish** button to start.",
             color=discord.Color.green()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -269,62 +348,79 @@ async def join_game(interaction):
         release(conn)
 
 async def send_guide(interaction):
-    """Send guide to user"""
     embed = discord.Embed(
-        title="📖 Fishing Guide",
-        description="Everything you need to know about SJpFISH!",
+        title="📖 Quick Guide",
+        description=(
+            "• Click **Fish** to catch a fish.\n"
+            "• Click **Inventory** to see your catches.\n"
+            "• Sell fish in the merchant channel (coming soon).\n"
+            "• Your location is always Fisher Shore for now."
+        ),
         color=discord.Color.blue()
-    )
-    embed.add_field(
-        name="🎣 Fishing",
-        value=(
-            "Go to `#1-fisher-shore` and type `!fish`\n"
-            "Better locations give better fish!"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="💰 Economy",
-        value=(
-            "• Sell fish to merchant for coins\n"
-            "• Buy better equipment\n"
-            "• Trade with black merchant for rare items"
-        ),
-        inline=False
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# -------------------- Fishing Commands --------------------
-@bot.command(name='fish')
-async def fish_command(ctx):
-    """Fish in the current location"""
-    if ctx.channel.id != CHANNELS['fisher_shore']:
-        await ctx.send("Please use this command in the shore channel! 🏖️")
-        return
-    
-    user = ctx.author
+async def show_inventory(interaction):
     conn = db()
     try:
-        cursor = conn.cursor()
-        
-        # Check if user exists
-        cursor.execute("SELECT * FROM players WHERE user_id = %s", (user.id,))
-        player = cursor.fetchone()
-        
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT fish_name, rarity, value, COUNT(*) as qty
+            FROM fish_inventory
+            WHERE user_id = %s
+            GROUP BY fish_name, rarity, value
+            ORDER BY rarity DESC, value DESC
+        """, (user.id,))
+        items = cur.fetchall()
+
+        if not items:
+            embed = discord.Embed(
+                title="🎒 Inventory",
+                description="You have no fish yet. Go fishing!",
+                color=discord.Color.purple()
+            )
+        else:
+            embed = discord.Embed(title=f"🎒 {user.name}'s Inventory", color=discord.Color.purple())
+            total = 0
+            for item in items:
+                val = item['value'] * item['qty']
+                total += val
+                embed.add_field(
+                    name=f"{item['fish_name']} x{item['qty']}",
+                    value=f"⭐ {item['rarity']} | 💰 {val} coins",
+                    inline=False
+                )
+            embed.add_field(name="**Total Value**", value=f"💰 {total} coins", inline=False)
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Error: {e}", ephemeral=True)
+    finally:
+        release(conn)
+
+async def fish_action(interaction):
+    # Only allow in the shore channel? We'll allow anywhere for simplicity.
+    user = interaction.user
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM players WHERE user_id = %s", (user.id,))
+        player = cur.fetchone()
         if not player:
-            await ctx.send("You haven't joined yet! Click the 'Join Game' button in #sjpfish-info")
+            await interaction.response.send_message("You need to join the game first! Use the Join Game button.", ephemeral=True)
             return
-        
-        # Check cooldown (30 seconds)
+
+        # Cooldown (30 seconds)
         if player['last_fish_time']:
             cooldown = (time.time() - player['last_fish_time'].timestamp())
             if cooldown < 30:
-                await ctx.send(f"⏳ Please wait {int(30 - cooldown)} seconds before fishing again!")
+                await interaction.response.send_message(
+                    f"⏳ Please wait {int(30 - cooldown)} seconds.", ephemeral=True
+                )
                 return
-        
-        # Fishing logic - simple version
-        import random
-        fish_types = [
+
+        # Fishing logic
+        fish_pool = [
             {"name": "Common Carp", "rarity": "Common", "value": 10},
             {"name": "Trout", "rarity": "Common", "value": 15},
             {"name": "Bass", "rarity": "Uncommon", "value": 25},
@@ -332,32 +428,29 @@ async def fish_command(ctx):
             {"name": "Golden Fish", "rarity": "Rare", "value": 100},
             {"name": "Legendary Koi", "rarity": "Legendary", "value": 500}
         ]
-        
-        # Weighted random based on location
-        catch = random.choices(fish_types, weights=[30, 25, 20, 15, 8, 2])[0]
-        
-        # Update database
-        cursor.execute("""
-            UPDATE players 
+        catch = random.choices(fish_pool, weights=[30,25,20,15,8,2])[0]
+
+        # Update player
+        cur.execute("""
+            UPDATE players
             SET fish_caught = fish_caught + 1,
                 coins = coins + %s,
                 experience = experience + %s,
                 last_fish_time = CURRENT_TIMESTAMP
             WHERE user_id = %s
-        """, (catch['value'] // 2, catch['value'] // 10, user.id))
-        
+        """, (catch['value']//2, catch['value']//10, user.id))
+
         # Add to inventory
-        cursor.execute("""
+        cur.execute("""
             INSERT INTO fish_inventory (user_id, fish_name, rarity, value)
             VALUES (%s, %s, %s, %s)
         """, (user.id, catch['name'], catch['rarity'], catch['value']))
-        
         conn.commit()
-        
+
         # Get updated stats
-        cursor.execute("SELECT * FROM players WHERE user_id = %s", (user.id,))
-        updated = cursor.fetchone()
-        
+        cur.execute("SELECT * FROM players WHERE user_id = %s", (user.id,))
+        updated = cur.fetchone()
+
         embed = discord.Embed(
             title="🎣 You caught a fish!",
             color=discord.Color.gold()
@@ -368,141 +461,34 @@ async def fish_command(ctx):
         embed.add_field(name="Total Fish", value=str(updated['fish_caught']), inline=True)
         embed.add_field(name="Coins", value=str(updated['coins']), inline=True)
         embed.add_field(name="Level", value=str(updated['level']), inline=True)
-        embed.set_footer(text=f"{user.name}'s Fishing Stats")
-        
-        await ctx.send(embed=embed)
-        
+
+        await interaction.response.send_message(embed=embed, ephemeral=False)  # visible to all
     except Exception as e:
-        await ctx.send(f"Error while fishing: {e}")
+        await interaction.response.send_message(f"Error: {e}", ephemeral=True)
         conn.rollback()
     finally:
         release(conn)
 
-@bot.command(name='stats')
-async def stats_command(ctx):
-    """View your fishing statistics"""
-    user = ctx.author
-    conn = db()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM players WHERE user_id = %s", (user.id,))
-        player = cursor.fetchone()
-        
-        if not player:
-            await ctx.send("You haven't joined the game yet!")
-            return
-        
-        embed = discord.Embed(
-            title=f"📊 {user.name}'s Fishing Stats",
-            color=discord.Color.blue()
-        )
-        embed.add_field(name="Level", value=str(player['level']), inline=True)
-        embed.add_field(name="Experience", value=f"{player['experience']} XP", inline=True)
-        embed.add_field(name="Fish Caught", value=str(player['fish_caught']), inline=True)
-        embed.add_field(name="Coins", value=f"💰 {player['coins']}", inline=True)
-        embed.add_field(name="Location", value=f"📍 {player['current_location']}", inline=True)
-        
-        await ctx.send(embed=embed)
-    except Exception as e:
-        await ctx.send(f"Error: {e}")
-    finally:
-        release(conn)
-
-@bot.command(name='inventory')
-async def inventory_command(ctx):
-    """View your fish inventory"""
-    user = ctx.author
-    conn = db()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT fish_name, rarity, value, COUNT(*) as quantity
-            FROM fish_inventory 
-            WHERE user_id = %s
-            GROUP BY fish_name, rarity, value
-            ORDER BY rarity DESC, value DESC
-        """, (user.id,))
-        
-        fish = cursor.fetchall()
-        
-        if not fish:
-            await ctx.send("Your inventory is empty! Go fishing! 🎣")
-            return
-        
-        embed = discord.Embed(
-            title=f"🎒 {user.name}'s Fish Inventory",
-            color=discord.Color.purple()
-        )
-        
-        total_value = 0
-        for item in fish:
-            value_total = item['value'] * item['quantity']
-            total_value += value_total
-            embed.add_field(
-                name=f"{item['fish_name']} x{item['quantity']}",
-                value=f"⭐ {item['rarity']} | 💰 {value_total} coins",
-                inline=False
-            )
-        
-        embed.add_field(name="**Total Value**", value=f"💰 {total_value} coins", inline=False)
-        await ctx.send(embed=embed)
-    except Exception as e:
-        await ctx.send(f"Error: {e}")
-    finally:
-        release(conn)
-
-@bot.command(name='sell')
-async def sell_command(ctx, *, fish_name: str = None):
-    """Sell fish to merchant"""
-    if ctx.channel.id != CHANNELS['merchant']:
-        await ctx.send("Please use this command in the merchant channel! 🏪")
+async def move_location(interaction, location):
+    user = interaction.user
+    if location not in LOCATIONS:
+        await interaction.response.send_message("Invalid location.", ephemeral=True)
         return
-    
-    if not fish_name:
-        await ctx.send("Please specify which fish to sell: `!sell [fish name]`")
-        return
-    
-    user = ctx.author
+
     conn = db()
     try:
-        cursor = conn.cursor()
-        
-        # Get fish from inventory
-        cursor.execute("""
-            SELECT * FROM fish_inventory 
-            WHERE user_id = %s AND fish_name ILIKE %s
-            LIMIT 1
-        """, (user.id, f"%{fish_name}%"))
-        
-        fish = cursor.fetchone()
-        
-        if not fish:
-            await ctx.send(f"You don't have any fish named '{fish_name}'!")
-            return
-        
-        # Sell the fish
-        cursor.execute("""
-            DELETE FROM fish_inventory 
-            WHERE id = %s
-        """, (fish['id'],))
-        
-        cursor.execute("""
-            UPDATE players 
-            SET coins = coins + %s 
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE players
+            SET current_location = %s
             WHERE user_id = %s
-        """, (fish['value'], user.id))
-        
+        """, (location, user.id))
         conn.commit()
-        
-        embed = discord.Embed(
-            title="💰 Sale Complete!",
-            description=f"Sold **{fish['fish_name']}** for **{fish['value']}** coins!",
-            color=discord.Color.green()
+        await interaction.response.send_message(
+            f"📍 You are now at **{location}**!", ephemeral=True
         )
-        await ctx.send(embed=embed)
-        
     except Exception as e:
-        await ctx.send(f"Error: {e}")
+        await interaction.response.send_message(f"Error: {e}", ephemeral=True)
         conn.rollback()
     finally:
         release(conn)
