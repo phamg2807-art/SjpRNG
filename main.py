@@ -24,13 +24,12 @@ Thread(target=lambda: app.run(host='0.0.0.0', port=port), daemon=True).start()
 # -------------------- Environment --------------------
 DB_URL = os.getenv('DATABASE_URL')
 TOKEN = os.getenv('DISCORD_TOKEN')
-REDIS_URL = os.getenv('REDIS_URL')  # optional, for cooldowns
+REDIS_URL = os.getenv('REDIS_URL')  # optional
 
 if not DB_URL or not TOKEN:
     print("ERROR: Missing DATABASE_URL or DISCORD_TOKEN.")
     exit(1)
 
-# Redis client (optional)
 redis_client = None
 if REDIS_URL:
     try:
@@ -66,7 +65,7 @@ intents.members = True
 
 bot = commands.Bot(command_prefix='-', intents=intents)
 
-# Channel IDs (as provided)
+# Channel IDs
 CHANNELS = {
     'info': 1516791844678271156,
     'world': 1516791545599103127,
@@ -75,12 +74,10 @@ CHANNELS = {
 }
 
 ROLES = {
-    'player': 1515614836653031475,        # role given on join
-    'fisher_shore': None,                 # you need to add role IDs for each location
-    # Add other location roles here
+    'player': 1515614836653031475,  # role given on join
 }
 
-# Locations with their role IDs (you must add them)
+# Locations with role IDs (you need to fill these)
 LOCATIONS = {
     '1-fisher-shore': {
         'name': '🏖️ Fisher Shore',
@@ -95,7 +92,7 @@ LOCATIONS = {
     # Add more locations with their role IDs
 }
 
-# -------------------- Fish Data (unchanged) --------------------
+# -------------------- Fish Data --------------------
 RARITIES = {
     'Common':    (6,     50,     0.45),
     'Uncommon':  (32,    92,     0.35),
@@ -132,6 +129,7 @@ NATIVE_FISH = [
 ALL_FISH = GLOBAL_FISH + NATIVE_FISH
 FISH_DEF = {f['name']: f for f in ALL_FISH}
 
+# -------------------- Helper Functions --------------------
 def calculate_price(fish_def, weight, mutation=None):
     rarity = fish_def['rarity']
     base_min, base_max, _ = RARITIES[rarity]
@@ -167,6 +165,7 @@ def init_database():
     conn = db()
     try:
         cur = conn.cursor()
+        # Players table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS players (
                 user_id BIGINT PRIMARY KEY,
@@ -180,7 +179,7 @@ def init_database():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Add missing columns if any (safe)
+        # Ensure columns exist
         for col, definition in [
             ("username", "TEXT"),
             ("current_location", "TEXT DEFAULT '1-fisher-shore'"),
@@ -196,6 +195,7 @@ def init_database():
             except Exception:
                 pass
 
+        # Caught fish table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS caught_fish (
                 id SERIAL PRIMARY KEY,
@@ -210,6 +210,30 @@ def init_database():
                 caught_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Rods table
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS rods (
+                user_id BIGINT PRIMARY KEY REFERENCES players(user_id),
+                rod_name TEXT DEFAULT 'Old Rod',
+                max_depth INTEGER DEFAULT 30,
+                max_weight INTEGER DEFAULT 20,
+                equipped BOOLEAN DEFAULT TRUE
+            )
+        """)
+        # Add columns if missing
+        for col, definition in [
+            ("rod_name", "TEXT DEFAULT 'Old Rod'"),
+            ("max_depth", "INTEGER DEFAULT 30"),
+            ("max_weight", "INTEGER DEFAULT 20"),
+            ("equipped", "BOOLEAN DEFAULT TRUE")
+        ]:
+            try:
+                cur.execute(f"ALTER TABLE rods ADD COLUMN IF NOT EXISTS {col} {definition}")
+            except Exception:
+                pass
+
+        # Merchant stock (optional)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS merchant_stock (
                 id SERIAL PRIMARY KEY,
@@ -240,12 +264,11 @@ async def update_info_channel():
     channel = bot.get_channel(CHANNELS['info'])
     if not channel:
         return
-    # If we have an ID, try to fetch and edit; if fails, resend
     if info_message_id:
         try:
             msg = await channel.fetch_message(info_message_id)
         except discord.NotFound:
-            info_message_id = None  # reset, will send new below
+            info_message_id = None
 
     conn = db()
     try:
@@ -298,7 +321,6 @@ async def update_info_channel():
 
     view = discord.ui.View()
     view.add_item(discord.ui.Button(label="🎣 Join Game", style=discord.ButtonStyle.success, custom_id="join_game"))
-    # No fish/inventory buttons – use commands
 
     if info_message_id:
         try:
@@ -331,7 +353,6 @@ async def update_world_channel():
         )
     embed.set_footer(text="Select a location below to move there and get the role.")
 
-    # Dropdown for locations
     select = discord.ui.Select(
         placeholder="Choose your destination...",
         options=[
@@ -363,33 +384,34 @@ async def on_ready():
     update_info_channel.start()
     update_world_channel.start()
 
-# -------------------- Interaction Handler (for dropdown & join) --------------------
+# -------------------- Interaction Handler --------------------
 @bot.event
 async def on_interaction(interaction):
     if interaction.type != discord.InteractionType.component:
         return
     custom_id = interaction.data.get('custom_id')
     if custom_id == "join_game":
-        await join_game(interaction)
+        await join_game(interaction)  # interaction is passed
     elif custom_id == "world_select":
         location_key = interaction.data['values'][0]
         await move_and_assign_role(interaction, location_key)
+    elif custom_id == "inv_filter_select":
+        filter = interaction.data['values'][0]
+        await show_inventory(interaction, filter=filter, page=0)
     elif custom_id.startswith("inv_page_"):
-        # pagination for inventory command (we'll keep that as button interaction)
-        # This will be used when inventory is displayed via command
-        page = int(custom_id.replace("inv_page_", ""))
-        # We need to store the filter state somehow; we'll pass via message
-        # For simplicity, we'll re-implement inventory with buttons in the command.
-        # Let's handle it by calling the inventory command with page.
-        # We'll use a different approach: we'll store filter in the custom_id? easier: use message components.
-        # We'll handle it in the inventory command below.
-        pass  # will be overridden
+        parts = custom_id.split("_")
+        if len(parts) == 4:
+            filter = parts[2]
+            page = int(parts[3])
+            await show_inventory(interaction, filter=filter, page=page)
+        else:
+            await interaction.response.send_message("Invalid pagination.", ephemeral=True)
 
-# -------------------- Commands (prefix -) --------------------
+# -------------------- Commands --------------------
 @bot.command(name='join')
 async def cmd_join(ctx):
     """Join the game (same as button)."""
-    await join_game(ctx)  # we'll adapt join_game to work with both interaction and context
+    await join_game(ctx)
 
 @bot.command(name='fish')
 async def cmd_fish(ctx):
@@ -398,14 +420,13 @@ async def cmd_fish(ctx):
 
 @bot.command(name='inventory')
 async def cmd_inventory(ctx, *args):
-    """View your inventory."""
-    # Optional filter argument
-    filter = args[0] if args and args[0] in ['common', 'uncommon', 'epic', 'legendary', 'mythical', 'godlike', 'secret', 'mutated', 'normal'] else None
+    """View your inventory. Optional filter: common, uncommon, epic, etc."""
+    filter = args[0].lower() if args and args[0].lower() in ['common','uncommon','epic','legendary','mythical','godlike','secret','mutated','normal'] else None
     await show_inventory(ctx, filter=filter, page=0)
 
 @bot.command(name='stats')
 async def cmd_stats(ctx):
-    """View your fishing stats."""
+    """View your stats."""
     await show_stats(ctx)
 
 @bot.command(name='move')
@@ -414,7 +435,6 @@ async def cmd_move(ctx, location: str = None):
     if not location:
         await ctx.send("Please specify a location. Available: " + ", ".join(LOCATIONS.keys()))
         return
-    # Find matching location (case-insensitive partial match)
     found = None
     for key, loc in LOCATIONS.items():
         if location.lower() in key.lower() or location.lower() in loc['name'].lower():
@@ -425,38 +445,60 @@ async def cmd_move(ctx, location: str = None):
         return
     await move_and_assign_role(ctx, found)
 
-# -------------------- Helper functions for commands --------------------
-async def join_game(ctx):
-    user = ctx.author
-    guild = ctx.guild
+@bot.command(name='rods')
+async def cmd_rods(ctx):
+    """Show your rods."""
+    await show_rods(ctx)
+
+# -------------------- Core Functions --------------------
+async def join_game(ctx_or_inter):
+    """Add player and give Old Rod."""
+    if isinstance(ctx_or_inter, discord.Interaction):
+        user = ctx_or_inter.user
+        guild = ctx_or_inter.guild
+        response = ctx_or_inter.response.send_message
+    else:  # commands.Context
+        user = ctx_or_inter.author
+        guild = ctx_or_inter.guild
+        response = ctx_or_inter.send
+
     role = guild.get_role(ROLES['player'])
     if role:
         await user.add_roles(role)
+
     conn = db()
     try:
         cur = conn.cursor()
+        # Insert player
         cur.execute("""
             INSERT INTO players (user_id, username, current_location)
             VALUES (%s, %s, '1-fisher-shore')
             ON CONFLICT (user_id) DO UPDATE
             SET username = EXCLUDED.username
         """, (user.id, user.name))
+        # Give them the Old Rod
+        cur.execute("""
+            INSERT INTO rods (user_id, rod_name, max_depth, max_weight, equipped)
+            VALUES (%s, 'Old Rod', 30, 20, TRUE)
+            ON CONFLICT (user_id) DO UPDATE
+            SET rod_name = 'Old Rod', max_depth = 30, max_weight = 20, equipped = TRUE
+        """, (user.id,))
         conn.commit()
-        embed = discord.Embed(title="✅ Joined!", description="You are now a fisher!", color=discord.Color.green())
-        await ctx.send(embed=embed)
+        embed = discord.Embed(title="✅ Joined!", description="You are now a fisher! You have an **Old Rod** (max depth 30m, max weight 20kg).", color=discord.Color.green())
+        await response(embed=embed)
     except Exception as e:
-        await ctx.send(f"Error: {e}")
+        await response(f"Error: {e}")
         conn.rollback()
     finally:
         release(conn)
 
 async def move_and_assign_role(ctx_or_inter, location_key):
-    """Move user to location and assign role."""
+    """Move user and assign role."""
     if isinstance(ctx_or_inter, discord.Interaction):
         user = ctx_or_inter.user
         guild = ctx_or_inter.guild
-        response = ctx_or_inter.response
-    else:  # commands.Context
+        response = ctx_or_inter.response.send_message
+    else:
         user = ctx_or_inter.author
         guild = ctx_or_inter.guild
         response = ctx_or_inter.send
@@ -466,7 +508,6 @@ async def move_and_assign_role(ctx_or_inter, location_key):
         await response("Invalid location.")
         return
 
-    # Update DB
     conn = db()
     try:
         cur = conn.cursor()
@@ -484,7 +525,7 @@ async def move_and_assign_role(ctx_or_inter, location_key):
     if role_id:
         role = guild.get_role(role_id)
         if role:
-            # Remove previous location roles (optional)
+            # Remove previous location roles
             for other_loc in LOCATIONS.values():
                 other_role = guild.get_role(other_loc.get('role_id', 0))
                 if other_role and other_role != role:
@@ -495,10 +536,7 @@ async def move_and_assign_role(ctx_or_inter, location_key):
             await user.add_roles(role)
 
     msg = f"📍 Moved to **{loc['name']}**!"
-    if isinstance(ctx_or_inter, discord.Interaction):
-        await response.send_message(msg, ephemeral=True)
-    else:
-        await response(msg)
+    await response(msg, ephemeral=isinstance(ctx_or_inter, discord.Interaction))
 
 async def fish_action(ctx):
     user = ctx.author
@@ -506,13 +544,21 @@ async def fish_action(ctx):
     msg = None
     try:
         cur = conn.cursor()
+        # Get player
         cur.execute("SELECT * FROM players WHERE user_id = %s", (user.id,))
         player = cur.fetchone()
         if not player:
             await ctx.send("You need to join first! Use `-join`.")
             return
 
-        # Cooldown via Redis or DB
+        # Get rod
+        cur.execute("SELECT * FROM rods WHERE user_id = %s", (user.id,))
+        rod = cur.fetchone()
+        if not rod:
+            await ctx.send("You don't have a rod! Please rejoin with `-join`.")
+            return
+
+        # Cooldown (30s)
         if player['last_fish_time']:
             cd = (time.time() - player['last_fish_time'].timestamp())
             if cd < 30:
@@ -521,8 +567,8 @@ async def fish_action(ctx):
 
         # Animation
         await ctx.send("🎣 Casting line...")
-        msg = await ctx.channel.fetch_message(ctx.message.id + 1)  # not reliable; better use send and edit.
-        # Better: send a new message and edit it.
+        msg = await ctx.channel.fetch_message(ctx.message.id + 1)  # not reliable; we'll use a new message
+        # Actually, we'll send a new message and edit it
         msg = await ctx.send("🌊 Waiting...")
         await asyncio.sleep(1.5)
         await msg.edit(content="🐟 Something's pulling!")
@@ -532,9 +578,15 @@ async def fish_action(ctx):
 
         location_key = player['current_location']
         loc_data = LOCATIONS.get(location_key) or LOCATIONS['1-fisher-shore']
-        pool = get_fish_for_location(location_key)
+        full_pool = get_fish_for_location(location_key)
+
+        # Filter by rod limits: depth <= max_depth, weight <= max_weight
+        pool = []
+        for f in full_pool:
+            if f['depth_max'] <= rod['max_depth'] and f['weight_max'] <= rod['max_weight']:
+                pool.append(f)
         if not pool:
-            await msg.edit(content="❌ No fish here.")
+            await msg.edit(content="❌ Your rod can't reach any fish here! Upgrade your rod.")
             return
 
         weights = [RARITIES[f['rarity']][2] for f in pool]
@@ -544,6 +596,7 @@ async def fish_action(ctx):
         mutation = roll_mutation()
         price = calculate_price(chosen, weight, mutation)
 
+        # Insert catch
         cur.execute("""
             INSERT INTO caught_fish (user_id, fish_name, weight, rarity, mutation, base_price, final_price, location)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -567,7 +620,7 @@ async def fish_action(ctx):
             embed.add_field(name="Mutation", value=f"✨ {mutation} (x{MUTATIONS[mutation][0]})", inline=True)
         embed.add_field(name="Value", value=f"💰 {price}", inline=True)
         embed.add_field(name="Depth", value=f"{depth:.1f}m", inline=True)
-        embed.set_footer(text=loc_data['name'])
+        embed.set_footer(text=f"Rod: {rod['rod_name']} | Location: {loc_data['name']}")
         await msg.edit(content=None, embed=embed)
 
     except Exception as e:
@@ -592,137 +645,58 @@ async def show_stats(ctx):
         if not player:
             await ctx.send("Join first!")
             return
+        # Get rod info
+        cur.execute("SELECT rod_name, max_depth, max_weight FROM rods WHERE user_id = %s", (user.id,))
+        rod = cur.fetchone()
         embed = discord.Embed(title=f"{user.name}'s Stats", color=discord.Color.blue())
         embed.add_field(name="Level", value=player['level'], inline=True)
         embed.add_field(name="Experience", value=player['experience'], inline=True)
         embed.add_field(name="Fish Caught", value=player['fish_caught'], inline=True)
         embed.add_field(name="Coins", value=player['coins'], inline=True)
         embed.add_field(name="Location", value=LOCATIONS.get(player['current_location'], {}).get('name', 'Unknown'), inline=True)
+        if rod:
+            embed.add_field(name="Rod", value=f"{rod['rod_name']} (max depth: {rod['max_depth']}m, max weight: {rod['max_weight']}kg)", inline=False)
         await ctx.send(embed=embed)
     except Exception as e:
         await ctx.send(f"Error: {e}")
     finally:
         release(conn)
 
-# Inventory command with pagination and filter (buttons)
-INVENTORY_PAGE_SIZE = 10
-async def show_inventory(ctx, filter=None, page=0):
+async def show_rods(ctx):
     user = ctx.author
     conn = db()
     try:
         cur = conn.cursor()
-        query = "SELECT fish_name, weight, rarity, mutation, final_price, location, caught_at FROM caught_fish WHERE user_id = %s"
-        params = [user.id]
-        if filter and filter != 'all':
-            if filter in RARITIES:
-                query += " AND rarity = %s"
-                params.append(filter.capitalize())
-            elif filter == 'mutated':
-                query += " AND mutation IS NOT NULL"
-            elif filter == 'normal':
-                query += " AND mutation IS NULL"
-        query += " ORDER BY caught_at DESC"
-        cur.execute(query, params)
-        all_fish = cur.fetchall()
-        total = len(all_fish)
-        total_pages = max(1, (total + INVENTORY_PAGE_SIZE - 1) // INVENTORY_PAGE_SIZE)
-        page = max(0, min(page, total_pages - 1))
-        start = page * INVENTORY_PAGE_SIZE
-        end = min(start + INVENTORY_PAGE_SIZE, total)
-        page_items = all_fish[start:end]
-
-        if not page_items:
-            embed = discord.Embed(title="🎒 Inventory", description="Empty!", color=discord.Color.purple())
-        else:
-            embed = discord.Embed(title=f"🎒 {user.name}'s Inventory", description=f"Total: {total}  |  Page {page+1}/{total_pages}", color=discord.Color.purple())
-            total_value = 0
-            for item in page_items:
-                total_value += item['final_price']
-                mutation_text = f" ✨{item['mutation']}" if item['mutation'] else ""
-                embed.add_field(
-                    name=f"{item['fish_name']}{mutation_text}",
-                    value=f"⭐ {item['rarity']}  |  {item['weight']:.2f}kg  |  💰 {item['final_price']}\n📍 {item['location']}  |  {item['caught_at'].strftime('%Y-%m-%d %H:%M')}",
-                    inline=False
-                )
-            embed.add_field(name="**Total Value**", value=f"💰 {total_value}", inline=False)
-
-        view = discord.ui.View()
-        # Filter dropdown
-        select = discord.ui.Select(
-            placeholder="Filter",
-            options=[
-                discord.SelectOption(label="All", value="all", default=(filter=='all' or filter is None)),
-                discord.SelectOption(label="Common", value="common", default=(filter=='common')),
-                discord.SelectOption(label="Uncommon", value="uncommon", default=(filter=='uncommon')),
-                discord.SelectOption(label="Epic", value="epic", default=(filter=='epic')),
-                discord.SelectOption(label="Legendary", value="legendary", default=(filter=='legendary')),
-                discord.SelectOption(label="Mythical", value="mythical", default=(filter=='mythical')),
-                discord.SelectOption(label="Godlike", value="godlike", default=(filter=='godlike')),
-                discord.SelectOption(label="Secret", value="secret", default=(filter=='secret')),
-                discord.SelectOption(label="Mutated", value="mutated", default=(filter=='mutated')),
-                discord.SelectOption(label="Normal", value="normal", default=(filter=='normal')),
-            ],
-            custom_id="inv_filter_select"
-        )
-        view.add_item(select)
-        if page > 0:
-            view.add_item(discord.ui.Button(label="◀", style=discord.ButtonStyle.secondary, custom_id=f"inv_page_{page-1}"))
-        if page < total_pages - 1:
-            view.add_item(discord.ui.Button(label="▶", style=discord.ButtonStyle.secondary, custom_id=f"inv_page_{page+1}"))
-        # We'll use a custom interaction handler for these buttons
-        # We'll store filter and page in a temporary state (use message id?)
-        # For simplicity, we'll handle the button clicks via a separate event.
-        # We'll attach a callback to the view.
-        await ctx.send(embed=embed, view=view)
+        cur.execute("SELECT rod_name, max_depth, max_weight, equipped FROM rods WHERE user_id = %s", (user.id,))
+        rods = cur.fetchall()
+        if not rods:
+            await ctx.send("You have no rods. Please use `-join` to get started.")
+            return
+        embed = discord.Embed(title=f"{user.name}'s Rods", color=discord.Color.green())
+        for r in rods:
+            status = "✅ Equipped" if r['equipped'] else "❌ Not equipped"
+            embed.add_field(
+                name=r['rod_name'],
+                value=f"Max Depth: {r['max_depth']}m\nMax Weight: {r['max_weight']}kg\n{status}",
+                inline=False
+            )
+        await ctx.send(embed=embed)
     except Exception as e:
         await ctx.send(f"Error: {e}")
     finally:
         release(conn)
 
-# -------------------- Additional Interaction Handler for Inventory Pagination & Filter --------------------
-# We need to handle the inventory filter and page buttons. We'll store state in the custom_id.
-# We'll use a global dict to store user's current filter and page? Better: store in the button custom_id.
-# But we need to keep filter across page changes. We can store filter in the message's view state.
-# However, Discord components don't persist state except via custom_id.
-# Simpler: when user clicks a button, we fetch the current filter from the database? Not efficient.
-# We can store filter as part of the custom_id: e.g., inv_page_<filter>_<page>.
-# But our select menu already triggers a custom_id "inv_filter_select", which we can handle.
-# We'll use a different approach: on filter select, we'll send a new message with updated filter and page=0.
-# On page buttons, we'll also send a new message with the same filter.
-# We'll pass the filter as a parameter in the custom_id.
-# But for simplicity, we'll use a global variable or store in the user's state (not recommended).
-# Let's implement a simple approach: when filter changes, we edit the original message? Not possible with ephemeral.
-# Since this is a command response (non-ephemeral), we can edit the message.
-# But the view is attached to the message; we can't update it easily.
-# I'll simplify: use only buttons for pagination and a dropdown for filter; when filter changes, we send a new message.
-# To keep it clean, we'll just let the user use the command again with a filter argument, e.g., -inventory epic.
-# That way we don't need complex state.
-# For now, I'll implement the dropdown and page buttons as separate interactions that call the command with the appropriate filter.
-# But we need to capture the filter. We can store the filter in the message's embed? not possible.
-# I'll use a simple solution: when the dropdown is used, we respond with a new message (or edit the original if we can).
-# I'll make the inventory command send a new message each time with the filter.
-# For page buttons, we can store the filter in the custom_id: inv_page_<filter>_<page>.
-# Then we can parse it.
+# -------------------- Inventory System --------------------
+INVENTORY_PAGE_SIZE = 10
 
-# Let's implement that: we'll use custom_id format: inv_page_<filter>_<page>
-# And for filter select, we'll call the command again.
-# We'll need to modify the on_interaction to handle these.
+async def show_inventory(ctx_or_inter, filter=None, page=0):
+    if isinstance(ctx_or_inter, discord.Interaction):
+        user = ctx_or_inter.user
+        response = ctx_or_inter.response.send_message
+    else:
+        user = ctx_or_inter.author
+        response = ctx_or_inter.send
 
-# I'll rewrite the inventory command to be called with a specific filter and page.
-# And the interaction handler will parse and call it.
-
-# Let's do it:
-
-# We'll store the user's current filter in a dict per user, but it's simpler to parse from custom_id.
-
-# In the command, we'll build the view with buttons that include the filter in the custom_id.
-# For dropdown, we'll handle it separately.
-
-# I'll implement that now.
-
-# -------------------- Inventory Command (revised) --------------------
-async def show_inventory(ctx, filter=None, page=0):
-    user = ctx.author
     conn = db()
     try:
         cur = conn.cursor()
@@ -780,51 +754,17 @@ async def show_inventory(ctx, filter=None, page=0):
             custom_id="inv_filter_select"
         )
         view.add_item(select)
-        # Page buttons with filter encoded
         filter_str = filter if filter else "all"
         if page > 0:
             view.add_item(discord.ui.Button(label="◀", style=discord.ButtonStyle.secondary, custom_id=f"inv_page_{filter_str}_{page-1}"))
         if page < total_pages - 1:
             view.add_item(discord.ui.Button(label="▶", style=discord.ButtonStyle.secondary, custom_id=f"inv_page_{filter_str}_{page+1}"))
 
-        # Send the message
-        if isinstance(ctx, discord.Interaction):
-            await ctx.response.send_message(embed=embed, view=view, ephemeral=True)
-        else:
-            await ctx.send(embed=embed, view=view)
+        await response(embed=embed, view=view, ephemeral=isinstance(ctx_or_inter, discord.Interaction))
     except Exception as e:
-        if isinstance(ctx, discord.Interaction):
-            await ctx.response.send_message(f"Error: {e}", ephemeral=True)
-        else:
-            await ctx.send(f"Error: {e}")
+        await response(f"Error: {e}", ephemeral=True)
     finally:
         release(conn)
-
-# -------------------- Interaction Handler (extended) --------------------
-@bot.event
-async def on_interaction(interaction):
-    if interaction.type != discord.InteractionType.component:
-        return
-    custom_id = interaction.data.get('custom_id')
-    if custom_id == "join_game":
-        await join_game(interaction)
-    elif custom_id == "world_select":
-        location_key = interaction.data['values'][0]
-        await move_and_assign_role(interaction, location_key)
-    elif custom_id == "inv_filter_select":
-        # Dropdown filter selected
-        filter = interaction.data['values'][0]
-        # Call inventory with this filter
-        await show_inventory(interaction, filter=filter, page=0)
-    elif custom_id.startswith("inv_page_"):
-        # Parse filter and page
-        parts = custom_id.split("_")
-        if len(parts) == 4:
-            filter = parts[2]
-            page = int(parts[3])
-            await show_inventory(interaction, filter=filter, page=page)
-        else:
-            await interaction.response.send_message("Invalid pagination.", ephemeral=True)
 
 # -------------------- Run Bot --------------------
 if __name__ == "__main__":
