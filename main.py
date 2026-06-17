@@ -24,7 +24,7 @@ Thread(target=lambda: app.run(host='0.0.0.0', port=port), daemon=True).start()
 # -------------------- Environment --------------------
 DB_URL = os.getenv('DATABASE_URL')
 TOKEN = os.getenv('DISCORD_TOKEN')
-REDIS_URL = os.getenv('REDIS_URL')  # optional
+REDIS_URL = os.getenv('REDIS_URL')
 
 if not DB_URL or not TOKEN:
     print("ERROR: Missing DATABASE_URL or DISCORD_TOKEN.")
@@ -65,7 +65,6 @@ intents.members = True
 
 bot = commands.Bot(command_prefix='-', intents=intents)
 
-# Channel IDs
 CHANNELS = {
     'info': 1516791844678271156,
     'world': 1516791545599103127,
@@ -74,10 +73,10 @@ CHANNELS = {
 }
 
 ROLES = {
-    'player': 1515614836653031475,  # role given on join
+    'player': 1515614836653031475,
 }
 
-# Locations with role IDs (fill these)
+# Locations with their shops
 LOCATIONS = {
     '1-fisher-shore': {
         'name': '🏖️ Fisher Shore',
@@ -85,14 +84,21 @@ LOCATIONS = {
         'max_depth': 20,
         'price_multiplier': 1.0,
         'weight_range': (0.2, 25),
-        'role_id': 0,   # <-- replace with actual role ID for this area
+        'role_id': 0,   # fill in
         'native_fish': ['Bristlemouths', 'Peruvian Anchoveta', 'Capelin',
-                        'Alaska Pollock', 'Nile Tilapia', 'Atlantic Herring']
+                        'Alaska Pollock', 'Nile Tilapia', 'Atlantic Herring'],
+        'shop_name': 'Old Market',
+        'shop_items': [
+            {'name': 'Plastic Rod', 'max_depth': 45, 'max_weight': 30, 'price': 400},
+            {'name': 'Basic Rod', 'max_depth': 65, 'max_weight': 50, 'price': 800},
+            {'name': 'Advanced Rod', 'max_depth': 80, 'max_weight': 80, 'price': 1500},
+            {'name': 'Rod of Strength', 'max_depth': 120, 'max_weight': 100, 'price': 10400, 'ability': 'strength'}
+        ]
     }
-    # Add more locations with their role IDs
+    # add more locations with their own shops
 }
 
-# -------------------- Fish Data --------------------
+# -------------------- Fish Data (unchanged) --------------------
 RARITIES = {
     'Common':    (6,     50,     0.45),
     'Uncommon':  (32,    92,     0.35),
@@ -160,12 +166,12 @@ def roll_mutation():
             return name
     return None
 
-# -------------------- Database Init with Migrations --------------------
+# -------------------- Database Migrations --------------------
 def init_database():
     conn = db()
     try:
         cur = conn.cursor()
-        # Players table
+        # players table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS players (
                 user_id BIGINT PRIMARY KEY,
@@ -194,6 +200,7 @@ def init_database():
             except Exception:
                 pass
 
+        # caught_fish
         cur.execute("""
             CREATE TABLE IF NOT EXISTS caught_fish (
                 id SERIAL PRIMARY KEY,
@@ -209,26 +216,39 @@ def init_database():
             )
         """)
 
+        # new user_rods table (multiple rods per user)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS rods (
-                user_id BIGINT PRIMARY KEY REFERENCES players(user_id),
-                rod_name TEXT DEFAULT 'Old Rod',
-                max_depth INTEGER DEFAULT 30,
-                max_weight INTEGER DEFAULT 20,
-                equipped BOOLEAN DEFAULT TRUE
+            CREATE TABLE IF NOT EXISTS user_rods (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES players(user_id),
+                rod_name TEXT,
+                max_depth INTEGER,
+                max_weight INTEGER,
+                bonus_weight INTEGER DEFAULT 0,
+                equipped BOOLEAN DEFAULT FALSE,
+                acquired_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        for col, definition in [
-            ("rod_name", "TEXT DEFAULT 'Old Rod'"),
-            ("max_depth", "INTEGER DEFAULT 30"),
-            ("max_weight", "INTEGER DEFAULT 20"),
-            ("equipped", "BOOLEAN DEFAULT TRUE")
-        ]:
-            try:
-                cur.execute(f"ALTER TABLE rods ADD COLUMN IF NOT EXISTS {col} {definition}")
-            except Exception:
-                pass
+        # migrate old rods table if exists (if we had old rods table)
+        # We'll try to copy data and then drop old table.
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'rods'
+            )
+        """)
+        old_rods_exist = cur.fetchone()['exists']
+        if old_rods_exist:
+            # copy data to new table
+            cur.execute("""
+                INSERT INTO user_rods (user_id, rod_name, max_depth, max_weight, equipped)
+                SELECT user_id, rod_name, max_depth, max_weight, equipped
+                FROM rods
+                ON CONFLICT (id) DO NOTHING
+            """)
+            cur.execute("DROP TABLE rods")
 
+        # merchant_stock (for future)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS merchant_stock (
                 id SERIAL PRIMARY KEY,
@@ -249,7 +269,7 @@ def init_database():
     finally:
         release(conn)
 
-# -------------------- Background Tasks --------------------
+# -------------------- Background Tasks (unchanged) --------------------
 info_message_id = None
 world_message_id = None
 
@@ -307,8 +327,8 @@ async def update_info_channel():
                         "`-fish` – go fishing\n"
                         "`-inventory` – view your catches\n"
                         "`-rods` – see your rods\n"
-                        "`-sell <fish>` – sell a fish (coming soon)\n"
-                        "`-buy <item>` – buy from merchant (coming soon)"
+                        "`-shop` – visit the local market\n"
+                        "`-sell <fish>` – sell one fish"
                     ),
                     inline=False)
 
@@ -399,40 +419,43 @@ async def on_interaction(interaction):
             await show_inventory(interaction, filter=filter, page=page)
         else:
             await interaction.response.send_message("Invalid pagination.", ephemeral=True)
+    elif custom_id.startswith("buy_rod_"):
+        rod_name = custom_id.replace("buy_rod_", "")
+        await buy_rod(interaction, rod_name)
+    elif custom_id == "equip_rod":
+        rod_id = interaction.data.get('values')[0] if 'values' in interaction.data else None
+        if rod_id:
+            await equip_rod(interaction, int(rod_id))
 
-# -------------------- Commands (remaining) --------------------
+# -------------------- Commands --------------------
 @bot.command(name='fish')
 async def cmd_fish(ctx):
-    """Go fishing."""
     await fish_action(ctx)
 
 @bot.command(name='inventory')
 async def cmd_inventory(ctx, *args):
-    """View your inventory. Optional filter: common, uncommon, epic, etc."""
     filter = args[0].lower() if args and args[0].lower() in ['common','uncommon','epic','legendary','mythical','godlike','secret','mutated','normal'] else None
     await show_inventory(ctx, filter=filter, page=0)
 
 @bot.command(name='rods')
 async def cmd_rods(ctx):
-    """Show your rods."""
     await show_rods(ctx)
+
+@bot.command(name='shop')
+async def cmd_shop(ctx):
+    await show_shop(ctx)
 
 @bot.command(name='sell')
 async def cmd_sell(ctx, *, fish_name: str = None):
-    """Sell a fish (coming soon)."""
-    await ctx.send("Sell command is not yet implemented.")
-
-@bot.command(name='buy')
-async def cmd_buy(ctx, *, item: str = None):
-    """Buy from merchant (coming soon)."""
-    await ctx.send("Buy command is not yet implemented.")
+    if not fish_name:
+        await ctx.send("Usage: `-sell <fish_name>`")
+        return
+    await sell_fish(ctx, fish_name)
 
 # -------------------- Core Functions --------------------
 async def join_game(interaction):
-    """Add player and give Old Rod via button."""
     user = interaction.user
     guild = interaction.guild
-
     role = guild.get_role(ROLES['player'])
     if role:
         await user.add_roles(role)
@@ -446,14 +469,14 @@ async def join_game(interaction):
             ON CONFLICT (user_id) DO UPDATE
             SET username = EXCLUDED.username
         """, (user.id, user.name))
+        # Give Old Rod
         cur.execute("""
-            INSERT INTO rods (user_id, rod_name, max_depth, max_weight, equipped)
+            INSERT INTO user_rods (user_id, rod_name, max_depth, max_weight, equipped)
             VALUES (%s, 'Old Rod', 30, 20, TRUE)
-            ON CONFLICT (user_id) DO UPDATE
-            SET rod_name = 'Old Rod', max_depth = 30, max_weight = 20, equipped = TRUE
+            ON CONFLICT DO NOTHING
         """, (user.id,))
         conn.commit()
-        embed = discord.Embed(title="✅ Joined!", description="You are now a fisher! You have an **Old Rod** (max depth 30m, max weight 20kg).", color=discord.Color.green())
+        embed = discord.Embed(title="✅ Joined!", description="You now have an **Old Rod** (max depth 30m, max weight 20kg).", color=discord.Color.green())
         await interaction.response.send_message(embed=embed, ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"Error: {e}", ephemeral=True)
@@ -462,10 +485,8 @@ async def join_game(interaction):
         release(conn)
 
 async def move_and_assign_role(interaction, location_key):
-    """Move user via dropdown."""
     user = interaction.user
     guild = interaction.guild
-
     loc = LOCATIONS.get(location_key)
     if not loc:
         await interaction.response.send_message("Invalid location.", ephemeral=True)
@@ -483,7 +504,6 @@ async def move_and_assign_role(interaction, location_key):
     finally:
         release(conn)
 
-    # Assign role
     role_id = loc.get('role_id')
     if role_id:
         role = guild.get_role(role_id)
@@ -508,23 +528,27 @@ async def fish_action(ctx):
         cur.execute("SELECT * FROM players WHERE user_id = %s", (user.id,))
         player = cur.fetchone()
         if not player:
-            await ctx.send("You need to join first! Use the **Join Game** button in the info channel.")
+            await ctx.send("Join first using the button in the info channel.")
             return
 
-        cur.execute("SELECT * FROM rods WHERE user_id = %s", (user.id,))
+        # Get equipped rod
+        cur.execute("""
+            SELECT * FROM user_rods 
+            WHERE user_id = %s AND equipped = TRUE
+        """, (user.id,))
         rod = cur.fetchone()
         if not rod:
-            await ctx.send("You don't have a rod! Please rejoin with the Join Game button.")
+            await ctx.send("You have no rod equipped! Use `-rods` to equip one.")
             return
 
-        # Cooldown (30s)
+        # Cooldown
         if player['last_fish_time']:
             cd = (time.time() - player['last_fish_time'].timestamp())
             if cd < 30:
                 await ctx.send(f"⏳ Wait {int(30-cd)}s.")
                 return
 
-        # --- Animation (single message edited) ---
+        # Animation
         msg = await ctx.send("🎣 Casting line...")
         await asyncio.sleep(1.5)
         await msg.edit(content="🌊 Waiting for a bite...")
@@ -538,8 +562,11 @@ async def fish_action(ctx):
         loc_data = LOCATIONS.get(location_key) or LOCATIONS['1-fisher-shore']
         full_pool = get_fish_for_location(location_key)
 
-        # Filter by rod limits
-        pool = [f for f in full_pool if f['depth_max'] <= rod['max_depth'] and f['weight_max'] <= rod['max_weight']]
+        # Effective rod limits (base + bonus for Strength rod)
+        max_depth = rod['max_depth']
+        max_weight = rod['max_weight'] + rod['bonus_weight']  # bonus applies to max weight
+
+        pool = [f for f in full_pool if f['depth_max'] <= max_depth and f['weight_max'] <= max_weight]
         if not pool:
             await msg.edit(content="❌ Your rod can't reach any fish here! Upgrade your rod.")
             return
@@ -551,11 +578,13 @@ async def fish_action(ctx):
         mutation = roll_mutation()
         price = calculate_price(chosen, weight, mutation)
 
+        # Insert catch
         cur.execute("""
             INSERT INTO caught_fish (user_id, fish_name, weight, rarity, mutation, base_price, final_price, location)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (user.id, chosen['name'], weight, chosen['rarity'], mutation, price, price, location_key))
 
+        # Update player stats
         cur.execute("""
             UPDATE players
             SET fish_caught = fish_caught + 1,
@@ -564,6 +593,15 @@ async def fish_action(ctx):
                 last_fish_time = CURRENT_TIMESTAMP
             WHERE user_id = %s
         """, (price, price//10, user.id))
+
+        # If Rod of Strength, increase bonus_weight
+        if rod['rod_name'] == 'Rod of Strength':
+            cur.execute("""
+                UPDATE user_rods
+                SET bonus_weight = bonus_weight + 1
+                WHERE id = %s
+            """, (rod['id'],))
+
         conn.commit()
 
         embed = discord.Embed(title="🎣 Caught!", color=discord.Color.gold())
@@ -574,7 +612,9 @@ async def fish_action(ctx):
             embed.add_field(name="Mutation", value=f"✨ {mutation} (x{MUTATIONS[mutation][0]})", inline=True)
         embed.add_field(name="Value", value=f"💰 {price}", inline=True)
         embed.add_field(name="Depth", value=f"{depth:.1f}m", inline=True)
-        embed.set_footer(text=f"Rod: {rod['rod_name']} | Location: {loc_data['name']}")
+        rod_name = rod['rod_name']
+        bonus_text = f" (+{rod['bonus_weight']} bonus weight)" if rod['bonus_weight'] > 0 else ""
+        embed.set_footer(text=f"Rod: {rod_name}{bonus_text} | Location: {loc_data['name']}")
         await msg.edit(content=None, embed=embed)
 
     except Exception as e:
@@ -594,17 +634,24 @@ async def show_rods(ctx):
     conn = db()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT rod_name, max_depth, max_weight, equipped FROM rods WHERE user_id = %s", (user.id,))
+        cur.execute("""
+            SELECT id, rod_name, max_depth, max_weight, bonus_weight, equipped
+            FROM user_rods
+            WHERE user_id = %s
+            ORDER BY acquired_at
+        """, (user.id,))
         rods = cur.fetchall()
         if not rods:
-            await ctx.send("You have no rods. Please use the Join Game button.")
+            await ctx.send("You have no rods. Join the game using the button in the info channel.")
             return
+
         embed = discord.Embed(title=f"{user.name}'s Rods", color=discord.Color.green())
         for r in rods:
-            status = "✅ Equipped" if r['equipped'] else "❌ Not equipped"
+            status = "✅ Equipped" if r['equipped'] else "Not equipped"
+            bonus_text = f" (+{r['bonus_weight']} bonus)" if r['bonus_weight'] > 0 else ""
             embed.add_field(
-                name=r['rod_name'],
-                value=f"Max Depth: {r['max_depth']}m\nMax Weight: {r['max_weight']}kg\n{status}",
+                name=f"{r['rod_name']}{bonus_text}",
+                value=f"Max Depth: {r['max_depth']}m | Max Weight: {r['max_weight']}kg{bonus_text}\n{status}",
                 inline=False
             )
         await ctx.send(embed=embed)
@@ -613,7 +660,142 @@ async def show_rods(ctx):
     finally:
         release(conn)
 
-# -------------------- Inventory System --------------------
+async def equip_rod(interaction, rod_id):
+    user = interaction.user
+    conn = db()
+    try:
+        cur = conn.cursor()
+        # Verify rod belongs to user
+        cur.execute("SELECT id FROM user_rods WHERE id = %s AND user_id = %s", (rod_id, user.id))
+        rod = cur.fetchone()
+        if not rod:
+            await interaction.response.send_message("You don't own that rod.", ephemeral=True)
+            return
+        # Unequip all others, equip this one
+        cur.execute("UPDATE user_rods SET equipped = FALSE WHERE user_id = %s", (user.id,))
+        cur.execute("UPDATE user_rods SET equipped = TRUE WHERE id = %s", (rod_id,))
+        conn.commit()
+        await interaction.response.send_message("✅ Rod equipped!", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Error: {e}", ephemeral=True)
+        conn.rollback()
+    finally:
+        release(conn)
+
+async def show_shop(ctx):
+    user = ctx.author
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT current_location FROM players WHERE user_id = %s", (user.id,))
+        player = cur.fetchone()
+        if not player:
+            await ctx.send("You need to join first!")
+            return
+        location_key = player['current_location']
+        loc = LOCATIONS.get(location_key)
+        if not loc or 'shop_items' not in loc:
+            await ctx.send("No shop available in this location.")
+            return
+
+        embed = discord.Embed(title=f"🏪 {loc['shop_name']}", description=f"Welcome to the {loc['shop_name']}!", color=discord.Color.blue())
+        for item in loc['shop_items']:
+            ability_text = f"\nAbility: {item.get('ability', 'None')}" if item.get('ability') else ""
+            embed.add_field(
+                name=f"🎣 {item['name']}",
+                value=f"Max Depth: {item['max_depth']}m | Max Weight: {item['max_weight']}kg\nPrice: 💰 {item['price']}{ability_text}",
+                inline=False
+            )
+
+        view = discord.ui.View()
+        for item in loc['shop_items']:
+            # Button to buy
+            view.add_item(discord.ui.Button(label=f"Buy {item['name']}", style=discord.ButtonStyle.primary, custom_id=f"buy_rod_{item['name']}"))
+
+        await ctx.send(embed=embed, view=view)
+    except Exception as e:
+        await ctx.send(f"Error: {e}")
+    finally:
+        release(conn)
+
+async def buy_rod(interaction, rod_name):
+    user = interaction.user
+    conn = db()
+    try:
+        # Get player's current location
+        cur = conn.cursor()
+        cur.execute("SELECT current_location, coins FROM players WHERE user_id = %s", (user.id,))
+        player = cur.fetchone()
+        if not player:
+            await interaction.response.send_message("You need to join first!", ephemeral=True)
+            return
+
+        location_key = player['current_location']
+        loc = LOCATIONS.get(location_key)
+        if not loc or 'shop_items' not in loc:
+            await interaction.response.send_message("No shop here.", ephemeral=True)
+            return
+
+        # Find item
+        item = None
+        for it in loc['shop_items']:
+            if it['name'] == rod_name:
+                item = it
+                break
+        if not item:
+            await interaction.response.send_message("Item not found.", ephemeral=True)
+            return
+
+        # Check coins
+        if player['coins'] < item['price']:
+            await interaction.response.send_message(f"You don't have enough coins! You need {item['price']} coins.", ephemeral=True)
+            return
+
+        # Deduct coins and give rod
+        cur.execute("UPDATE players SET coins = coins - %s WHERE user_id = %s", (item['price'], user.id))
+        cur.execute("""
+            INSERT INTO user_rods (user_id, rod_name, max_depth, max_weight, equipped)
+            VALUES (%s, %s, %s, %s, FALSE)
+        """, (user.id, item['name'], item['max_depth'], item['max_weight']))
+        conn.commit()
+
+        embed = discord.Embed(title="✅ Purchase successful!", description=f"You bought **{item['name']}** for {item['price']} coins.", color=discord.Color.green())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Error: {e}", ephemeral=True)
+        conn.rollback()
+    finally:
+        release(conn)
+
+async def sell_fish(ctx, fish_name):
+    user = ctx.author
+    conn = db()
+    try:
+        cur = conn.cursor()
+        # Find one fish of that name in user's inventory
+        cur.execute("""
+            SELECT id, final_price FROM caught_fish
+            WHERE user_id = %s AND fish_name ILIKE %s
+            LIMIT 1
+        """, (user.id, f"%{fish_name}%"))
+        fish = cur.fetchone()
+        if not fish:
+            await ctx.send(f"You don't have any fish named '{fish_name}'.")
+            return
+
+        # Delete that entry
+        cur.execute("DELETE FROM caught_fish WHERE id = %s", (fish['id'],))
+        # Add coins
+        cur.execute("UPDATE players SET coins = coins + %s WHERE user_id = %s", (fish['final_price'], user.id))
+        conn.commit()
+        await ctx.send(f"✅ Sold **{fish_name}** for **{fish['final_price']}** coins!")
+    except Exception as e:
+        await ctx.send(f"Error: {e}")
+        conn.rollback()
+    finally:
+        release(conn)
+
+# -------------------- Inventory System (unchanged) --------------------
 INVENTORY_PAGE_SIZE = 10
 
 async def show_inventory(ctx_or_inter, filter=None, page=0):
