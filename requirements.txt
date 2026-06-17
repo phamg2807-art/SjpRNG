@@ -1,4 +1,4 @@
-discord.py>=2.3.0
-flask>=3.0.0
-psycopg2-binary>=2.9.9
-redis
+discord.py
+psycopg2-binary
+Flask
+redis  # optional, only if you want to use Redis
