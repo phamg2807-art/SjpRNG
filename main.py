@@ -77,7 +77,7 @@ ROLES = {
     'player': 1515614836653031475,  # role given on join
 }
 
-# Locations with role IDs (you need to fill these)
+# Locations with role IDs (fill these)
 LOCATIONS = {
     '1-fisher-shore': {
         'name': '🏖️ Fisher Shore',
@@ -179,7 +179,6 @@ def init_database():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Ensure columns exist
         for col, definition in [
             ("username", "TEXT"),
             ("current_location", "TEXT DEFAULT '1-fisher-shore'"),
@@ -195,7 +194,6 @@ def init_database():
             except Exception:
                 pass
 
-        # Caught fish table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS caught_fish (
                 id SERIAL PRIMARY KEY,
@@ -211,7 +209,6 @@ def init_database():
             )
         """)
 
-        # Rods table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS rods (
                 user_id BIGINT PRIMARY KEY REFERENCES players(user_id),
@@ -221,7 +218,6 @@ def init_database():
                 equipped BOOLEAN DEFAULT TRUE
             )
         """)
-        # Add columns if missing
         for col, definition in [
             ("rod_name", "TEXT DEFAULT 'Old Rod'"),
             ("max_depth", "INTEGER DEFAULT 30"),
@@ -233,7 +229,6 @@ def init_database():
             except Exception:
                 pass
 
-        # Merchant stock (optional)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS merchant_stock (
                 id SERIAL PRIMARY KEY,
@@ -311,11 +306,9 @@ async def update_info_channel():
                     value=(
                         "`-fish` – go fishing\n"
                         "`-inventory` – view your catches\n"
-                        "`-stats` – your progress\n"
-                        "`-sell <fish>` – sell a fish\n"
-                        "`-buy <item>` – buy from merchant\n"
-                        "`-move <location>` – change area\n"
-                        "`-join` – join the game"
+                        "`-rods` – see your rods\n"
+                        "`-sell <fish>` – sell a fish (coming soon)\n"
+                        "`-buy <item>` – buy from merchant (coming soon)"
                     ),
                     inline=False)
 
@@ -391,7 +384,7 @@ async def on_interaction(interaction):
         return
     custom_id = interaction.data.get('custom_id')
     if custom_id == "join_game":
-        await join_game(interaction)  # interaction is passed
+        await join_game(interaction)
     elif custom_id == "world_select":
         location_key = interaction.data['values'][0]
         await move_and_assign_role(interaction, location_key)
@@ -407,12 +400,7 @@ async def on_interaction(interaction):
         else:
             await interaction.response.send_message("Invalid pagination.", ephemeral=True)
 
-# -------------------- Commands --------------------
-@bot.command(name='join')
-async def cmd_join(ctx):
-    """Join the game (same as button)."""
-    await join_game(ctx)
-
+# -------------------- Commands (remaining) --------------------
 @bot.command(name='fish')
 async def cmd_fish(ctx):
     """Go fishing."""
@@ -424,43 +412,26 @@ async def cmd_inventory(ctx, *args):
     filter = args[0].lower() if args and args[0].lower() in ['common','uncommon','epic','legendary','mythical','godlike','secret','mutated','normal'] else None
     await show_inventory(ctx, filter=filter, page=0)
 
-@bot.command(name='stats')
-async def cmd_stats(ctx):
-    """View your stats."""
-    await show_stats(ctx)
-
-@bot.command(name='move')
-async def cmd_move(ctx, location: str = None):
-    """Move to a location (use -move <location name>)."""
-    if not location:
-        await ctx.send("Please specify a location. Available: " + ", ".join(LOCATIONS.keys()))
-        return
-    found = None
-    for key, loc in LOCATIONS.items():
-        if location.lower() in key.lower() or location.lower() in loc['name'].lower():
-            found = key
-            break
-    if not found:
-        await ctx.send(f"Location '{location}' not found.")
-        return
-    await move_and_assign_role(ctx, found)
-
 @bot.command(name='rods')
 async def cmd_rods(ctx):
     """Show your rods."""
     await show_rods(ctx)
 
+@bot.command(name='sell')
+async def cmd_sell(ctx, *, fish_name: str = None):
+    """Sell a fish (coming soon)."""
+    await ctx.send("Sell command is not yet implemented.")
+
+@bot.command(name='buy')
+async def cmd_buy(ctx, *, item: str = None):
+    """Buy from merchant (coming soon)."""
+    await ctx.send("Buy command is not yet implemented.")
+
 # -------------------- Core Functions --------------------
-async def join_game(ctx_or_inter):
-    """Add player and give Old Rod."""
-    if isinstance(ctx_or_inter, discord.Interaction):
-        user = ctx_or_inter.user
-        guild = ctx_or_inter.guild
-        response = ctx_or_inter.response.send_message
-    else:  # commands.Context
-        user = ctx_or_inter.author
-        guild = ctx_or_inter.guild
-        response = ctx_or_inter.send
+async def join_game(interaction):
+    """Add player and give Old Rod via button."""
+    user = interaction.user
+    guild = interaction.guild
 
     role = guild.get_role(ROLES['player'])
     if role:
@@ -469,14 +440,12 @@ async def join_game(ctx_or_inter):
     conn = db()
     try:
         cur = conn.cursor()
-        # Insert player
         cur.execute("""
             INSERT INTO players (user_id, username, current_location)
             VALUES (%s, %s, '1-fisher-shore')
             ON CONFLICT (user_id) DO UPDATE
             SET username = EXCLUDED.username
         """, (user.id, user.name))
-        # Give them the Old Rod
         cur.execute("""
             INSERT INTO rods (user_id, rod_name, max_depth, max_weight, equipped)
             VALUES (%s, 'Old Rod', 30, 20, TRUE)
@@ -485,27 +454,21 @@ async def join_game(ctx_or_inter):
         """, (user.id,))
         conn.commit()
         embed = discord.Embed(title="✅ Joined!", description="You are now a fisher! You have an **Old Rod** (max depth 30m, max weight 20kg).", color=discord.Color.green())
-        await response(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
     except Exception as e:
-        await response(f"Error: {e}")
+        await interaction.response.send_message(f"Error: {e}", ephemeral=True)
         conn.rollback()
     finally:
         release(conn)
 
-async def move_and_assign_role(ctx_or_inter, location_key):
-    """Move user and assign role."""
-    if isinstance(ctx_or_inter, discord.Interaction):
-        user = ctx_or_inter.user
-        guild = ctx_or_inter.guild
-        response = ctx_or_inter.response.send_message
-    else:
-        user = ctx_or_inter.author
-        guild = ctx_or_inter.guild
-        response = ctx_or_inter.send
+async def move_and_assign_role(interaction, location_key):
+    """Move user via dropdown."""
+    user = interaction.user
+    guild = interaction.guild
 
     loc = LOCATIONS.get(location_key)
     if not loc:
-        await response("Invalid location.")
+        await interaction.response.send_message("Invalid location.", ephemeral=True)
         return
 
     conn = db()
@@ -514,7 +477,7 @@ async def move_and_assign_role(ctx_or_inter, location_key):
         cur.execute("UPDATE players SET current_location = %s WHERE user_id = %s", (location_key, user.id))
         conn.commit()
     except Exception as e:
-        await response(f"Database error: {e}")
+        await interaction.response.send_message(f"Database error: {e}", ephemeral=True)
         conn.rollback()
         return
     finally:
@@ -525,7 +488,6 @@ async def move_and_assign_role(ctx_or_inter, location_key):
     if role_id:
         role = guild.get_role(role_id)
         if role:
-            # Remove previous location roles
             for other_loc in LOCATIONS.values():
                 other_role = guild.get_role(other_loc.get('role_id', 0))
                 if other_role and other_role != role:
@@ -535,8 +497,7 @@ async def move_and_assign_role(ctx_or_inter, location_key):
                         pass
             await user.add_roles(role)
 
-    msg = f"📍 Moved to **{loc['name']}**!"
-    await response(msg, ephemeral=isinstance(ctx_or_inter, discord.Interaction))
+    await interaction.response.send_message(f"📍 Moved to **{loc['name']}**!", ephemeral=True)
 
 async def fish_action(ctx):
     user = ctx.author
@@ -544,18 +505,16 @@ async def fish_action(ctx):
     msg = None
     try:
         cur = conn.cursor()
-        # Get player
         cur.execute("SELECT * FROM players WHERE user_id = %s", (user.id,))
         player = cur.fetchone()
         if not player:
-            await ctx.send("You need to join first! Use `-join`.")
+            await ctx.send("You need to join first! Use the **Join Game** button in the info channel.")
             return
 
-        # Get rod
         cur.execute("SELECT * FROM rods WHERE user_id = %s", (user.id,))
         rod = cur.fetchone()
         if not rod:
-            await ctx.send("You don't have a rod! Please rejoin with `-join`.")
+            await ctx.send("You don't have a rod! Please rejoin with the Join Game button.")
             return
 
         # Cooldown (30s)
@@ -565,26 +524,22 @@ async def fish_action(ctx):
                 await ctx.send(f"⏳ Wait {int(30-cd)}s.")
                 return
 
-        # Animation
-        await ctx.send("🎣 Casting line...")
-        msg = await ctx.channel.fetch_message(ctx.message.id + 1)  # not reliable; we'll use a new message
-        # Actually, we'll send a new message and edit it
-        msg = await ctx.send("🌊 Waiting...")
+        # --- Animation (single message edited) ---
+        msg = await ctx.send("🎣 Casting line...")
         await asyncio.sleep(1.5)
+        await msg.edit(content="🌊 Waiting for a bite...")
+        await asyncio.sleep(2)
         await msg.edit(content="🐟 Something's pulling!")
         await asyncio.sleep(1)
-        await msg.edit(content="🎣 Reeling in...")
+        await msg.edit(content="🎣 Reeling it in...")
         await asyncio.sleep(1.5)
 
         location_key = player['current_location']
         loc_data = LOCATIONS.get(location_key) or LOCATIONS['1-fisher-shore']
         full_pool = get_fish_for_location(location_key)
 
-        # Filter by rod limits: depth <= max_depth, weight <= max_weight
-        pool = []
-        for f in full_pool:
-            if f['depth_max'] <= rod['max_depth'] and f['weight_max'] <= rod['max_weight']:
-                pool.append(f)
+        # Filter by rod limits
+        pool = [f for f in full_pool if f['depth_max'] <= rod['max_depth'] and f['weight_max'] <= rod['max_weight']]
         if not pool:
             await msg.edit(content="❌ Your rod can't reach any fish here! Upgrade your rod.")
             return
@@ -596,7 +551,6 @@ async def fish_action(ctx):
         mutation = roll_mutation()
         price = calculate_price(chosen, weight, mutation)
 
-        # Insert catch
         cur.execute("""
             INSERT INTO caught_fish (user_id, fish_name, weight, rarity, mutation, base_price, final_price, location)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -635,33 +589,6 @@ async def fish_action(ctx):
     finally:
         release(conn)
 
-async def show_stats(ctx):
-    user = ctx.author
-    conn = db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM players WHERE user_id = %s", (user.id,))
-        player = cur.fetchone()
-        if not player:
-            await ctx.send("Join first!")
-            return
-        # Get rod info
-        cur.execute("SELECT rod_name, max_depth, max_weight FROM rods WHERE user_id = %s", (user.id,))
-        rod = cur.fetchone()
-        embed = discord.Embed(title=f"{user.name}'s Stats", color=discord.Color.blue())
-        embed.add_field(name="Level", value=player['level'], inline=True)
-        embed.add_field(name="Experience", value=player['experience'], inline=True)
-        embed.add_field(name="Fish Caught", value=player['fish_caught'], inline=True)
-        embed.add_field(name="Coins", value=player['coins'], inline=True)
-        embed.add_field(name="Location", value=LOCATIONS.get(player['current_location'], {}).get('name', 'Unknown'), inline=True)
-        if rod:
-            embed.add_field(name="Rod", value=f"{rod['rod_name']} (max depth: {rod['max_depth']}m, max weight: {rod['max_weight']}kg)", inline=False)
-        await ctx.send(embed=embed)
-    except Exception as e:
-        await ctx.send(f"Error: {e}")
-    finally:
-        release(conn)
-
 async def show_rods(ctx):
     user = ctx.author
     conn = db()
@@ -670,7 +597,7 @@ async def show_rods(ctx):
         cur.execute("SELECT rod_name, max_depth, max_weight, equipped FROM rods WHERE user_id = %s", (user.id,))
         rods = cur.fetchall()
         if not rods:
-            await ctx.send("You have no rods. Please use `-join` to get started.")
+            await ctx.send("You have no rods. Please use the Join Game button.")
             return
         embed = discord.Embed(title=f"{user.name}'s Rods", color=discord.Color.green())
         for r in rods:
@@ -693,9 +620,11 @@ async def show_inventory(ctx_or_inter, filter=None, page=0):
     if isinstance(ctx_or_inter, discord.Interaction):
         user = ctx_or_inter.user
         response = ctx_or_inter.response.send_message
+        ephemeral = True
     else:
         user = ctx_or_inter.author
         response = ctx_or_inter.send
+        ephemeral = False
 
     conn = db()
     try:
@@ -736,7 +665,6 @@ async def show_inventory(ctx_or_inter, filter=None, page=0):
             embed.add_field(name="**Total Value**", value=f"💰 {total_value}", inline=False)
 
         view = discord.ui.View()
-        # Filter dropdown
         select = discord.ui.Select(
             placeholder="Filter",
             options=[
@@ -760,7 +688,7 @@ async def show_inventory(ctx_or_inter, filter=None, page=0):
         if page < total_pages - 1:
             view.add_item(discord.ui.Button(label="▶", style=discord.ButtonStyle.secondary, custom_id=f"inv_page_{filter_str}_{page+1}"))
 
-        await response(embed=embed, view=view, ephemeral=isinstance(ctx_or_inter, discord.Interaction))
+        await response(embed=embed, view=view, ephemeral=ephemeral)
     except Exception as e:
         await response(f"Error: {e}", ephemeral=True)
     finally:
