@@ -173,11 +173,13 @@ def get_origin(fish_name):
         return "Native"
     return "Unknown"
 
-# -------------------- Database Migrations --------------------
+# -------------------- Database Migrations (with column safety) --------------------
 def init_database():
     conn = db()
     try:
         cur = conn.cursor()
+
+        # --- players ---
         cur.execute("""
             CREATE TABLE IF NOT EXISTS players (
                 user_id BIGINT PRIMARY KEY,
@@ -206,6 +208,7 @@ def init_database():
             except Exception:
                 pass
 
+        # --- caught_fish (ensure all columns exist) ---
         cur.execute("""
             CREATE TABLE IF NOT EXISTS caught_fish (
                 id SERIAL PRIMARY KEY,
@@ -220,7 +223,22 @@ def init_database():
                 caught_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        for col, definition in [
+            ("fish_name", "TEXT"),
+            ("weight", "REAL"),
+            ("rarity", "TEXT"),
+            ("mutation", "TEXT"),
+            ("base_price", "BIGINT"),
+            ("final_price", "BIGINT"),
+            ("location", "TEXT"),
+            ("caught_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        ]:
+            try:
+                cur.execute(f"ALTER TABLE caught_fish ADD COLUMN IF NOT EXISTS {col} {definition}")
+            except Exception:
+                pass
 
+        # --- user_rods ---
         cur.execute("""
             CREATE TABLE IF NOT EXISTS user_rods (
                 id SERIAL PRIMARY KEY,
@@ -233,6 +251,7 @@ def init_database():
                 acquired_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Migrate old rods if exists
         cur.execute("""
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
@@ -249,6 +268,7 @@ def init_database():
             """)
             cur.execute("DROP TABLE rods")
 
+        # --- locked_fish ---
         cur.execute("""
             CREATE TABLE IF NOT EXISTS locked_fish (
                 user_id BIGINT REFERENCES players(user_id),
@@ -257,6 +277,7 @@ def init_database():
             )
         """)
 
+        # --- merchant_stock (future) ---
         cur.execute("""
             CREATE TABLE IF NOT EXISTS merchant_stock (
                 id SERIAL PRIMARY KEY,
@@ -269,6 +290,7 @@ def init_database():
                 last_restock TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
         conn.commit()
         print("Database ready.")
     except Exception as e:
@@ -287,12 +309,20 @@ async def update_info_channel():
     channel = bot.get_channel(CHANNELS['info'])
     if not channel:
         return
+
+    # If we have an ID, try to fetch; if fails, reset
     if info_message_id:
         try:
             msg = await channel.fetch_message(info_message_id)
         except discord.NotFound:
             info_message_id = None
+            msg = None
+        except Exception:
+            msg = None
+    else:
+        msg = None
 
+    # Query stats
     conn = db()
     try:
         cur = conn.cursor()
@@ -336,25 +366,28 @@ async def update_info_channel():
                         "`-inv` / `-inventory` – view your catches\n"
                         "`-rods` – see your rods\n"
                         "`-shop` – visit the local market\n"
+                        "`-balance` / `-bal` – check your coins\n"
                         "`-sell <fish>` – sell one fish\n"
                         "`-sell all` – sell all unlocked fish\n"
-                        "`-sell <fish> all` – sell all unlocked of that fish\n"
-                        "`-lock <fish>` – lock all fish of that name (prevents selling)\n"
-                        "`-unlock <fish>` – unlock them\n"
-                        "`-collection` / `-col` – view your fish collection"
+                        "`-sell <fish> all` – sell all of that fish\n"
+                        "`-lock <fish>` – lock a fish (prevents `-sell all`)\n"
+                        "`-unlock <fish>` – unlock a fish\n"
+                        "`-collection` / `-col` – view your fish collection\n"
+                        "`-help` – show this help"
                     ),
                     inline=False)
 
     view = discord.ui.View()
     view.add_item(discord.ui.Button(label="🎣 Join Game", style=discord.ButtonStyle.success, custom_id="join_game"))
 
-    if info_message_id:
+    if msg:
         try:
-            msg = await channel.fetch_message(info_message_id)
             await msg.edit(embed=embed, view=view)
         except:
-            info_message_id = None
-    if not info_message_id:
+            # If edit fails, send new
+            msg = await channel.send(embed=embed, view=view)
+            info_message_id = msg.id
+    else:
         msg = await channel.send(embed=embed, view=view)
         info_message_id = msg.id
 
@@ -364,11 +397,17 @@ async def update_world_channel():
     channel = bot.get_channel(CHANNELS['world'])
     if not channel:
         return
+
     if world_message_id:
         try:
             msg = await channel.fetch_message(world_message_id)
         except discord.NotFound:
             world_message_id = None
+            msg = None
+        except Exception:
+            msg = None
+    else:
+        msg = None
 
     embed = discord.Embed(title="🗺️ SJPFISH WORLD MAP", color=discord.Color.green())
     for key, loc in LOCATIONS.items():
@@ -390,13 +429,13 @@ async def update_world_channel():
     view = discord.ui.View()
     view.add_item(select)
 
-    if world_message_id:
+    if msg:
         try:
-            msg = await channel.fetch_message(world_message_id)
             await msg.edit(embed=embed, view=view)
         except:
-            world_message_id = None
-    if not world_message_id:
+            msg = await channel.send(embed=embed, view=view)
+            world_message_id = msg.id
+    else:
         msg = await channel.send(embed=embed, view=view)
         world_message_id = msg.id
 
@@ -459,14 +498,12 @@ async def cmd_rods(ctx):
 async def cmd_shop(ctx):
     await show_shop(ctx)
 
-# --- FIXED SELL COMMAND ---
 @bot.command(name='sell')
 async def cmd_sell(ctx, *, args: str = None):
     if not args:
         await ctx.send("Usage: `-sell <fish_name>` or `-sell all` or `-sell <fish_name> all`")
         return
     parts = args.split()
-    # If first word is "all", sell all unlocked fish
     if parts[0].lower() == 'all':
         await sell_all_fish(ctx)
         return
@@ -496,6 +533,40 @@ async def cmd_unlock(ctx, *, fish_name: str = None):
 @bot.command(name='collection', aliases=['col'])
 async def cmd_collection(ctx):
     await show_collection(ctx)
+
+@bot.command(name='balance', aliases=['bal'])
+async def cmd_balance(ctx):
+    await show_balance(ctx)
+
+@bot.command(name='help')
+async def cmd_help(ctx):
+    embed = discord.Embed(
+        title="🎣 SJpFISH Help",
+        description="All commands use the prefix `-`",
+        color=discord.Color.blue()
+    )
+    embed.add_field(
+        name="🎣 Fishing & Inventory",
+        value="`-fish` – go fishing (5s cooldown)\n`-inv` / `-inventory` – view your fish (with filters)\n`-collection` / `-col` – see your collection\n`-balance` / `-bal` – check your coins",
+        inline=False
+    )
+    embed.add_field(
+        name="💰 Shop & Rods",
+        value="`-shop` – visit the local market\n`-rods` – view and equip your rods",
+        inline=False
+    )
+    embed.add_field(
+        name="💵 Selling & Locking",
+        value="`-sell <fish>` – sell one fish\n`-sell all` – sell all unlocked fish\n`-sell <fish> all` – sell all of a fish\n`-lock <fish>` – prevent selling with `-sell all`\n`-unlock <fish>` – unlock a fish",
+        inline=False
+    )
+    embed.add_field(
+        name="📍 Location",
+        value="Use the dropdown in `#sjpfish-world` to move.",
+        inline=False
+    )
+    embed.set_footer(text="Enjoy your fishing adventure!")
+    await ctx.send(embed=embed)
 
 # -------------------- Core Functions --------------------
 async def join_game(interaction):
@@ -568,6 +639,26 @@ async def fish_action(ctx):
     conn = db()
     msg = None
     try:
+        # ---- Redis cooldown (atomic) ----
+        if redis_client:
+            cooldown_key = f"fish_cooldown:{user.id}"
+            if redis_client.exists(cooldown_key):
+                ttl = redis_client.ttl(cooldown_key)
+                await ctx.send(f"⏳ Wait {ttl}s.")
+                return
+            redis_client.setex(cooldown_key, 5, "1")
+        else:
+            # fallback DB check
+            cur = conn.cursor()
+            cur.execute("SELECT last_fish_time FROM players WHERE user_id = %s", (user.id,))
+            row = cur.fetchone()
+            if row and row['last_fish_time']:
+                cd = (time.time() - row['last_fish_time'].timestamp())
+                if cd < 5:
+                    await ctx.send(f"⏳ Wait {int(5-cd)}s.")
+                    return
+
+        # ---- Get player & rod ----
         cur = conn.cursor()
         cur.execute("SELECT * FROM players WHERE user_id = %s", (user.id,))
         player = cur.fetchone()
@@ -584,12 +675,7 @@ async def fish_action(ctx):
             await ctx.send("You have no rod equipped! Use `-rods` to equip one.")
             return
 
-        if player['last_fish_time']:
-            cd = (time.time() - player['last_fish_time'].timestamp())
-            if cd < 5:
-                await ctx.send(f"⏳ Wait {int(5-cd)}s.")
-                return
-
+        # ---- Animation ----
         msg = await ctx.send("🎣 Casting line...")
         await asyncio.sleep(1.5)
         await msg.edit(content="🌊 Waiting for a bite...")
@@ -599,6 +685,7 @@ async def fish_action(ctx):
         await msg.edit(content="🎣 Reeling it in...")
         await asyncio.sleep(1.5)
 
+        # ---- Catch logic ----
         location_key = player['current_location']
         loc_data = LOCATIONS.get(location_key) or LOCATIONS['1-fisher-shore']
         full_pool = get_fish_for_location(location_key)
@@ -618,11 +705,13 @@ async def fish_action(ctx):
         mutation = roll_mutation()
         price = calculate_price(chosen, weight, mutation)
 
+        # ---- Insert fish ----
         cur.execute("""
             INSERT INTO caught_fish (user_id, fish_name, weight, rarity, mutation, base_price, final_price, location)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (user.id, chosen['name'], weight, chosen['rarity'], mutation, price, price, location_key))
 
+        # ---- Update player stats ----
         cur.execute("""
             UPDATE players
             SET fish_caught = fish_caught + 1,
@@ -632,6 +721,7 @@ async def fish_action(ctx):
             WHERE user_id = %s
         """, (price, price//10, user.id))
 
+        # ---- Rod of Strength bonus ----
         if rod['rod_name'] == 'Rod of Strength':
             cur.execute("""
                 UPDATE user_rods
@@ -641,6 +731,7 @@ async def fish_action(ctx):
 
         conn.commit()
 
+        # ---- Build result embed ----
         origin = get_origin(chosen['name'])
         embed = discord.Embed(title="🎣 Caught!", color=discord.Color.gold())
         embed.add_field(name="Fish", value=f"**{chosen['name']}**", inline=True)
@@ -932,6 +1023,24 @@ async def show_collection(ctx):
                 value=f"⭐ {item['rarity']} | Origin: {origin}",
                 inline=False
             )
+        await ctx.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"Error: {e}")
+    finally:
+        release(conn)
+
+async def show_balance(ctx):
+    user = ctx.author
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT coins FROM players WHERE user_id = %s", (user.id,))
+        row = cur.fetchone()
+        if not row:
+            await ctx.send("You need to join first!")
+            return
+        embed = discord.Embed(title=f"{user.name}'s Balance", color=discord.Color.gold())
+        embed.add_field(name="💰 Coins", value=row['coins'], inline=False)
         await ctx.send(embed=embed)
     except Exception as e:
         await ctx.send(f"Error: {e}")
