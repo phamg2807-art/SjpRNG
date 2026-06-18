@@ -65,21 +65,21 @@ intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix='-', intents=intents)
-bot.remove_command('help')
+bot.remove_command('help')  # remove default help
 
 CHANNELS = {
     'info': 1516791844678271156,
     'world': 1516791545599103127,
     'merchant': 1516791889750397018,
-    'fisher_shore': 1516793333790408845,          # Fisher Shore channel
-    'tropical_isle': 1517023363506114751         # Tropical Isle channel
+    'fisher_shore': 1516793333790408845,
+    'tropical_isle': 1517023363506114751
 }
 
 ROLES = {
     'player': 1515614836653031475,
 }
 
-# -------------------- Locations with role IDs --------------------
+# Locations with role IDs
 LOCATIONS = {
     '1-fisher-shore': {
         'name': '🏖️ Fisher Shore',
@@ -87,7 +87,7 @@ LOCATIONS = {
         'max_depth': 20,
         'price_multiplier': 1.0,
         'weight_range': (0.2, 25),
-        'role_id': 1516800086405808158,           # <-- UPDATED
+        'role_id': 1516800086405808158,
         'native_fish': ['Bristlemouths', 'Peruvian Anchoveta', 'Capelin',
                         'Alaska Pollock', 'Nile Tilapia', 'Atlantic Herring'],
         'shop_name': 'Old Market',
@@ -104,7 +104,7 @@ LOCATIONS = {
         'max_depth': 120,
         'price_multiplier': 1.2,
         'weight_range': (3, 45),
-        'role_id': 1517023829988475060,           # <-- UPDATED
+        'role_id': 1517023829988475060,
         'native_fish': ['Goldfish', 'Angelfish', 'Guppy', 'Platy', 'Rainbowfish',
                         'Ram Cichlid', 'Flowerhorn Cichlid', 'Arowana', 'Emperor Tetra',
                         'Black Neon Tetra', 'Pufferfish', 'Clownfish'],
@@ -123,7 +123,7 @@ LOCATIONS = {
     }
 }
 
-# -------------------- Fish Data (unchanged) --------------------
+# -------------------- Fish Data --------------------
 RARITIES = {
     'Common':    (6,     50,     0.45),
     'Uncommon':  (32,    92,     0.35),
@@ -227,7 +227,7 @@ def calculate_level(exp):
         needed = level * 10
     return level, exp, needed
 
-# -------------------- Database Migrations (unchanged) --------------------
+# -------------------- Database Migrations --------------------
 def init_database():
     conn = db()
     try:
@@ -356,7 +356,7 @@ def init_database():
     finally:
         release(conn)
 
-# -------------------- Background Tasks (unchanged) --------------------
+# -------------------- Background Tasks --------------------
 info_message_id = None
 world_message_id = None
 
@@ -510,7 +510,7 @@ async def on_ready():
     update_info_channel.start()
     update_world_channel.start()
 
-# -------------------- Interaction Handler (unchanged) --------------------
+# -------------------- Interaction Handler --------------------
 @bot.event
 async def on_interaction(interaction):
     if interaction.type != discord.InteractionType.component:
@@ -544,7 +544,7 @@ async def on_interaction(interaction):
     else:
         pass
 
-# -------------------- Commands (unchanged) --------------------
+# -------------------- Commands --------------------
 @bot.command(name='fish')
 async def cmd_fish(ctx):
     await fish_action(ctx)
@@ -664,7 +664,7 @@ async def cmd_help(ctx):
     embed.set_footer(text="Enjoy your fishing adventure!")
     await ctx.send(embed=embed)
 
-# -------------------- Core Functions (unchanged except role IDs are now in LOCATIONS) --------------------
+# -------------------- Core Functions --------------------
 async def join_game(interaction):
     user = interaction.user
     guild = interaction.guild
@@ -719,7 +719,6 @@ async def move_and_assign_role(interaction, location_key):
     if role_id:
         role = guild.get_role(role_id)
         if role:
-            # Remove previous location roles
             for other_loc in LOCATIONS.values():
                 other_role = guild.get_role(other_loc.get('role_id', 0))
                 if other_role and other_role != role:
@@ -731,13 +730,12 @@ async def move_and_assign_role(interaction, location_key):
 
     await interaction.response.send_message(f"📍 Moved to **{loc['name']}**!", ephemeral=True)
 
-# -------------------- fish_action (unchanged, but uses bait effects and level system) --------------------
+# -------------------- Fishing Action --------------------
 async def fish_action(ctx):
     user = ctx.author
     conn = db()
     msg = None
     try:
-        # Redis cooldown with bait reduction
         base_cooldown = 5
         cur = conn.cursor()
         cur.execute("SELECT * FROM players WHERE user_id = %s", (user.id,))
@@ -792,7 +790,6 @@ async def fish_action(ctx):
             await ctx.send("You have no rod equipped! Use `-rods` to equip one.")
             return
 
-        # Catch time
         catch_time = 5.0
         if 'catch_time_reduction' in bait_effects:
             catch_time = catch_time * (1 - bait_effects['catch_time_reduction'])
@@ -908,14 +905,484 @@ async def fish_action(ctx):
     finally:
         release(conn)
 
-# -------------------- Rod, Bait, Shop, Sell, etc. (unchanged) --------------------
-# ... (all the functions below remain exactly as in the previous version)
-# For brevity, I'll paste the remaining functions from the last version.
-# (They are unchanged and already included in the full script above.)
+# -------------------- Rod Functions --------------------
+async def show_rods(ctx):
+    user = ctx.author
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, rod_name, max_depth, max_weight, bonus_weight, equipped
+            FROM user_rods
+            WHERE user_id = %s
+            ORDER BY acquired_at
+        """, (user.id,))
+        rods = cur.fetchall()
+        if not rods:
+            await ctx.send("You have no rods. Join the game using the button in the info channel.")
+            return
 
-# But to keep the answer complete, I'll include the rest of the functions:
-# show_rods, equip_rod, show_baits, equip_bait, unequip_bait, show_shop, buy_item,
-# toggle_lock, sell_fish, sell_all_fish, show_collection, show_balance, show_inventory
+        embed = discord.Embed(title=f"{user.name}'s Rods", color=discord.Color.green())
+        for r in rods:
+            status = "✅ Equipped" if r['equipped'] else "Not equipped"
+            bonus_text = f" (+{r['bonus_weight']} bonus)" if r['bonus_weight'] > 0 else ""
+            embed.add_field(
+                name=f"{r['rod_name']}{bonus_text}",
+                value=f"Max Depth: {r['max_depth']}m | Max Weight: {r['max_weight']}kg{bonus_text}\n{status}",
+                inline=False
+            )
+        if len(rods) > 1:
+            select = discord.ui.Select(
+                placeholder="Equip a rod...",
+                options=[
+                    discord.SelectOption(label=f"{r['rod_name']} (ID:{r['id']})", value=str(r['id']))
+                    for r in rods if not r['equipped']
+                ],
+                custom_id="equip_rod"
+            )
+            view = discord.ui.View()
+            view.add_item(select)
+            await ctx.send(embed=embed, view=view)
+        else:
+            await ctx.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"Error: {e}")
+    finally:
+        release(conn)
 
-# All these are already defined in the script above. The only changes were role IDs.
-# The script is complete and ready to deploy.
+async def equip_rod(interaction, rod_id):
+    user = interaction.user
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM user_rods WHERE id = %s AND user_id = %s", (rod_id, user.id))
+        rod = cur.fetchone()
+        if not rod:
+            await interaction.response.send_message("You don't own that rod.", ephemeral=True)
+            return
+        cur.execute("UPDATE user_rods SET equipped = FALSE WHERE user_id = %s", (user.id,))
+        cur.execute("UPDATE user_rods SET equipped = TRUE WHERE id = %s", (rod_id,))
+        conn.commit()
+        await interaction.response.send_message("✅ Rod equipped!", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Error: {e}", ephemeral=True)
+        conn.rollback()
+    finally:
+        release(conn)
+
+# -------------------- Bait Functions --------------------
+async def show_baits(ctx):
+    user = ctx.author
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT bait_name, quantity, equipped
+            FROM user_baits
+            WHERE user_id = %s
+            ORDER BY bait_name
+        """, (user.id,))
+        baits = cur.fetchall()
+        if not baits:
+            await ctx.send("You have no baits. Buy some from the shop!")
+            return
+
+        embed = discord.Embed(title=f"{user.name}'s Baits", color=discord.Color.teal())
+        for b in baits:
+            status = "✅ Equipped" if b['equipped'] else "Not equipped"
+            embed.add_field(
+                name=f"{b['bait_name']} (x{b['quantity']})",
+                value=status,
+                inline=False
+            )
+        await ctx.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"Error: {e}")
+    finally:
+        release(conn)
+
+async def equip_bait(ctx, bait_name):
+    user = ctx.author
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT quantity FROM user_baits WHERE user_id = %s AND bait_name = %s", (user.id, bait_name))
+        row = cur.fetchone()
+        if not row:
+            await ctx.send(f"You don't own any **{bait_name}**.")
+            return
+        cur.execute("UPDATE user_baits SET equipped = FALSE WHERE user_id = %s", (user.id,))
+        cur.execute("UPDATE user_baits SET equipped = TRUE WHERE user_id = %s AND bait_name = %s", (user.id, bait_name))
+        conn.commit()
+        await ctx.send(f"✅ Equipped **{bait_name}**!")
+    except Exception as e:
+        await ctx.send(f"Error: {e}")
+        conn.rollback()
+    finally:
+        release(conn)
+
+async def unequip_bait(ctx):
+    user = ctx.author
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE user_baits SET equipped = FALSE WHERE user_id = %s", (user.id,))
+        conn.commit()
+        await ctx.send("✅ Bait unequipped!")
+    except Exception as e:
+        await ctx.send(f"Error: {e}")
+        conn.rollback()
+    finally:
+        release(conn)
+
+# -------------------- Shop --------------------
+async def show_shop(ctx):
+    user = ctx.author
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT current_location FROM players WHERE user_id = %s", (user.id,))
+        player = cur.fetchone()
+        if not player:
+            await ctx.send("You need to join first!")
+            return
+        location_key = player['current_location']
+        loc = LOCATIONS.get(location_key)
+        if not loc or 'shop_items' not in loc:
+            await ctx.send("No shop available in this location.")
+            return
+
+        embed = discord.Embed(title=f"🏪 {loc['shop_name']}", description=f"Welcome to the {loc['shop_name']}!", color=discord.Color.blue())
+        for item in loc['shop_items']:
+            if item['type'] == 'rod':
+                ability_text = f"\nAbility: {item.get('ability', 'None')}" if item.get('ability') else ""
+                embed.add_field(
+                    name=f"🎣 {item['name']}",
+                    value=f"Max Depth: {item['max_depth']}m | Max Weight: {item['max_weight']}kg\nPrice: 💰 {item['price']}{ability_text}",
+                    inline=False
+                )
+            elif item['type'] == 'bait':
+                effects = item.get('effects', {})
+                effect_lines = []
+                for key, val in effects.items():
+                    if 'luck' in key:
+                        effect_lines.append(f"➕ {val*100:.1f}% luck for {key.replace('luck_','').capitalize()}")
+                    elif 'catch_time_reduction' in key:
+                        effect_lines.append(f"⏱️ {val*100:.0f}% faster catch")
+                    elif 'cooldown_reduction' in key:
+                        effect_lines.append(f"⏳ {val*100:.0f}% cooldown reduction")
+                    elif 'weight_multiplier' in key:
+                        effect_lines.append(f"⚖️ {val}x weight multiplier")
+                embed.add_field(
+                    name=f"🪱 {item['name']}",
+                    value=f"Price: 💰 {item['price']}\n" + "\n".join(effect_lines),
+                    inline=False
+                )
+
+        view = discord.ui.View()
+        for item in loc['shop_items']:
+            view.add_item(discord.ui.Button(
+                label=f"Buy {item['name']}",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"buy_{item['type']}_{item['name']}"
+            ))
+
+        await ctx.send(embed=embed, view=view)
+    except Exception as e:
+        await ctx.send(f"Error: {e}")
+    finally:
+        release(conn)
+
+async def buy_item(interaction, item_type, item_name):
+    user = interaction.user
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT current_location, coins FROM players WHERE user_id = %s", (user.id,))
+        player = cur.fetchone()
+        if not player:
+            await interaction.response.send_message("You need to join first!", ephemeral=True)
+            return
+
+        location_key = player['current_location']
+        loc = LOCATIONS.get(location_key)
+        if not loc or 'shop_items' not in loc:
+            await interaction.response.send_message("No shop here.", ephemeral=True)
+            return
+
+        item = None
+        for it in loc['shop_items']:
+            if it['type'] == item_type and it['name'] == item_name:
+                item = it
+                break
+        if not item:
+            await interaction.response.send_message("Item not found.", ephemeral=True)
+            return
+
+        if player['coins'] < item['price']:
+            await interaction.response.send_message(f"You don't have enough coins! You need {item['price']} coins.", ephemeral=True)
+            return
+
+        cur.execute("UPDATE players SET coins = coins - %s WHERE user_id = %s", (item['price'], user.id))
+
+        if item_type == 'rod':
+            cur.execute("""
+                INSERT INTO user_rods (user_id, rod_name, max_depth, max_weight, equipped)
+                VALUES (%s, %s, %s, %s, FALSE)
+            """, (user.id, item['name'], item['max_depth'], item['max_weight']))
+        elif item_type == 'bait':
+            cur.execute("""
+                INSERT INTO user_baits (user_id, bait_name, quantity, equipped)
+                VALUES (%s, %s, 1, FALSE)
+                ON CONFLICT (user_id, bait_name)
+                DO UPDATE SET quantity = user_baits.quantity + 1
+            """, (user.id, item['name']))
+
+        conn.commit()
+        embed = discord.Embed(title="✅ Purchase successful!", description=f"You bought **{item['name']}** for {item['price']} coins.", color=discord.Color.green())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"Error: {e}", ephemeral=True)
+        conn.rollback()
+    finally:
+        release(conn)
+
+# -------------------- Sell / Lock / Collection / Balance --------------------
+async def toggle_lock(ctx, fish_name, lock=True):
+    user = ctx.author
+    conn = db()
+    try:
+        cur = conn.cursor()
+        if lock:
+            cur.execute("INSERT INTO locked_fish (user_id, fish_name) VALUES (%s, %s) ON CONFLICT DO NOTHING", (user.id, fish_name))
+            await ctx.send(f"🔒 Locked **{fish_name}** – you won't sell it with `-sell all`.")
+        else:
+            cur.execute("DELETE FROM locked_fish WHERE user_id = %s AND fish_name = %s", (user.id, fish_name))
+            await ctx.send(f"🔓 Unlocked **{fish_name}**.")
+        conn.commit()
+    except Exception as e:
+        await ctx.send(f"Error: {e}")
+        conn.rollback()
+    finally:
+        release(conn)
+
+async def sell_fish(ctx, fish_name, all_of_type=False):
+    user = ctx.author
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM locked_fish WHERE user_id = %s AND fish_name = %s", (user.id, fish_name))
+        locked = cur.fetchone()
+        if locked:
+            await ctx.send(f"❌ **{fish_name}** is locked. Unlock it first with `-unlock {fish_name}`.")
+            return
+
+        if all_of_type:
+            cur.execute("""
+                SELECT id, final_price FROM caught_fish
+                WHERE user_id = %s AND fish_name ILIKE %s
+            """, (user.id, f"%{fish_name}%"))
+            fish_list = cur.fetchall()
+            if not fish_list:
+                await ctx.send(f"You don't have any fish named '{fish_name}'.")
+                return
+            total_coins = sum(f['final_price'] for f in fish_list)
+            ids = [f['id'] for f in fish_list]
+            cur.execute("DELETE FROM caught_fish WHERE id = ANY(%s)", (ids,))
+            cur.execute("UPDATE players SET coins = coins + %s WHERE user_id = %s", (total_coins, user.id))
+            conn.commit()
+            await ctx.send(f"✅ Sold **{len(fish_list)}** **{fish_name}** for **{total_coins}** coins!")
+        else:
+            cur.execute("""
+                SELECT id, final_price FROM caught_fish
+                WHERE user_id = %s AND fish_name ILIKE %s
+                LIMIT 1
+            """, (user.id, f"%{fish_name}%"))
+            fish = cur.fetchone()
+            if not fish:
+                await ctx.send(f"You don't have any fish named '{fish_name}'.")
+                return
+            cur.execute("DELETE FROM caught_fish WHERE id = %s", (fish['id'],))
+            cur.execute("UPDATE players SET coins = coins + %s WHERE user_id = %s", (fish['final_price'], user.id))
+            conn.commit()
+            await ctx.send(f"✅ Sold **{fish_name}** for **{fish['final_price']}** coins!")
+    except Exception as e:
+        await ctx.send(f"Error: {e}")
+        conn.rollback()
+    finally:
+        release(conn)
+
+async def sell_all_fish(ctx):
+    user = ctx.author
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT cf.id, cf.final_price
+            FROM caught_fish cf
+            LEFT JOIN locked_fish lf ON cf.user_id = lf.user_id AND cf.fish_name = lf.fish_name
+            WHERE cf.user_id = %s AND lf.fish_name IS NULL
+        """, (user.id,))
+        fish_list = cur.fetchall()
+        if not fish_list:
+            await ctx.send("You have no unlocked fish to sell.")
+            return
+        total_coins = sum(f['final_price'] for f in fish_list)
+        ids = [f['id'] for f in fish_list]
+        cur.execute("DELETE FROM caught_fish WHERE id = ANY(%s)", (ids,))
+        cur.execute("UPDATE players SET coins = coins + %s WHERE user_id = %s", (total_coins, user.id))
+        conn.commit()
+        await ctx.send(f"✅ Sold **{len(fish_list)}** fish for **{total_coins}** coins! (Locked fish were skipped)")
+    except Exception as e:
+        await ctx.send(f"Error: {e}")
+        conn.rollback()
+    finally:
+        release(conn)
+
+async def show_collection(ctx):
+    user = ctx.author
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT fish_name, rarity, COUNT(*) as count
+            FROM caught_fish
+            WHERE user_id = %s
+            GROUP BY fish_name, rarity
+            ORDER BY rarity DESC, fish_name
+        """, (user.id,))
+        collection = cur.fetchall()
+        if not collection:
+            await ctx.send("You haven't caught any fish yet!")
+            return
+
+        embed = discord.Embed(title=f"{user.name}'s Fish Collection", color=discord.Color.gold())
+        total_species = len(collection)
+        total_fish = sum(c['count'] for c in collection)
+        embed.set_footer(text=f"Total species: {total_species} | Total fish: {total_fish}")
+
+        for item in collection:
+            origin = get_origin(item['fish_name'])
+            embed.add_field(
+                name=f"{item['fish_name']} (x{item['count']})",
+                value=f"⭐ {item['rarity']} | Origin: {origin}",
+                inline=False
+            )
+        await ctx.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"Error: {e}")
+    finally:
+        release(conn)
+
+async def show_balance(ctx):
+    user = ctx.author
+    conn = db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT coins, level, experience FROM players WHERE user_id = %s", (user.id,))
+        row = cur.fetchone()
+        if not row:
+            await ctx.send("You need to join first!")
+            return
+        level, remaining, needed = calculate_level(row['experience'])
+        embed = discord.Embed(title=f"{user.name}'s Stats", color=discord.Color.gold())
+        embed.add_field(name="💰 Coins", value=row['coins'], inline=True)
+        embed.add_field(name="🎣 Level", value=level, inline=True)
+        embed.add_field(name="⭐ XP", value=f"{remaining}/{needed} (total {row['experience']})", inline=False)
+        await ctx.send(embed=embed)
+    except Exception as e:
+        await ctx.send(f"Error: {e}")
+    finally:
+        release(conn)
+
+# -------------------- Inventory System --------------------
+INVENTORY_PAGE_SIZE = 10
+
+async def show_inventory(ctx_or_inter, filter=None, page=0):
+    if isinstance(ctx_or_inter, discord.Interaction):
+        user = ctx_or_inter.user
+        response = ctx_or_inter.response.send_message
+        ephemeral = True
+    else:
+        user = ctx_or_inter.author
+        response = ctx_or_inter.send
+        ephemeral = False
+
+    conn = db()
+    try:
+        cur = conn.cursor()
+        query = "SELECT fish_name, weight, rarity, mutation, final_price, location, caught_at FROM caught_fish WHERE user_id = %s"
+        params = [user.id]
+        if filter and filter != 'all':
+            if filter in RARITIES:
+                query += " AND rarity = %s"
+                params.append(filter.capitalize())
+            elif filter == 'mutated':
+                query += " AND mutation IS NOT NULL"
+            elif filter == 'normal':
+                query += " AND mutation IS NULL"
+        query += " ORDER BY caught_at DESC"
+        cur.execute(query, params)
+        all_fish = cur.fetchall()
+        total = len(all_fish)
+        total_pages = max(1, (total + INVENTORY_PAGE_SIZE - 1) // INVENTORY_PAGE_SIZE)
+        page = max(0, min(page, total_pages - 1))
+        start = page * INVENTORY_PAGE_SIZE
+        end = min(start + INVENTORY_PAGE_SIZE, total)
+        page_items = all_fish[start:end]
+
+        if not page_items:
+            embed = discord.Embed(title="🎒 Inventory", description="Empty!", color=discord.Color.purple())
+        else:
+            embed = discord.Embed(title=f"🎒 {user.name}'s Inventory", description=f"Total: {total}  |  Page {page+1}/{total_pages}", color=discord.Color.purple())
+            total_value = 0
+            for item in page_items:
+                total_value += item['final_price']
+                mutation_text = f" ✨{item['mutation']}" if item['mutation'] else ""
+                origin = get_origin(item['fish_name'])
+                embed.add_field(
+                    name=f"{item['fish_name']}{mutation_text}",
+                    value=f"⭐ {item['rarity']}  |  {item['weight']:.2f}kg  |  💰 {item['final_price']}\n📍 {origin}  |  {item['caught_at'].strftime('%Y-%m-%d %H:%M')}",
+                    inline=False
+                )
+            embed.add_field(name="**Total Value**", value=f"💰 {total_value}", inline=False)
+
+        view = discord.ui.View()
+        select = discord.ui.Select(
+            placeholder="Filter",
+            options=[
+                discord.SelectOption(label="All", value="all", default=(filter=='all' or filter is None)),
+                discord.SelectOption(label="Common", value="common", default=(filter=='common')),
+                discord.SelectOption(label="Uncommon", value="uncommon", default=(filter=='uncommon')),
+                discord.SelectOption(label="Epic", value="epic", default=(filter=='epic')),
+                discord.SelectOption(label="Legendary", value="legendary", default=(filter=='legendary')),
+                discord.SelectOption(label="Mythical", value="mythical", default=(filter=='mythical')),
+                discord.SelectOption(label="Godlike", value="godlike", default=(filter=='godlike')),
+                discord.SelectOption(label="Secret", value="secret", default=(filter=='secret')),
+                discord.SelectOption(label="Mutated", value="mutated", default=(filter=='mutated')),
+                discord.SelectOption(label="Normal", value="normal", default=(filter=='normal')),
+            ],
+            custom_id="inv_filter_select"
+        )
+        view.add_item(select)
+        filter_str = filter if filter else "all"
+        if page > 0:
+            view.add_item(discord.ui.Button(label="◀", style=discord.ButtonStyle.secondary, custom_id=f"inv_page_{filter_str}_{page-1}"))
+        if page < total_pages - 1:
+            view.add_item(discord.ui.Button(label="▶", style=discord.ButtonStyle.secondary, custom_id=f"inv_page_{filter_str}_{page+1}"))
+
+        await response(embed=embed, view=view, ephemeral=ephemeral)
+    except Exception as e:
+        await response(f"Error: {e}", ephemeral=True)
+    finally:
+        release(conn)
+
+# -------------------- Run Bot --------------------
+if __name__ == "__main__":
+    try:
+        print("Starting bot...")
+        bot.run(TOKEN)
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
