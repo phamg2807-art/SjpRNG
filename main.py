@@ -75,6 +75,12 @@ CHANNELS = {
     'tropical_isle': 1517023363506114751
 }
 
+# Map channel ID -> location key for shop detection
+CHANNEL_TO_LOCATION = {
+    CHANNELS['fisher_shore']: '1-fisher-shore',
+    CHANNELS['tropical_isle']: 'tropical-isle',
+}
+
 ROLES = {
     'player': 1515614836653031475,
 }
@@ -115,7 +121,7 @@ LOCATIONS = {
             {'name': 'Swift Bait', 'price': 600, 'type': 'bait', 'effects': {'catch_time_reduction': 0.20}},
             {'name': 'Quick Bait', 'price': 1200, 'type': 'bait', 'effects': {'catch_time_reduction': 0.35}},
             {'name': 'Rapid Bait', 'price': 3200, 'type': 'bait', 'effects': {'catch_time_reduction': 0.60}},
-            {'name': 'Quick Bait+', 'price': 2500, 'type': 'bait', 'effects': {'catch_time_reduction': 0.45, 'cooldown_reduction': 0.30}},  # <-- renamed
+            {'name': 'Quick Bait+', 'price': 2500, 'type': 'bait', 'effects': {'catch_time_reduction': 0.45, 'cooldown_reduction': 0.30}},
             {'name': 'Fortune Bait', 'price': 500, 'type': 'bait', 'effects': {'luck_all': 0.50}},
             {'name': 'Weight Bait', 'price': 1300, 'type': 'bait', 'effects': {'weight_multiplier': 1.2}},
             {'name': 'Mythical Hunter', 'price': 6400, 'type': 'bait', 'effects': {'luck_mythical': 0.01}}
@@ -533,11 +539,15 @@ async def on_interaction(interaction):
         else:
             await interaction.response.send_message("Invalid pagination.", ephemeral=True)
     elif custom_id.startswith("buy_"):
-        parts = custom_id.split("_", 2)
-        if len(parts) == 3:
+        # Format: buy_type_name_locationkey
+        parts = custom_id.split("_", 3)
+        if len(parts) == 4:
             item_type = parts[1]
             item_name = parts[2]
-            await buy_item(interaction, item_type, item_name)
+            location_key = parts[3]
+            await buy_item(interaction, item_type, item_name, location_key)
+        else:
+            await interaction.response.send_message("Invalid purchase.", ephemeral=True)
     elif custom_id == "equip_rod":
         rod_id = int(interaction.data['values'][0])
         await equip_rod(interaction, rod_id)
@@ -575,7 +585,23 @@ async def cmd_unequipbait(ctx):
 
 @bot.command(name='shop')
 async def cmd_shop(ctx):
-    await show_shop(ctx)
+    # Determine location based on channel ID
+    location_key = CHANNEL_TO_LOCATION.get(ctx.channel.id)
+    if not location_key:
+        # Fallback to player's current_location
+        conn = db()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT current_location FROM players WHERE user_id = %s", (ctx.author.id,))
+            row = cur.fetchone()
+            if row:
+                location_key = row['current_location']
+            else:
+                await ctx.send("You need to join first!")
+                return
+        finally:
+            release(conn)
+    await show_shop(ctx, location_key)
 
 @bot.command(name='sell')
 async def cmd_sell(ctx, *, args: str = None):
@@ -1035,79 +1061,64 @@ async def unequip_bait(ctx):
     finally:
         release(conn)
 
-# -------------------- Shop --------------------
-async def show_shop(ctx):
-    user = ctx.author
-    conn = db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT current_location FROM players WHERE user_id = %s", (user.id,))
-        player = cur.fetchone()
-        if not player:
-            await ctx.send("You need to join first!")
-            return
-        location_key = player['current_location']
-        loc = LOCATIONS.get(location_key)
-        if not loc or 'shop_items' not in loc:
-            await ctx.send("No shop available in this location.")
-            return
+# -------------------- Shop Functions (channel-based) --------------------
+async def show_shop(ctx, location_key):
+    loc = LOCATIONS.get(location_key)
+    if not loc or 'shop_items' not in loc:
+        await ctx.send("No shop available in this location.")
+        return
 
-        embed = discord.Embed(title=f"🏪 {loc['shop_name']}", description=f"Welcome to the {loc['shop_name']}!", color=discord.Color.blue())
-        for item in loc['shop_items']:
-            if item['type'] == 'rod':
-                ability_text = f"\nAbility: {item.get('ability', 'None')}" if item.get('ability') else ""
-                embed.add_field(
-                    name=f"🎣 {item['name']}",
-                    value=f"Max Depth: {item['max_depth']}m | Max Weight: {item['max_weight']}kg\nPrice: 💰 {item['price']}{ability_text}",
-                    inline=False
-                )
-            elif item['type'] == 'bait':
-                effects = item.get('effects', {})
-                effect_lines = []
-                for key, val in effects.items():
-                    if 'luck' in key:
-                        effect_lines.append(f"➕ {val*100:.1f}% luck for {key.replace('luck_','').capitalize()}")
-                    elif 'catch_time_reduction' in key:
-                        effect_lines.append(f"⏱️ {val*100:.0f}% faster catch")
-                    elif 'cooldown_reduction' in key:
-                        effect_lines.append(f"⏳ {val*100:.0f}% cooldown reduction")
-                    elif 'weight_multiplier' in key:
-                        effect_lines.append(f"⚖️ {val}x weight multiplier")
-                embed.add_field(
-                    name=f"🪱 {item['name']}",
-                    value=f"Price: 💰 {item['price']}\n" + "\n".join(effect_lines),
-                    inline=False
-                )
+    embed = discord.Embed(title=f"🏪 {loc['shop_name']}", description=f"Welcome to the {loc['shop_name']}!", color=discord.Color.blue())
+    for item in loc['shop_items']:
+        if item['type'] == 'rod':
+            ability_text = f"\nAbility: {item.get('ability', 'None')}" if item.get('ability') else ""
+            embed.add_field(
+                name=f"🎣 {item['name']}",
+                value=f"Max Depth: {item['max_depth']}m | Max Weight: {item['max_weight']}kg\nPrice: 💰 {item['price']}{ability_text}",
+                inline=False
+            )
+        elif item['type'] == 'bait':
+            effects = item.get('effects', {})
+            effect_lines = []
+            for key, val in effects.items():
+                if 'luck' in key:
+                    effect_lines.append(f"➕ {val*100:.1f}% luck for {key.replace('luck_','').capitalize()}")
+                elif 'catch_time_reduction' in key:
+                    effect_lines.append(f"⏱️ {val*100:.0f}% faster catch")
+                elif 'cooldown_reduction' in key:
+                    effect_lines.append(f"⏳ {val*100:.0f}% cooldown reduction")
+                elif 'weight_multiplier' in key:
+                    effect_lines.append(f"⚖️ {val}x weight multiplier")
+            embed.add_field(
+                name=f"🪱 {item['name']}",
+                value=f"Price: 💰 {item['price']}\n" + "\n".join(effect_lines),
+                inline=False
+            )
 
-        view = discord.ui.View()
-        for item in loc['shop_items']:
-            view.add_item(discord.ui.Button(
-                label=f"Buy {item['name']}",
-                style=discord.ButtonStyle.primary,
-                custom_id=f"buy_{item['type']}_{item['name']}"
-            ))
+    view = discord.ui.View()
+    for item in loc['shop_items']:
+        view.add_item(discord.ui.Button(
+            label=f"Buy {item['name']}",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"buy_{item['type']}_{item['name']}_{location_key}"
+        ))
 
-        await ctx.send(embed=embed, view=view)
-    except Exception as e:
-        await ctx.send(f"Error: {e}")
-    finally:
-        release(conn)
+    await ctx.send(embed=embed, view=view)
 
-async def buy_item(interaction, item_type, item_name):
+async def buy_item(interaction, item_type, item_name, location_key):
     user = interaction.user
     conn = db()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT current_location, coins FROM players WHERE user_id = %s", (user.id,))
+        cur.execute("SELECT coins FROM players WHERE user_id = %s", (user.id,))
         player = cur.fetchone()
         if not player:
             await interaction.response.send_message("You need to join first!", ephemeral=True)
             return
 
-        location_key = player['current_location']
         loc = LOCATIONS.get(location_key)
         if not loc or 'shop_items' not in loc:
-            await interaction.response.send_message("No shop here.", ephemeral=True)
+            await interaction.response.send_message("This item is no longer available.", ephemeral=True)
             return
 
         item = None
@@ -1120,7 +1131,7 @@ async def buy_item(interaction, item_type, item_name):
             return
 
         if player['coins'] < item['price']:
-            await interaction.response.send_message(f"You don't have enough coins! You need {item['price']} coins.", ephemeral=True)
+            await interaction.response.send_message(f"You need {item['price']} coins.", ephemeral=True)
             return
 
         cur.execute("UPDATE players SET coins = coins - %s WHERE user_id = %s", (item['price'], user.id))
