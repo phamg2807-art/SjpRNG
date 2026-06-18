@@ -65,7 +65,7 @@ intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix='-', intents=intents)
-bot.remove_command('help')  # remove default help
+bot.remove_command('help')
 
 CHANNELS = {
     'info': 1516791844678271156,
@@ -115,7 +115,7 @@ LOCATIONS = {
             {'name': 'Swift Bait', 'price': 600, 'type': 'bait', 'effects': {'catch_time_reduction': 0.20}},
             {'name': 'Quick Bait', 'price': 1200, 'type': 'bait', 'effects': {'catch_time_reduction': 0.35}},
             {'name': 'Rapid Bait', 'price': 3200, 'type': 'bait', 'effects': {'catch_time_reduction': 0.60}},
-            {'name': 'Quick Bait', 'price': 2500, 'type': 'bait', 'effects': {'catch_time_reduction': 0.45, 'cooldown_reduction': 0.30}},
+            {'name': 'Quick Bait+', 'price': 2500, 'type': 'bait', 'effects': {'catch_time_reduction': 0.45, 'cooldown_reduction': 0.30}},  # <-- renamed
             {'name': 'Fortune Bait', 'price': 500, 'type': 'bait', 'effects': {'luck_all': 0.50}},
             {'name': 'Weight Bait', 'price': 1300, 'type': 'bait', 'effects': {'weight_multiplier': 1.2}},
             {'name': 'Mythical Hunter', 'price': 6400, 'type': 'bait', 'effects': {'luck_mythical': 0.01}}
